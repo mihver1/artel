@@ -7,19 +7,19 @@ import json
 import logging
 import os
 import secrets
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 
 import websockets
 from websockets.asyncio.server import ServerConnection
-
-from worker_ai.providers import create_default_registry
 from worker_core.agent import AgentEventType, AgentSession
 from worker_core.bootstrap import (
     bootstrap_runtime,
     create_agent_session_from_bootstrap,
 )
 from worker_core.config import WorkerConfig, load_config, resolve_model
+from worker_core.extensions import ExtensionContext, load_server_extensions_async
 
 logger = logging.getLogger("worker.server")
 
@@ -28,6 +28,7 @@ logger = logging.getLogger("worker.server")
 class ServerState:
     config: WorkerConfig
     sessions: dict[str, AgentSession] = field(default_factory=dict)
+    server_extensions: list[Any] = field(default_factory=list)
 
 
 async def handle_client(ws: ServerConnection, state: ServerState) -> None:
@@ -93,6 +94,7 @@ async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: Serv
                 project_dir=os.getcwd(),
                 resolve_api_key=_resolve_api_key,
                 include_extensions=True,
+                runtime="server",
             )
             session = create_agent_session_from_bootstrap(
                 state.config,
@@ -110,9 +112,10 @@ async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: Serv
     async for event in session.run(content):
         payload: dict[str, Any] = {"type": event.type.value}
 
-        if event.type == AgentEventType.TEXT_DELTA:
-            payload["content"] = event.content
-        elif event.type == AgentEventType.REASONING_DELTA:
+        if event.type in {
+            AgentEventType.TEXT_DELTA,
+            AgentEventType.REASONING_DELTA,
+        }:
             payload["content"] = event.content
         elif event.type == AgentEventType.TOOL_CALL:
             payload["tool"] = event.tool_name
@@ -150,7 +153,6 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
         if auth_header != f"Bearer {token}":
             return web.json_response({"error": "Unauthorized"}, status=401)
         return await handler(request)
-        return middleware_handler
 
     async def handle_health(request: web.Request) -> web.Response:
         return web.json_response({
@@ -174,10 +176,8 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
         sid = request.match_info["session_id"]
         if sid in state.sessions:
             session = state.sessions.pop(sid)
-            try:
+            with suppress(Exception):
                 await session.provider.close()
-            except Exception:
-                pass
             return web.json_response({"deleted": sid})
         return web.json_response({"error": "Session not found"}, status=404)
 
@@ -185,6 +185,9 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
     app.router.add_get("/api/health", handle_health)
     app.router.add_get("/api/sessions", handle_sessions_list)
     app.router.add_delete("/api/sessions/{session_id}", handle_session_delete)
+    for ext in state.server_extensions:
+        with suppress(Exception):
+            ext.configure_rest_app(app)
     return app
 
 
@@ -202,7 +205,9 @@ async def run_server(
     from aiohttp import web
 
     config = load_config(os.getcwd())
-    state = ServerState(config=config)
+    context = ExtensionContext(project_dir=os.getcwd(), runtime="server", config=config)
+    server_extensions = await load_server_extensions_async(context=context)
+    state = ServerState(config=config, server_extensions=server_extensions)
 
     # Use explicit args → config → defaults
     host = host or config.server.host
@@ -238,5 +243,5 @@ async def run_server(
     logger.info("  REST API:  http://%s:%d/api/", host, rest_port)
     logger.info("  Auth token: %s", token)
 
-    async with websockets.serve(ws_handler, host, port) as server:  # type: ignore[attr-defined]
+    async with websockets.serve(ws_handler, host, port):  # type: ignore[attr-defined]
         await asyncio.Future()  # Run forever

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any
 
 import worker_core.cmux as cmux
@@ -38,6 +40,11 @@ from worker_core.bootstrap import (
 )
 from worker_core.cmux import is_cmux
 from worker_core.config import load_config, resolve_model
+from worker_core.extensions import (
+    ExtensionContext,
+    load_tui_extensions_async,
+    reload_tui_extensions_async,
+)
 from worker_core.prompts import load_prompts, render_prompt
 from worker_core.provider_resolver import (
     get_effective_model_info,
@@ -493,6 +500,7 @@ class WorkerApp(App):
         self._session: AgentSession | None = None
         self._store: SessionStore | None = None
         self._extensions: list[Any] = []
+        self._tui_extensions: list[Any] = []
         self._current_widget: MessageWidget | None = None
         self._ws: Any = None  # websocket connection for remote mode
         self._remote_session_id = str(uuid.uuid4())
@@ -531,6 +539,7 @@ class WorkerApp(App):
         project_dir = os.getcwd()
         self._prompts = load_prompts(project_dir)
         self._skills = load_skills(project_dir)
+        await self._load_tui_extensions(config)
 
         # Apply custom keybindings from config
         for key, action in config.keybindings.bindings.items():
@@ -541,6 +550,32 @@ class WorkerApp(App):
     def _focus_input(self) -> None:
         """Keep the main input focused for immediate typing."""
         self.query_one("#input-bar", Input).focus()
+
+    async def _load_tui_extensions(self, config: Any) -> None:
+        """Load TUI extensions and wire their widgets/keybindings into the app."""
+        context = ExtensionContext(project_dir=os.getcwd(), runtime="tui", config=config)
+        self._tui_extensions = await load_tui_extensions_async(context=context)
+        for ext in self._tui_extensions:
+            with suppress(Exception):
+                await ext.mount(self)
+            self._register_tui_extension_keybindings(ext)
+
+    def _register_tui_extension_keybindings(self, ext: Any) -> None:
+        """Bind dynamic keybindings exported by TUI extensions."""
+        for index, (key, handler) in enumerate(ext.get_keybindings().items()):
+            ext_name = getattr(ext, "name", "") or ext.__class__.__name__.lower()
+            action_name = f"ext_{ext_name}_{index}"
+
+            async def _action(self: WorkerApp, _handler: Callable[..., Any] = handler) -> None:
+                try:
+                    result = _handler(self)
+                except TypeError:
+                    result = _handler()
+                if inspect.isawaitable(result):
+                    await result
+
+            setattr(self, f"action_{action_name}", MethodType(_action, self))
+            self.bind(key, action_name, description=action_name)
 
     def _command_menu(self) -> OptionList:
         return self.query_one("#command-suggestions", OptionList)
@@ -743,6 +778,7 @@ class WorkerApp(App):
             project_dir=project_dir,
             resolve_api_key=_resolve_api_key,
             include_extensions=True,
+            runtime="tui",
         )
         self._extensions = runtime.extensions
         self._input_price = runtime.input_price_per_m
@@ -1143,6 +1179,7 @@ class WorkerApp(App):
                 project_dir=os.getcwd(),
                 resolve_api_key=_resolve_api_key,
                 include_extensions=True,
+                runtime="tui",
             )
         except Exception as e:
             self._add_message(f"Failed to create provider: {e}", role="error")
@@ -1557,8 +1594,14 @@ class WorkerApp(App):
         if not self._session:
             self._add_message("No active session.", role="error")
             return
-
-        self._extensions, new_hooks = await reload_extensions_async(self._extensions)
+        config = load_config(os.getcwd())
+        context = ExtensionContext(project_dir=os.getcwd(), runtime="tui", config=config)
+        self._extensions, new_hooks = await reload_extensions_async(
+            self._extensions, context=context
+        )
+        self._tui_extensions = await reload_tui_extensions_async(
+            self._tui_extensions, context=context
+        )
         self._session.hooks = new_hooks
 
         # Re-collect tools
@@ -1566,13 +1609,18 @@ class WorkerApp(App):
         for ext in self._extensions:
             tools.extend(ext.get_tools())
         self._session.tools = {t.name: t for t in tools}
+        for ext in self._tui_extensions:
+            with suppress(Exception):
+                await ext.mount(self)
+            self._register_tui_extension_keybindings(ext)
 
         # Reload prompts and skills
         project_dir = os.getcwd()
         self._prompts = load_prompts(project_dir)
         self._skills = load_skills(project_dir)
         self._add_message(
-            f"Reloaded: {len(self._extensions)} extension(s), "
+            f"Reloaded: {len(self._extensions)} core extension(s), "
+            f"{len(self._tui_extensions)} tui extension(s), "
             f"{len(self._prompts)} prompt(s), "
             f"{len(self._skills)} skill(s)",
             role="tool",

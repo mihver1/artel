@@ -7,6 +7,7 @@ import importlib.metadata
 import inspect
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Any
 
 from worker_core.tools import Tool
@@ -17,23 +18,42 @@ CommandHandler = Callable[[str], Awaitable[str | None]]
 """Async function receiving arg string, returning optional response text."""
 
 
+@dataclass(slots=True)
+class ExtensionContext:
+    """Runtime context shared with loaded extensions."""
+
+    project_dir: str = ""
+    runtime: str = "local"
+    config: Any | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
+
+
 # ── Base classes ──────────────────────────────────────────────────
 
 
-class Extension:
-    """Base class for worker extensions.
-
-    Subclass this and declare tools, hooks, and commands.
-    """
+class BaseExtension:
+    """Shared lifecycle and context for Worker extension groups."""
 
     name: str = ""
     version: str = "0.0.0"
+    context: ExtensionContext | None = None
+
+    def bind_context(self, context: ExtensionContext) -> None:
+        """Bind runtime context before the extension is loaded."""
+        self.context = context
 
     async def on_load(self) -> None:
         """Called when the extension is loaded."""
 
     async def on_unload(self) -> None:
         """Called when the extension is unloaded."""
+
+
+class Extension(BaseExtension):
+    """Base class for worker extensions.
+
+    Subclass this and declare tools, hooks, and commands.
+    """
 
     def get_tools(self) -> list[Tool]:
         """Return extra tools to register with the agent."""
@@ -48,11 +68,8 @@ class Extension:
         return {}
 
 
-class TuiExtension:
+class TuiExtension(BaseExtension):
     """Base class for TUI extensions (Textual widgets, shortcuts, renderers)."""
-
-    name: str = ""
-    version: str = "0.0.0"
 
     def get_widgets(self) -> list[Any]:
         """Return Textual widgets to mount in the TUI."""
@@ -62,12 +79,34 @@ class TuiExtension:
         """Return keyboard shortcuts."""
         return {}
 
+    async def mount(self, app: Any) -> None:
+        """Mount widgets into the running app by default."""
+        widgets = self.get_widgets()
+        if not widgets:
+            return
+        main = app.query_one("#main-content")
+        for widget in widgets:
+            await main.mount(widget)
 
-class WebExtension:
+
+class ServerExtension(BaseExtension):
+    """Base class for server/runtime extensions."""
+
+    def configure_rest_app(self, app: Any) -> None:
+        """Register extra REST routes or middleware."""
+        return None
+
+
+class AIExtension(BaseExtension):
+    """Base class for AI/runtime provider extensions."""
+
+    def register_providers(self, registry: Any) -> None:
+        """Register additional providers with the shared provider registry."""
+        return None
+
+
+class WebExtension(BaseExtension):
     """Base class for future Web UI extensions."""
-
-    name: str = ""
-    version: str = "0.0.0"
 
 
 def hook(event: str) -> Callable[..., Any]:
@@ -89,9 +128,9 @@ def hook(event: str) -> Callable[..., Any]:
 # ── Discovery ─────────────────────────────────────────────────────
 
 
-def discover_extensions(group: str = "worker.extensions") -> dict[str, type[Extension]]:
+def discover_extensions(group: str = "worker.extensions") -> dict[str, type[Any]]:
     """Discover installed extensions via entry_points."""
-    extensions: dict[str, type[Extension]] = {}
+    extensions: dict[str, type[Any]] = {}
     try:
         eps = importlib.metadata.entry_points(group=group)
     except TypeError:
@@ -105,6 +144,59 @@ def discover_extensions(group: str = "worker.extensions") -> dict[str, type[Exte
         except Exception:
             continue
     return extensions
+
+
+def _instantiate_extensions(
+    classes: dict[str, type[Any]],
+    *,
+    context: ExtensionContext | None = None,
+) -> list[Any]:
+    instances: list[Any] = []
+    for cls in classes.values():
+        try:
+            ext = cls()
+        except Exception:
+            continue
+        if context is not None and hasattr(ext, "bind_context"):
+            with suppress(Exception):
+                ext.bind_context(context)
+        instances.append(ext)
+    return instances
+
+
+async def _activate_extensions(instances: list[Any]) -> list[Any]:
+    active: list[Any] = []
+    for ext in instances:
+        try:
+            await ext.on_load()
+        except Exception:
+            with suppress(Exception):
+                await ext.on_unload()
+            continue
+        active.append(ext)
+    return active
+
+
+async def _load_extension_group_async(
+    *,
+    group: str,
+    context: ExtensionContext | None = None,
+) -> list[Any]:
+    instances = _instantiate_extensions(discover_extensions(group=group), context=context)
+    return await _activate_extensions(instances)
+
+
+async def _reload_extension_group_async(
+    *,
+    group: str,
+    current_instances: list[Any] | None = None,
+    context: ExtensionContext | None = None,
+) -> list[Any]:
+    for ext in current_instances or []:
+        with suppress(Exception):
+            await ext.on_unload()
+    importlib.invalidate_caches()
+    return await _load_extension_group_async(group=group, context=context)
 
 
 class HookDispatcher:
@@ -140,7 +232,7 @@ class HookDispatcher:
     async def fire_filter(self, event: str, value: Any, **kwargs: Any) -> Any:
         """Fire hooks that can modify a value (pipeline pattern).
 
-        Each hook receives `value=...` plus kwargs.  If a hook returns
+        Each hook receives `value=...` plus kwargs. If a hook returns
         a non-None result, the value is replaced for subsequent hooks.
         """
         for fn in self._hooks.get(event, []):
@@ -152,45 +244,32 @@ class HookDispatcher:
         return value
 
 
-def load_extensions() -> tuple[list[Extension], HookDispatcher]:
+def load_extensions(
+    context: ExtensionContext | None = None,
+) -> tuple[list[Extension], HookDispatcher]:
     """Discover, instantiate, and return extensions + hook dispatcher."""
-    classes = discover_extensions()
-    instances: list[Extension] = []
-    for cls in classes.values():
-        try:
-            instances.append(cls())
-        except Exception:
-            continue
+    instances = _instantiate_extensions(discover_extensions(), context=context)
     return instances, HookDispatcher(instances)
 
-async def load_extensions_async() -> tuple[list[Extension], HookDispatcher]:
+
+async def load_extensions_async(
+    context: ExtensionContext | None = None,
+) -> tuple[list[Extension], HookDispatcher]:
     """Discover, instantiate, activate, and return extensions + hook dispatcher."""
-    classes = discover_extensions()
-    instances: list[Extension] = []
-    for cls in classes.values():
-        try:
-            ext = cls()
-        except Exception:
-            continue
-        try:
-            await ext.on_load()
-        except Exception:
-            with suppress(Exception):
-                await ext.on_unload()
-            continue
-        instances.append(ext)
+    instances = await _load_extension_group_async(group="worker.extensions", context=context)
     return instances, HookDispatcher(instances)
 
 
 async def reload_extensions_async(
     current_instances: list[Extension] | None = None,
+    *,
+    context: ExtensionContext | None = None,
 ) -> tuple[list[Extension], HookDispatcher]:
-    """Hot-reload: unload current extensions, invalidate caches, re-discover."""
-    for ext in current_instances or []:
-        with suppress(Exception):
-            await ext.on_unload()
-    importlib.invalidate_caches()
-    return await load_extensions_async()
+    """Hot-reload core extensions, invalidate caches, and re-discover."""
+    instances = await _reload_extension_group_async(
+        group="worker.extensions", current_instances=current_instances, context=context
+    )
+    return instances, HookDispatcher(instances)
 
 
 def discover_tui_extensions() -> dict[str, type[TuiExtension]]:
@@ -198,6 +277,55 @@ def discover_tui_extensions() -> dict[str, type[TuiExtension]]:
     return discover_extensions(group="worker.tui")  # type: ignore[return-value]
 
 
+def discover_server_extensions() -> dict[str, type[ServerExtension]]:
+    """Discover installed server extensions."""
+    return discover_extensions(group="worker.server")  # type: ignore[return-value]
+
+
+def discover_ai_extensions() -> dict[str, type[AIExtension]]:
+    """Discover installed AI extensions."""
+    return discover_extensions(group="worker.ai")  # type: ignore[return-value]
+
+
 def discover_web_extensions() -> dict[str, type[WebExtension]]:
     """Discover installed Web UI extensions."""
     return discover_extensions(group="worker.web")  # type: ignore[return-value]
+
+
+async def load_tui_extensions_async(
+    context: ExtensionContext | None = None,
+) -> list[TuiExtension]:
+    """Load and activate TUI extensions."""
+    return await _load_extension_group_async(group="worker.tui", context=context)  # type: ignore[return-value]
+
+
+async def reload_tui_extensions_async(
+    current_instances: list[TuiExtension] | None = None,
+    *,
+    context: ExtensionContext | None = None,
+) -> list[TuiExtension]:
+    """Hot-reload TUI extensions."""
+    return await _reload_extension_group_async(  # type: ignore[return-value]
+        group="worker.tui", current_instances=current_instances, context=context
+    )
+
+
+async def load_server_extensions_async(
+    context: ExtensionContext | None = None,
+) -> list[ServerExtension]:
+    """Load and activate server extensions."""
+    return await _load_extension_group_async(group="worker.server", context=context)  # type: ignore[return-value]
+
+
+async def load_ai_extensions_async(
+    context: ExtensionContext | None = None,
+) -> list[AIExtension]:
+    """Load and activate AI extensions."""
+    return await _load_extension_group_async(group="worker.ai", context=context)  # type: ignore[return-value]
+
+
+async def load_web_extensions_async(
+    context: ExtensionContext | None = None,
+) -> list[WebExtension]:
+    """Load and activate Web extensions."""
+    return await _load_extension_group_async(group="worker.web", context=context)  # type: ignore[return-value]

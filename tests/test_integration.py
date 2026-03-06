@@ -118,6 +118,7 @@ class TestRuntimeBootstrap:
             project_dir=str(tmp_path),
             resolve_api_key=_resolve_api_key,
             include_extensions=False,
+            runtime="local",
         )
 
         assert isinstance(runtime.provider, KimiProvider)
@@ -141,6 +142,7 @@ class TestRuntimeBootstrap:
             project_dir=str(tmp_path),
             resolve_api_key=_resolve_api_key,
             include_extensions=False,
+            runtime="local",
         )
 
         assert isinstance(runtime.provider, GitHubCopilotProvider)
@@ -175,6 +177,7 @@ class TestRuntimeBootstrap:
             project_dir=str(tmp_path),
             resolve_api_key=_resolve_api_key,
             include_extensions=False,
+            runtime="local",
         )
 
         assert isinstance(runtime.provider, OllamaProvider)
@@ -207,6 +210,7 @@ class TestRuntimeBootstrap:
             project_dir=str(tmp_path),
             resolve_api_key=_resolve_api_key,
             include_extensions=False,
+            runtime="local",
         )
 
         assert isinstance(runtime.provider, LMStudioProvider)

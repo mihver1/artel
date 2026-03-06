@@ -19,7 +19,6 @@ import asyncio
 import json
 import os
 import sys
-import uuid
 from typing import Any
 
 from worker_core.agent import AgentEventType, AgentSession
@@ -30,12 +29,18 @@ from worker_core.bootstrap import (
 from worker_core.config import load_config, resolve_model
 
 
-def _jsonrpc_response(id: Any, result: Any) -> str:
-    return json.dumps({"jsonrpc": "2.0", "id": id, "result": result})
+def _jsonrpc_response(request_id: Any, result: Any) -> str:
+    return json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
-def _jsonrpc_error(id: Any, code: int, message: str) -> str:
-    return json.dumps({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+def _jsonrpc_error(request_id: Any, code: int, message: str) -> str:
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        }
+    )
 
 
 def _jsonrpc_notification(method: str, params: dict[str, Any]) -> str:
@@ -62,6 +67,7 @@ class RpcServer:
             project_dir=os.getcwd(),
             resolve_api_key=_resolve_api_key,
             include_extensions=True,
+            runtime="rpc",
         )
         session = create_agent_session_from_bootstrap(
             config,
@@ -125,9 +131,10 @@ class RpcServer:
         async for event in self._session.run(content):
             evt: dict[str, Any] = {"type": event.type.value}
 
-            if event.type == AgentEventType.TEXT_DELTA:
-                evt["content"] = event.content
-            elif event.type == AgentEventType.REASONING_DELTA:
+            if event.type in {
+                AgentEventType.TEXT_DELTA,
+                AgentEventType.REASONING_DELTA,
+            }:
                 evt["content"] = event.content
             elif event.type == AgentEventType.TOOL_CALL:
                 evt["tool"] = event.tool_name

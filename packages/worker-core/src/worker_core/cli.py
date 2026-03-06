@@ -342,6 +342,7 @@ async def _print_mode(
         project_dir=cwd,
         resolve_api_key=_resolve_api_key,
         include_extensions=True,
+        runtime="local",
     )
 
     # Session store

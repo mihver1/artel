@@ -26,6 +26,7 @@ from worker_ai.models import (
     Usage,
 )
 from worker_ai.provider import Provider, build_httpx_timeout, merge_headers
+from worker_ai.tool_schema import tool_input_schema
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -230,26 +231,13 @@ def _parse_openai_model_list(payload: Any, provider_name: str) -> list[ModelInfo
 def _build_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     result = []
     for t in tools:
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for p in t.parameters:
-            prop: dict[str, Any] = {"type": p.type, "description": p.description}
-            if p.enum:
-                prop["enum"] = p.enum
-            properties[p.name] = prop
-            if p.required:
-                required.append(p.name)
         result.append(
             {
                 "type": "function",
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
+                    "parameters": tool_input_schema(t),
                 },
             }
         )
@@ -383,24 +371,11 @@ def _build_responses_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     """Convert ToolDef list to Responses API tool definitions."""
     result = []
     for t in tools:
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for p in t.parameters:
-            prop: dict[str, Any] = {"type": p.type, "description": p.description}
-            if p.enum:
-                prop["enum"] = p.enum
-            properties[p.name] = prop
-            if p.required:
-                required.append(p.name)
         result.append({
             "type": "function",
             "name": t.name,
             "description": t.description,
-            "parameters": {
-                "type": "object",
-                "properties": properties,
-                "required": required,
-            },
+            "parameters": tool_input_schema(t),
         })
     return result
 

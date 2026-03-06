@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from inspect import isawaitable
 from typing import Any
@@ -12,7 +13,13 @@ from worker_ai.providers import create_default_registry
 from worker_core import provider_resolver as _provider_resolver
 from worker_core.agent import AgentSession
 from worker_core.config import WorkerConfig
-from worker_core.extensions import Extension, HookDispatcher, load_extensions_async
+from worker_core.extensions import (
+    Extension,
+    ExtensionContext,
+    HookDispatcher,
+    load_ai_extensions_async,
+    load_extensions_async,
+)
 from worker_core.tools import Tool
 from worker_core.tools.builtins import create_builtin_tools
 
@@ -69,9 +76,16 @@ async def bootstrap_runtime(
     project_dir: str,
     resolve_api_key: ResolveApiKey,
     include_extensions: bool = True,
+    runtime: str = "local",
 ) -> RuntimeBootstrap:
     """Create provider/tools/hooks/extensions and model metadata for a session."""
     registry = create_default_registry()
+    extension_context = ExtensionContext(project_dir=project_dir, runtime=runtime, config=config)
+    if include_extensions:
+        ai_extensions = await load_ai_extensions_async(context=extension_context)
+        for ext in ai_extensions:
+            with suppress(Exception):
+                ext.register_providers(registry)
     resolved_api_key = resolve_api_key(config, provider_name)
     if isawaitable(resolved_api_key):
         api_key, auth_type = await resolved_api_key
@@ -86,7 +100,7 @@ async def bootstrap_runtime(
     extensions: list[Extension] = []
     hooks = HookDispatcher()
     if include_extensions:
-        extensions, hooks = await load_extensions_async()
+        extensions, hooks = await load_extensions_async(context=extension_context)
         for ext in extensions:
             tools.extend(ext.get_tools())
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Literal, TYPE_CHECKING
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from worker_core.sessions import SessionStore
@@ -15,22 +16,21 @@ if TYPE_CHECKING:
 from worker_ai.models import (
     Done,
     Message,
+    ReasoningDelta,
     Role,
-    StreamEvent,
     TextDelta,
     ToolCall,
     ToolCallDelta,
     ToolDef,
     ToolResult,
-    ReasoningDelta,
     Usage,
 )
 from worker_ai.provider import Provider
 
+from worker_core.execution import ToolExecutionContext, bind_tool_execution_context
 from worker_core.extensions import HookDispatcher
 from worker_core.permissions import PermissionPolicy
 from worker_core.tools import Tool
-
 
 # ── Thinking levels ───────────────────────────────────────────────
 
@@ -40,7 +40,7 @@ ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
 # ── Agent events (yielded to the client) ─────────────────────────
 
 
-class AgentEventType(str, Enum):
+class AgentEventType(StrEnum):
     TEXT_DELTA = "text_delta"
     REASONING_DELTA = "reasoning_delta"
     TOOL_CALL = "tool_call"
@@ -104,6 +104,7 @@ class AgentSession:
         self.provider = provider
         self.model = model
         self.tools = {t.name: t for t in tools}
+        self.project_dir = project_dir
         self.temperature = temperature
         self.max_turns = max_turns
         self.thinking_level: ThinkingLevel = thinking_level
@@ -296,16 +297,12 @@ class AgentSession:
         if project_dir:
             system_md = Path(project_dir) / ".worker" / "SYSTEM.md"
             if system_md.exists():
-                try:
+                with suppress(OSError):
                     system_override = system_md.read_text(encoding="utf-8").strip()
-                except OSError:
-                    pass
         global_system_md = Path("~/.config/worker/SYSTEM.md").expanduser()
         if system_override is None and global_system_md.exists():
-            try:
+            with suppress(OSError):
                 system_override = global_system_md.read_text(encoding="utf-8").strip()
-            except OSError:
-                pass
 
         if system_override:
             parts.append(system_override)
@@ -500,7 +497,7 @@ class AgentSession:
                 return
 
             # Execute tool calls
-            for i, tc in enumerate(tool_calls):
+            for _i, tc in enumerate(tool_calls):
                 # Yield to event loop so UI stays responsive
                 await asyncio.sleep(0)
 
@@ -511,12 +508,16 @@ class AgentSession:
                 # Hook: before_tool_call (can modify args)
                 exec_args = await self.hooks.fire_filter(
                     "before_tool_call", value=tc.arguments,
-                    session=self, tool_name=tc.name,
+                    session=self, tool_name=tc.name, tool_call_id=tc.id,
                 )
 
                 # Hook: on_tool_call (notification, read-only)
                 await self.hooks.fire(
-                    "on_tool_call", session=self, tool_name=tc.name, args=exec_args,
+                    "on_tool_call",
+                    session=self,
+                    tool_name=tc.name,
+                    tool_call_id=tc.id,
+                    args=exec_args,
                 )
 
                 tool = self.tools.get(tc.name)
@@ -531,7 +532,15 @@ class AgentSession:
                             is_error = True
                         else:
                             try:
-                                result = await tool.execute(**exec_args)
+                                with bind_tool_execution_context(
+                                    ToolExecutionContext(
+                                        session=self,
+                                        tool_name=tc.name,
+                                        tool_call_id=tc.id,
+                                        arguments=dict(exec_args),
+                                    )
+                                ):
+                                    result = await tool.execute(**exec_args)
                                 is_error = False
                             except Exception as e:
                                 await self.hooks.fire("on_error", session=self, error=e)
@@ -539,7 +548,15 @@ class AgentSession:
                                 is_error = True
                     else:
                         try:
-                            result = await tool.execute(**exec_args)
+                            with bind_tool_execution_context(
+                                ToolExecutionContext(
+                                    session=self,
+                                    tool_name=tc.name,
+                                    tool_call_id=tc.id,
+                                    arguments=dict(exec_args),
+                                )
+                            ):
+                                result = await tool.execute(**exec_args)
                             is_error = False
                         except Exception as e:
                             await self.hooks.fire("on_error", session=self, error=e)

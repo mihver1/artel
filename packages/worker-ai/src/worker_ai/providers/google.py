@@ -22,6 +22,7 @@ from worker_ai.models import (
     Usage,
 )
 from worker_ai.provider import Provider, build_httpx_timeout, merge_headers
+from worker_ai.tool_schema import json_schema_to_gemini_schema, tool_input_schema
 
 _DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
 _VERTEX_BASE_URL_TEMPLATE = "https://{location}-aiplatform.googleapis.com"
@@ -92,21 +93,11 @@ def _build_contents(messages: list[Message]) -> tuple[str | None, list[dict[str,
 def _build_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     declarations = []
     for t in tools:
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for p in t.parameters:
-            properties[p.name] = {"type": p.type.upper(), "description": p.description}
-            if p.required:
-                required.append(p.name)
         declarations.append(
             {
                 "name": t.name,
                 "description": t.description,
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": properties,
-                    "required": required,
-                },
+                "parameters": json_schema_to_gemini_schema(tool_input_schema(t)),
             }
         )
     return [{"functionDeclarations": declarations}]

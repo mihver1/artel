@@ -21,6 +21,7 @@ from worker_ai.models import (
     Usage,
 )
 from worker_ai.provider import Provider, build_httpx_timeout, merge_headers
+from worker_ai.tool_schema import tool_input_schema
 
 _DEFAULT_BASE_URL = "https://api.anthropic.com"
 _API_VERSION = "2023-06-01"
@@ -85,24 +86,11 @@ def _build_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     """Convert ToolDef list to Anthropic tool format."""
     result = []
     for t in tools:
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for p in t.parameters:
-            prop: dict[str, Any] = {"type": p.type, "description": p.description}
-            if p.enum:
-                prop["enum"] = p.enum
-            properties[p.name] = prop
-            if p.required:
-                required.append(p.name)
         result.append(
             {
                 "name": t.name,
                 "description": t.description,
-                "input_schema": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
+                "input_schema": tool_input_schema(t),
             }
         )
     return result

@@ -23,6 +23,7 @@ from worker_ai.models import (
     Usage,
 )
 from worker_ai.provider import Provider
+from worker_ai.tool_schema import tool_input_schema
 
 _DEFAULT_CONNECT_TIMEOUT = 10
 _DEFAULT_READ_TIMEOUT = 300
@@ -64,26 +65,13 @@ def _normalize_timeout_seconds(timeout: int | bool | None, *, default: int) -> i
 def _build_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for tool in tools:
-        properties: dict[str, Any] = {}
-        required: list[str] = []
-        for param in tool.parameters:
-            prop: dict[str, Any] = {"type": param.type, "description": param.description}
-            if param.enum:
-                prop["enum"] = param.enum
-            properties[param.name] = prop
-            if param.required:
-                required.append(param.name)
         result.append(
             {
                 "toolSpec": {
                     "name": tool.name,
                     "description": tool.description,
                     "inputSchema": {
-                        "json": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": required,
-                        }
+                        "json": tool_input_schema(tool)
                     },
                 }
             }

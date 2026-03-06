@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Literal, Union
+from enum import StrEnum
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
-
 
 # ── Messages ──────────────────────────────────────────────────────
 
 
-class Role(str, Enum):
+class Role(StrEnum):
     SYSTEM = "system"
     USER = "user"
     ASSISTANT = "assistant"
@@ -55,6 +54,7 @@ class ToolParam(BaseModel):
     description: str = ""
     required: bool = True
     enum: list[str] | None = None
+    default: Any | None = None
 
 
 class ToolDef(BaseModel):
@@ -63,6 +63,7 @@ class ToolDef(BaseModel):
     name: str
     description: str
     parameters: list[ToolParam]
+    input_schema: dict[str, Any] | None = None
 
 
 # ── Stream events ─────────────────────────────────────────────────
@@ -110,7 +111,7 @@ class Done(BaseModel):
     usage: Usage = Field(default_factory=Usage)
 
 
-StreamEvent = Union[TextDelta, ToolCallDelta, ReasoningDelta, Usage, Done]
+StreamEvent = TextDelta | ToolCallDelta | ReasoningDelta | Usage | Done
 
 
 # ── Model info ────────────────────────────────────────────────────
