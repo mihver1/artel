@@ -15,8 +15,9 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Collapsible, Footer, Header, Input, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Collapsible, Footer, Header, Input, Static
 from worker_ai.models import Role
 from worker_core.agent import AgentEventType, AgentSession
 from worker_core.bootstrap import (
@@ -83,7 +84,7 @@ class MessageWidget(Static):
 
     def append_content(self, delta: str) -> None:
         self._content += delta
-        self.refresh()
+        self.refresh(layout=True)
 
 
 class StatusFooter(Static):
@@ -145,6 +146,85 @@ class StatusFooter(Static):
         self.refresh()
 
 
+# ── Permission dialog ─────────────────────────────────────────
+
+
+class PermissionScreen(ModalScreen[str]):
+    """Modal dialog asking to approve / deny a tool call."""
+
+    CSS = """
+    PermissionScreen {
+        align: center middle;
+    }
+    #perm-dialog {
+        width: 70;
+        max-height: 18;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+    #perm-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #perm-detail {
+        max-height: 6;
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+    #perm-buttons {
+        height: 3;
+        align: center middle;
+    }
+    #perm-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("y", "approve_once", "Allow once", show=False),
+        Binding("a", "approve_all", "Allow all", show=False),
+        Binding("n", "deny", "Deny", show=False),
+        Binding("escape", "deny", "Deny", show=False),
+    ]
+
+    def __init__(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.tool_name = tool_name
+        self.tool_args = args
+
+    def compose(self) -> ComposeResult:
+        detail = ""
+        if self.tool_name == "bash":
+            detail = self.tool_args.get("command", "")
+        else:
+            detail = ", ".join(f"{k}={v!r}" for k, v in self.tool_args.items())
+        with Vertical(id="perm-dialog"):
+            yield Static(f"⚠ Permission required: [b]{self.tool_name}[/b]", id="perm-title")
+            yield Static(detail[:300], id="perm-detail")
+            with Horizontal(id="perm-buttons"):
+                yield Button("[y] Allow once", id="btn-once", variant="primary")
+                yield Button("[a] Allow all", id="btn-all", variant="success")
+                yield Button("[n] Deny", id="btn-deny", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-once":
+            self.dismiss("once")
+        elif event.button.id == "btn-all":
+            self.dismiss("all")
+        else:
+            self.dismiss("deny")
+
+    def action_approve_once(self) -> None:
+        self.dismiss("once")
+
+    def action_approve_all(self) -> None:
+        self.dismiss("all")
+
+    def action_deny(self) -> None:
+        self.dismiss("deny")
+
+
 # ── Main App ──────────────────────────────────────────────────
 
 
@@ -202,6 +282,7 @@ class WorkerApp(App):
         self._tool_collapsibles: list[Collapsible] = []
         self._input_price: float = 0.0  # per 1M tokens
         self._output_price: float = 0.0
+        self._auto_approve_all: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -278,6 +359,7 @@ class WorkerApp(App):
             project_dir=project_dir,
             store=self._store,
             session_id=session_id,
+            permission_callback=self._ask_permission,
         )
 
         # Restore prior messages and display them
@@ -466,6 +548,7 @@ class WorkerApp(App):
                     had_tool_calls = False
                     reasoning_widget = None  # reset for next turn
                 widget.append_content(event.content)
+                self.call_after_refresh(self._scroll_to_bottom)
 
             elif event.type == AgentEventType.TOOL_CALL:
                 had_tool_calls = True
@@ -1123,6 +1206,25 @@ class WorkerApp(App):
             return
         result = await cmux.browser_open(arg)
         self._add_message(f"Browser opened: {result or arg or '(empty)'}", role="tool")
+
+    # ── Permission callback ────────────────────────────────────
+
+    async def _ask_permission(self, tool_name: str, args: dict[str, Any]) -> bool:
+        """Show a modal dialog and return whether the tool call is allowed."""
+        if self._auto_approve_all:
+            return True
+        # cmux: notify user that permission is needed
+        await cmux.set_status(
+            "state", f"permission: {tool_name}", icon="lock", color="#fab387",
+        )
+        await cmux.notify(
+            "Worker", subtitle=f"Permission required: {tool_name}",
+        )
+        result = await self.push_screen_wait(PermissionScreen(tool_name, args))
+        if result == "all":
+            self._auto_approve_all = True
+            return True
+        return result == "once"
 
     # ── Helpers ──────────────────────────────────────────────
 

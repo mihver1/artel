@@ -148,6 +148,7 @@ def create_agent_session_from_bootstrap(
     project_dir: str,
     store: Any | None = None,
     session_id: str = "",
+    permission_callback: Any | None = None,
 ) -> AgentSession:
     """Create an AgentSession with consistent defaults across all modes."""
     return AgentSession(
@@ -165,5 +166,6 @@ def create_agent_session_from_bootstrap(
         compact_threshold=config.sessions.compact_threshold,
         context_window=bootstrap.context_window,
         permissions_config=config.permissions,
+        permission_callback=permission_callback,
         hooks=bootstrap.hooks,
     )

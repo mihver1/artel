@@ -431,6 +431,7 @@ class OpenAICompatProvider(Provider):
             "model": model,
             "input": input_items,
             "stream": True,
+            "store": False,
         }
         if instructions:
             body["instructions"] = instructions
