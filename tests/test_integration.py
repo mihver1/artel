@@ -500,6 +500,43 @@ class TestCliExtensions:
 
 # ── REST API ──────────────────────────────────────────────────────
 
+class TestRemoteControlClient:
+    @pytest.mark.asyncio
+    async def test_request_uses_same_port_api_path_when_remote_url_has_ws_suffix(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+        from worker_tui.remote_control import RemoteControlClient
+
+        async def handle_health(request):
+            return web.json_response({"path": request.path})
+
+        app = web.Application()
+        app.router.add_get("/api/health", handle_health)
+
+        async with TestClient(TestServer(app)) as client:
+            remote_url = str(client.make_url("/ws")).replace("http://", "ws://", 1)
+            payload = await RemoteControlClient(remote_url).request("GET", "/api/health")
+
+        assert payload == {"path": "/api/health"}
+
+    @pytest.mark.asyncio
+    async def test_request_uses_nested_api_path_for_prefixed_remote_url(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+        from worker_tui.remote_control import RemoteControlClient
+
+        async def handle_health(request):
+            return web.json_response({"path": request.path})
+
+        app = web.Application()
+        app.router.add_get("/worker/api/health", handle_health)
+
+        async with TestClient(TestServer(app)) as client:
+            remote_url = str(client.make_url("/worker/ws")).replace("http://", "ws://", 1)
+            payload = await RemoteControlClient(remote_url).request("GET", "/api/health")
+
+        assert payload == {"path": "/worker/api/health"}
+
 
 class TestRESTAPI:
     @pytest.fixture

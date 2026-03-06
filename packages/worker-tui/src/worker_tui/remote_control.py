@@ -16,12 +16,18 @@ def remote_rest_base_url(remote_url: str) -> str:
         raise ValueError(f"Unsupported remote URL scheme: {parts.scheme!r}")
 
     scheme = "https" if parts.scheme == "wss" else "http"
-    default_port = 443 if parts.scheme == "wss" else 80
-    ws_port = parts.port or default_port
-    rest_port = ws_port + 1
+    default_port = 443 if scheme == "https" else 80
+    normalized_path = parts.path.rstrip("/")
+    if normalized_path:
+        base_path = normalized_path[:-3] if normalized_path.endswith("/ws") else normalized_path
+        rest_port = parts.port or default_port
+    else:
+        ws_port = parts.port or default_port
+        rest_port = ws_port + 1
+        base_path = ""
     host = parts.hostname or ""
     netloc = host if rest_port == default_port else f"{host}:{rest_port}"
-    return urlunsplit((scheme, netloc, "", "", ""))
+    return urlunsplit((scheme, netloc, base_path, "", ""))
 
 
 class RemoteControlClient:

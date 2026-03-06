@@ -596,6 +596,18 @@ class TestRemoteTransportHelpers:
 
         assert remote_rest_base_url("ws://example.com:7432") == "http://example.com:7433"
         assert remote_rest_base_url("wss://example.com:443") == "https://example.com:444"
+
+    def test_remote_rest_base_url_uses_same_port_for_ws_path_proxy(self):
+        from worker_tui.remote_control import remote_rest_base_url
+
+        assert remote_rest_base_url("ws://example.com:7432/ws") == "http://example.com:7432"
+        assert remote_rest_base_url("wss://example.com/ws") == "https://example.com"
+        assert remote_rest_base_url("wss://example.com:8443/worker/ws") == "https://example.com:8443/worker"
+
+    def test_remote_rest_base_url_appends_api_under_custom_base_path(self):
+        from worker_tui.remote_control import remote_rest_base_url
+
+        assert remote_rest_base_url("ws://example.com:7432/worker") == "http://example.com:7432/worker"
     def test_remote_headers_with_token(self):
         from worker_tui.app import WorkerApp
 
