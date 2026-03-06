@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
-import os
-import textwrap
+from types import SimpleNamespace
 
 import pytest
-
-from conftest import MockProvider
-from worker_ai.models import Done, TextDelta, Usage
-
 
 # ── cmux module tests ─────────────────────────────────────────────
 
@@ -387,6 +381,135 @@ class TestCollapsibleTracking:
 
         collapsibles.clear()
         assert len(collapsibles) == 0
+
+
+def _tui_test_config():
+    return SimpleNamespace(
+        ui=SimpleNamespace(theme="dark"),
+        keybindings=SimpleNamespace(bindings={}),
+    )
+
+
+def _patch_tui_test_context(monkeypatch, *, prompts=None, skills=None):
+    import worker_tui.app as tui_app
+
+    monkeypatch.setattr(tui_app, "load_config", lambda _: _tui_test_config())
+    monkeypatch.setattr(tui_app, "load_prompts", lambda _: prompts or {})
+    monkeypatch.setattr(tui_app, "load_skills", lambda _: skills or {})
+    monkeypatch.setattr(
+        tui_app.WorkerApp,
+        "_apply_theme",
+        lambda self, name: setattr(self, "_active_theme", name),
+    )
+
+
+class TestSlashCommandSuggestions:
+    def test_matching_command_suggestions_include_dynamic_skill_entries(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._skills = {
+            "debug": SimpleNamespace(name="debug", description="Debug the current issue"),
+        }
+
+        matches = app._matching_command_suggestions("/skill:d")
+
+        assert [match.value for match in matches] == ["/skill:debug"]
+
+    def test_matching_command_suggestions_hide_after_command_arguments(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+
+        assert app._matching_command_suggestions("/model anthropic/claude") == []
+
+
+class TestTuiAutocompleteIntegration:
+    @pytest.mark.asyncio
+    async def test_input_is_focused_on_mount(self, monkeypatch):
+        from textual.widgets import Input
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", Input)
+            assert input_bar.has_focus
+
+    @pytest.mark.asyncio
+    async def test_slash_command_suggestions_filter_and_tab_complete(self, monkeypatch):
+        from textual.widgets import Input, OptionList
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(
+            monkeypatch,
+            skills={
+                "debug": SimpleNamespace(
+                    name="debug",
+                    description="Debug the current issue",
+                ),
+            },
+        )
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", Input)
+            input_bar.value = "/m"
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == [
+                "/model",
+                "/models",
+            ]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.value == "/model"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_slash_command_suggestions_navigate_past_first_five_items(self, monkeypatch):
+        from textual.widgets import Input, OptionList
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test(size=(80, 18)) as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", Input)
+            input_bar.value = "/"
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            visible_commands = [
+                suggestions.get_option_at_index(i).id for i in range(suggestions.option_count)
+            ]
+            assert len(visible_commands) > 5
+
+            for _ in range(5):
+                await pilot.press("down")
+            await pilot.pause()
+
+            assert suggestions.highlighted == 5
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.value == visible_commands[5]
 
 
 # ── Remote payload/auth helper tests ──────────────────────────────

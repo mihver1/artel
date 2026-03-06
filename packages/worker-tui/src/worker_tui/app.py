@@ -7,17 +7,27 @@ import json
 import os
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 import worker_core.cmux as cmux
 from rich.markdown import Markdown
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Collapsible, Footer, Header, Input, Static
+from textual.widgets import (
+    Button,
+    Collapsible,
+    Footer,
+    Header,
+    Input,
+    OptionList,
+    Static,
+)
+from textual.widgets.option_list import Option
 from worker_ai.models import Role
 from worker_core.agent import AgentEventType, AgentSession
 from worker_core.bootstrap import (
@@ -33,6 +43,39 @@ from worker_core.skills import inject_skill, load_skills
 from worker_core.tools.builtins import create_builtin_tools
 
 # ── Widgets ───────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class SlashCommandSuggestion:
+    """A slash command entry shown in the autocomplete dropdown."""
+
+    value: str
+    description: str
+
+
+BUILTIN_COMMAND_SUGGESTIONS: tuple[SlashCommandSuggestion, ...] = (
+    SlashCommandSuggestion("/help", "show available commands"),
+    SlashCommandSuggestion("/model", "show current model or switch model"),
+    SlashCommandSuggestion("/models", "list available models"),
+    SlashCommandSuggestion("/connect", "log in to a provider"),
+    SlashCommandSuggestion("/resume", "resume a saved session"),
+    SlashCommandSuggestion("/sessions", "list recent sessions"),
+    SlashCommandSuggestion("/compact", "compact conversation history"),
+    SlashCommandSuggestion("/name", "rename the current session"),
+    SlashCommandSuggestion("/tree", "show the session message tree"),
+    SlashCommandSuggestion("/fork", "fork from a message index"),
+    SlashCommandSuggestion("/prompts", "list prompt templates"),
+    SlashCommandSuggestion("/skill:", "load a skill into the session"),
+    SlashCommandSuggestion("/skills", "list available skills"),
+    SlashCommandSuggestion("/thinking", "set the thinking level"),
+    SlashCommandSuggestion("/theme", "switch the active theme"),
+    SlashCommandSuggestion("/export", "export the session to HTML"),
+    SlashCommandSuggestion("/reload", "reload extensions, prompts, and skills"),
+    SlashCommandSuggestion("/split", "open a cmux split pane"),
+    SlashCommandSuggestion("/browser", "open a cmux browser pane"),
+    SlashCommandSuggestion("/clear", "clear chat and start a new session"),
+    SlashCommandSuggestion("/quit", "exit the TUI"),
+)
 
 
 class MessageWidget(Static):
@@ -249,6 +292,16 @@ class WorkerApp(App):
     #chat-container {
         height: auto;
     }
+    #command-suggestions {
+        display: none;
+        height: 5;
+        margin: 0 1;
+        background: $surface;
+        color: $text;
+    }
+    #command-suggestions.visible {
+        display: block;
+    }
     #input-bar {
         height: auto;
         max-height: 6;
@@ -290,12 +343,14 @@ class WorkerApp(App):
         self._output_price: float = 0.0
         self._auto_approve_all: bool = False
         self._provider_model: str = ""  # "provider/model" for DB storage
+        self._suppress_next_command_menu_update: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="main-content"):
             with VerticalScroll(id="chat-scroll"):
                 yield Vertical(id="chat-container")
+            yield OptionList(id="command-suggestions", compact=True)
             yield Input(placeholder="Type a message... (Enter to send)", id="input-bar")
             yield StatusFooter(id="status-footer")
         yield Footer()
@@ -319,6 +374,173 @@ class WorkerApp(App):
         # Apply custom keybindings from config
         for key, action in config.keybindings.bindings.items():
             self.bind(key, action, description=action)
+
+        self.call_after_refresh(self._focus_input)
+
+    def _focus_input(self) -> None:
+        """Keep the main input focused for immediate typing."""
+        self.query_one("#input-bar", Input).focus()
+
+    def _command_menu(self) -> OptionList:
+        return self.query_one("#command-suggestions", OptionList)
+
+    def _command_menu_visible(self) -> bool:
+        menu = self._command_menu()
+        return menu.has_class("visible") and menu.option_count > 0
+
+    def _show_command_menu(self) -> None:
+        self._command_menu().add_class("visible")
+
+    def _hide_command_menu(self) -> None:
+        menu = self._command_menu()
+        menu.remove_class("visible")
+        if menu.option_count:
+            menu.clear_options()
+
+    def _truncate_command_description(self, description: str, limit: int = 44) -> str:
+        clean = " ".join(description.split())
+        if len(clean) <= limit:
+            return clean
+        return clean[: limit - 1] + "…"
+
+    def _command_suggestions(self) -> list[SlashCommandSuggestion]:
+        suggestions = list(BUILTIN_COMMAND_SUGGESTIONS)
+
+        for name, template in sorted(self._prompts.items()):
+            suggestions.append(
+                SlashCommandSuggestion(
+                    f"/{name}",
+                    self._truncate_command_description(template),
+                )
+            )
+
+        if self._skills:
+            for skill in sorted(self._skills.values(), key=lambda item: item.name):
+                description = getattr(skill, "description", "") or "load skill"
+                suggestions.append(
+                    SlashCommandSuggestion(
+                        f"/skill:{skill.name}",
+                        self._truncate_command_description(description),
+                    )
+                )
+
+        if self._session:
+            for name in sorted(self._session.hooks.commands):
+                suggestions.append(
+                    SlashCommandSuggestion(f"/{name}", "extension command")
+                )
+
+        deduped: list[SlashCommandSuggestion] = []
+        seen: set[str] = set()
+        for suggestion in suggestions:
+            if suggestion.value in seen:
+                continue
+            seen.add(suggestion.value)
+            deduped.append(suggestion)
+        return deduped
+
+    def _matching_command_suggestions(self, text: str) -> list[SlashCommandSuggestion]:
+        query = text.strip().lower()
+        if not query.startswith("/") or " " in query:
+            return []
+        return [
+            suggestion
+            for suggestion in self._command_suggestions()
+            if suggestion.value.lower().startswith(query)
+        ]
+
+    def _update_command_menu(self, text: str) -> None:
+        menu = self._command_menu()
+        matches = self._matching_command_suggestions(text)
+        if not matches:
+            self._hide_command_menu()
+            return
+
+        options = [
+            Option(
+                f"{suggestion.value} — "
+                f"{self._truncate_command_description(suggestion.description)}",
+                id=suggestion.value,
+            )
+            for suggestion in matches
+        ]
+        menu.clear_options()
+        menu.add_options(options)
+        menu.highlighted = 0
+        menu.scroll_home(animate=False)
+        self._show_command_menu()
+
+    def _selected_command_suggestion(self) -> str | None:
+        menu = self._command_menu()
+        highlighted = menu.highlighted
+        if highlighted is None or menu.option_count == 0:
+            return None
+        option = menu.get_option_at_index(highlighted)
+        return option.id
+
+    def _move_command_suggestion(self, delta: int) -> None:
+        menu = self._command_menu()
+        if not self._command_menu_visible():
+            return
+        highlighted = menu.highlighted if menu.highlighted is not None else 0
+        highlighted = max(0, min(menu.option_count - 1, highlighted + delta))
+        menu.highlighted = highlighted
+        menu.scroll_to_highlight()
+
+    def _apply_command_suggestion(
+        self,
+        command: str | None = None,
+        *,
+        only_if_completion_needed: bool = False,
+    ) -> bool:
+        input_bar = self.query_one("#input-bar", Input)
+        command = command or self._selected_command_suggestion()
+        if not command:
+            return False
+        if only_if_completion_needed and input_bar.value.strip() == command:
+            return False
+        self._suppress_next_command_menu_update = True
+
+        input_bar.value = command
+        input_bar.cursor_position = len(command)
+        self._hide_command_menu()
+        self.call_after_refresh(self._focus_input)
+        return True
+
+    def on_key(self, event: events.Key) -> None:
+        input_bar = self.query_one("#input-bar", Input)
+        if not input_bar.has_focus or not self._command_menu_visible():
+            return
+
+        if event.key == "down":
+            self._move_command_suggestion(1)
+        elif event.key == "up":
+            self._move_command_suggestion(-1)
+        elif event.key == "tab":
+            if not self._apply_command_suggestion():
+                return
+        elif event.key == "escape":
+            self._hide_command_menu()
+        else:
+            return
+
+        event.stop()
+        event.prevent_default()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "input-bar":
+            return
+        if self._suppress_next_command_menu_update:
+            self._suppress_next_command_menu_update = False
+            self._hide_command_menu()
+            return
+        self._update_command_menu(event.value)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "command-suggestions":
+            return
+        self._apply_command_suggestion(event.option.id)
+        event.stop()
 
     async def _init_local_session(self) -> None:
         from worker_core.cli import _resolve_api_key
@@ -398,8 +620,14 @@ class WorkerApp(App):
         text = event.value.strip()
         if not text:
             return
+        if self._command_menu_visible() and self._apply_command_suggestion(
+            only_if_completion_needed=True
+        ):
+            return
 
         event.input.value = ""
+        self._hide_command_menu()
+        self.call_after_refresh(self._focus_input)
 
         # Handle bash commands: !! = local only, ! = send output to LLM
         if text.startswith("!!"):
@@ -877,9 +1105,8 @@ class WorkerApp(App):
         info = await self._store.get_session(session_id)
 
         # Switch to the session's original model if different
-        if info and info.model and "/" in info.model:
-            if info.model != self._provider_model:
-                await self._switch_model(info.model)
+        if info and info.model and "/" in info.model and info.model != self._provider_model:
+            await self._switch_model(info.model)
 
         if not self._session:
             return
@@ -1343,6 +1570,7 @@ class WorkerApp(App):
         container = self.query_one("#chat-container", Vertical)
         container.remove_children()
         self._tool_collapsibles.clear()
+        self._hide_command_menu()
         if self.remote_url:
             self._remote_session_id = str(uuid.uuid4())
         if self._session:
@@ -1353,6 +1581,7 @@ class WorkerApp(App):
                 )
             self._session.session_id = new_id
             self._session.messages = self._session.messages[:1]
+        self.call_after_refresh(self._focus_input)
 
 
 def run_tui(
