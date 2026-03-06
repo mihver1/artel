@@ -482,9 +482,9 @@ class AnthropicProvider(Provider):
             usage = Usage()
 
             async for raw_line in response.aiter_lines():
-                if not raw_line.startswith("data: "):
+                if not raw_line.startswith("data:"):
                     continue
-                data_str = raw_line[6:]
+                data_str = raw_line[5:].lstrip()
                 if data_str.strip() == "[DONE]":
                     break
 

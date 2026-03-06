@@ -11,8 +11,9 @@ from worker_ai.providers import create_default_registry
 from worker_ai.providers.kimi import KimiProvider
 
 
-def _sse_lines(events: list[dict]) -> list[str]:
-    return [f"data: {json.dumps(event)}" for event in events] + ["data: [DONE]"]
+def _sse_lines(events: list[dict], *, spaced: bool = True) -> list[str]:
+    prefix = "data: " if spaced else "data:"
+    return [f"{prefix}{json.dumps(event)}" for event in events] + [f"{prefix}[DONE]"]
 
 
 class TestKimiProviderRegistry:
@@ -90,5 +91,53 @@ class TestKimiProviderRuntime:
         assert "reasoning_effort" not in body
         assert headers["x-api-key"] == "moonshot-token"
         assert headers["anthropic-version"] == "2023-06-01"
+
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_accepts_moonshot_sse_without_space_after_data_prefix(self):
+        provider = KimiProvider(api_key="moonshot-token")
+
+        events = [
+            {
+                "type": "message_start",
+                "message": {"usage": {"input_tokens": 3}},
+            },
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Hi"},
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1},
+            },
+        ]
+
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        async def async_lines():
+            for line in _sse_lines(events, spaced=False):
+                yield line
+
+        mock_response.aiter_lines = async_lines
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(provider._client, "stream", return_value=mock_cm):
+            collected = []
+            async for event in provider.stream_chat(
+                "kimi-k2.5",
+                [Message(role=Role.USER, content="Hi")],
+            ):
+                collected.append(event)
+
+        assert isinstance(collected[0], TextDelta)
+        assert collected[0].content == "Hi"
+        assert isinstance(collected[1], Done)
+        assert collected[1].usage.input_tokens == 3
+        assert collected[1].usage.output_tokens == 1
 
         await provider.close()
