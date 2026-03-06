@@ -570,45 +570,48 @@ class WorkerApp(App):
 
     @work(exclusive=True, thread=False)
     async def _list_models(self) -> None:
-        """Show available models from models.dev catalog for configured providers."""
+        """Show available models for connected providers only."""
         from worker_ai.models_catalog import ModelsCatalog
         from worker_core.cli import _resolve_api_key
 
         config = load_config(os.getcwd())
 
-        # Providers supported directly plus configured aliases.
-        key_providers = [
+        # Collect all candidate provider names: explicit config + well-known ones.
+        candidate_providers = list(config.providers)
+        for pid in [
             "anthropic", "openai", "google", "kimi", "ollama",
             "groq", "openrouter", "deepseek", "mistral", "xai",
             "together", "cerebras",
-        ]
-        for provider_name in config.providers:
-            if provider_name not in key_providers:
-                key_providers.append(provider_name)
+        ]:
+            if pid not in candidate_providers:
+                candidate_providers.append(pid)
 
         catalog = await ModelsCatalog.load()
         lines: list[str] = []
-        for pid in key_providers:
+        for pid in candidate_providers:
             prov = catalog.get(pid)
             if not prov or not prov.models:
                 continue
-            requires_api_key = provider_requires_api_key(config, pid)
+            requires_key = provider_requires_api_key(config, pid)
             api_key, _ = await _resolve_api_key(config, pid)
-            marker = "✓" if (api_key or not requires_api_key) else " "
-            lines.append(f"\n  [{marker}] {prov.name}:")
-            for m in prov.models[:8]:  # Show top 8 models per provider
+            connected = bool(api_key or not requires_key)
+            if not connected:
+                continue
+            lines.append(f"\n  {prov.name}:")
+            for m in prov.models:
                 ctx = f"{m.context_window // 1000}k" if m.context_window else "?"
                 lines.append(f"      {pid}/{m.id}  ({m.name}, {ctx} ctx)")
-            if len(prov.models) > 8:
-                lines.append(f"      ... and {len(prov.models) - 8} more")
 
         if lines:
             self._add_message(
-                "Models (\u2713 = credentials available):\n" + "\n".join(lines),
+                "Connected providers:\n" + "\n".join(lines),
                 role="tool",
             )
         else:
-            self._add_message("Failed to load model catalog.", role="error")
+            self._add_message(
+                "No connected providers. Use /connect <provider> to log in.",
+                role="error",
+            )
 
     async def _switch_model(self, model_str: str) -> None:
         """Switch to a different model (provider/model-id format)."""
