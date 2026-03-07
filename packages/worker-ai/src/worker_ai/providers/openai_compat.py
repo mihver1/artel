@@ -321,6 +321,12 @@ def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[di
     """
     instructions: str | None = None
     items: list[dict[str, Any]] = []
+    tool_result_ids = {
+        msg.tool_result.tool_call_id
+        for msg in messages
+        if msg.role == Role.TOOL and msg.tool_result is not None
+    }
+    emitted_tool_call_ids: set[str] = set()
 
     for msg in messages:
         if msg.role == Role.SYSTEM:
@@ -329,6 +335,8 @@ def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[di
 
         if msg.role == Role.TOOL:
             assert msg.tool_result is not None
+            if msg.tool_result.tool_call_id not in emitted_tool_call_ids:
+                continue
             items.append({
                 "type": "function_call_output",
                 "call_id": msg.tool_result.tool_call_id,
@@ -345,6 +353,8 @@ def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[di
                     "content": msg.content,
                 })
             for tc in msg.tool_calls:
+                if tc.id not in tool_result_ids:
+                    continue
                 arguments = (
                     json.dumps(tc.arguments)
                     if isinstance(tc.arguments, dict)
@@ -356,6 +366,7 @@ def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[di
                     "arguments": arguments,
                     "call_id": tc.id,
                 })
+                emitted_tool_call_ids.add(tc.id)
             continue
 
         items.append({

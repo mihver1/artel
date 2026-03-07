@@ -91,6 +91,12 @@ def _prompt_to_text(prompt: list[Any]) -> str:
     return "\n\n".join(parts)
 
 
+def _text_chunks(text: str, *, chunk_size: int = 4096) -> list[str]:
+    if not text:
+        return []
+    return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
+
+
 def _tool_title(tool_name: str, args: dict[str, Any]) -> str:
     if not args:
         return tool_name
@@ -174,12 +180,11 @@ async def run_acp() -> None:
         from acp import (
             Agent,
             run_agent,
-            start_tool_call,
             text_block,
             tool_content,
             update_agent_message_text,
             update_agent_thought_text,
-            update_tool_call,
+            update_user_message_text,
         )
         from acp.contrib.permissions import PermissionBroker
         from acp.contrib.tool_calls import ToolCallTracker
@@ -402,6 +407,29 @@ async def run_acp() -> None:
                 "modes": self._session_mode_state(session_id),
             }
 
+        async def _replay_session_history(self, session_id: str) -> None:
+            from worker_ai.models import Role as WorkerRole
+
+            messages = await server_mod._session_history_messages(state, session_id)
+            for message in messages:
+                if message.role == WorkerRole.USER:
+                    for chunk in _text_chunks(message.content):
+                        await self._conn.session_update(
+                            session_id=session_id,
+                            update=update_user_message_text(chunk),
+                        )
+                elif message.role == WorkerRole.ASSISTANT and message.content:
+                    for chunk in _text_chunks(message.reasoning or ""):
+                        await self._conn.session_update(
+                            session_id=session_id,
+                            update=update_agent_thought_text(chunk),
+                        )
+                    for chunk in _text_chunks(message.content):
+                        await self._conn.session_update(
+                            session_id=session_id,
+                            update=update_agent_message_text(chunk),
+                        )
+
         async def _ensure_session_known(
             self,
             session_id: str,
@@ -490,6 +518,7 @@ async def run_acp() -> None:
             project_dir = str(serialized.get("project_dir", "")).strip()
             if project_dir and not _workspace_matches(project_dir, requested_dir):
                 return None
+            await self._replay_session_history(session_id)
             return LoadSessionResponse(**(await self._session_response_payload(session_id)))
 
         async def list_sessions(
@@ -614,9 +643,19 @@ async def run_acp() -> None:
 
             async with runtime.prompt_lock:
                 tracker = ToolCallTracker()
+                async def _request_permission(request: Any) -> Any:
+                    kwargs = {
+                        "session_id": request.session_id,
+                        "tool_call": request.tool_call,
+                        "options": request.options,
+                    }
+                    field_meta = getattr(request, "field_meta", None)
+                    if isinstance(field_meta, dict):
+                        kwargs.update(field_meta)
+                    return await self._conn.request_permission(**kwargs)
                 broker = PermissionBroker(
                     session_id=session_id,
-                    requester=self._conn.request_permission,
+                    requester=_request_permission,
                     tracker=tracker,
                 )
                 runtime.tracker = tracker
@@ -657,8 +696,8 @@ async def run_acp() -> None:
                             ]
                             await self._conn.session_update(
                                 session_id=session_id,
-                                update=start_tool_call(
-                                    tool_call_id=event.tool_call_id,
+                                update=tracker.start(
+                                    event.tool_call_id,
                                     title=_tool_title(event.tool_name, event.tool_args),
                                     kind=server_mod._tool_kind_for_name(event.tool_name),
                                     status="pending",
@@ -669,8 +708,8 @@ async def run_acp() -> None:
                         elif event.type == server_mod.AgentEventType.TOOL_RESULT:
                             await self._conn.session_update(
                                 session_id=session_id,
-                                update=update_tool_call(
-                                    tool_call_id=event.tool_call_id,
+                                update=tracker.progress(
+                                    event.tool_call_id,
                                     status="failed" if event.is_error else "completed",
                                     content=[tool_content(text_block(event.content))],
                                     raw_output={
@@ -783,6 +822,7 @@ async def run_acp() -> None:
             project_dir = str(serialized.get("project_dir", "")).strip()
             if project_dir and not _workspace_matches(project_dir, requested_dir):
                 raise RuntimeError(f"Session not in workspace: {session_id}")
+            await self._replay_session_history(session_id)
             from acp.schema import ResumeSessionResponse
 
             return ResumeSessionResponse(**(await self._session_response_payload(session_id)))

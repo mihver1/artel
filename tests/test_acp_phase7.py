@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+from worker_ai.models import Message, Role
 from worker_core.config import WorkerConfig
 from worker_server.server import ServerState
 
@@ -33,7 +34,28 @@ class _FakeConn:
         self.updates.append((session_id, update))
 
     async def request_permission(self, **kwargs: Any) -> Any:
-        self.permission_requests.append(dict(kwargs))
+        tool_call = kwargs.get("tool_call")
+        tool_call_id = kwargs.get("tool_call_id")
+        if tool_call_id is None and tool_call is not None:
+            tool_call_id = getattr(tool_call, "tool_call_id", None)
+        options = kwargs.get("options", [])
+        self.permission_requests.append(
+            {
+                "session_id": kwargs.get("session_id"),
+                "tool_call_id": tool_call_id,
+                "options": [
+                    {
+                        "id": (
+                            option.get("id")
+                            if isinstance(option, dict)
+                            else getattr(option, "option_id", None)
+                            or getattr(option, "id", None)
+                        )
+                    }
+                    for option in options
+                ],
+            }
+        )
         return SimpleNamespace(
             outcome={
                 "outcome": "selected",
@@ -66,28 +88,83 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
 
         async def request_for(self, tool_call_id: str) -> Any:
             return await self.requester(
-                session_id=self.session_id,
-                tool_call_id=tool_call_id,
-                options=[
-                    {"id": "approve"},
-                    {"id": "approve_for_session"},
-                    {"id": "deny"},
-                ],
+                SimpleNamespace(
+                    session_id=self.session_id,
+                    tool_call=self.tracker.tool_call_model(tool_call_id),
+                    options=[
+                        {"id": "approve"},
+                        {"id": "approve_for_session"},
+                        {"id": "reject"},
+                    ],
+                    field_meta=None,
+                )
             )
 
     class ToolCallTracker:
         def __init__(self) -> None:
+            self.calls: dict[str, dict[str, Any]] = {}
             self.forgotten: list[str] = []
 
-        def progress(self, tool_call_id: str, *, status: str) -> dict[str, str]:
-            return {
-                "kind": "tool_progress",
-                "tool_call_id": tool_call_id,
+        def start(
+            self,
+            tool_call_id: str,
+            *,
+            title: str,
+            kind: str | None = None,
+            status: str | None = None,
+            content: Any = None,
+            locations: Any = None,
+            raw_input: Any = None,
+            raw_output: Any = None,
+        ) -> dict[str, Any]:
+            acp_tool_call_id = f"acp_{tool_call_id}"
+            self.calls[tool_call_id] = {
+                "tool_call_id": acp_tool_call_id,
+                "title": title,
+                "kind": kind,
                 "status": status,
+                "content": content,
+                "locations": locations,
+                "raw_input": raw_input,
+                "raw_output": raw_output,
+            }
+            return {
+                "kind": "start_tool_call",
+                "tool_call_id": acp_tool_call_id,
+                "title": title,
+                "tool_kind": kind,
+                "status": status,
+                "content": content,
+                "locations": locations,
+                "raw_input": raw_input,
+                "raw_output": raw_output,
+            }
+
+        def tool_call_model(self, tool_call_id: str) -> Any:
+            call = self.calls[tool_call_id]
+            return SimpleNamespace(
+                tool_call_id=call["tool_call_id"],
+                title=call["title"],
+                kind=call["kind"],
+                status=call["status"],
+                content=call["content"],
+                locations=call["locations"],
+                raw_input=call["raw_input"],
+                raw_output=call["raw_output"],
+            )
+
+        def progress(self, tool_call_id: str, **kwargs: Any) -> dict[str, Any]:
+            call = self.calls[tool_call_id]
+            call.update(kwargs)
+            return {
+                "kind": "tool_call_update",
+                "tool_call_id": call["tool_call_id"],
+                **kwargs,
             }
 
         def forget(self, tool_call_id: str) -> None:
             self.forgotten.append(tool_call_id)
+            self.calls.pop(tool_call_id, None)
 
     def start_tool_call(**kwargs: Any) -> dict[str, Any]:
         tool_kind = kwargs.pop("kind", None)
@@ -102,6 +179,8 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
 
     def update_agent_message_text(text: str) -> dict[str, str]:
         return {"kind": "message_text", "text": text}
+    def update_user_message_text(text: str) -> dict[str, str]:
+        return {"kind": "user_message_text", "text": text}
 
     def update_agent_thought_text(text: str) -> dict[str, str]:
         return {"kind": "thought_text", "text": text}
@@ -120,6 +199,7 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
     acp_mod.update_agent_message_text = update_agent_message_text
     acp_mod.update_agent_thought_text = update_agent_thought_text
     acp_mod.update_tool_call = update_tool_call
+    acp_mod.update_user_message_text = update_user_message_text
 
     permissions_mod.PermissionBroker = PermissionBroker
     tool_calls_mod.ToolCallTracker = ToolCallTracker
@@ -507,11 +587,11 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
     assert captured["conn"].permission_requests == [
         {
             "session_id": session_id,
-            "tool_call_id": "tc1",
+            "tool_call_id": "acp_tc1",
             "options": [
                 {"id": "approve"},
                 {"id": "approve_for_session"},
-                {"id": "deny"},
+                {"id": "reject"},
             ],
         }
     ]
@@ -531,18 +611,20 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
     assert any(
         isinstance(update, dict)
         and update.get("kind") == "start_tool_call"
-        and update.get("tool_call_id") == "tc1"
+        and update.get("tool_call_id") == "acp_tc1"
         for update in updates
     )
     assert any(
         isinstance(update, dict)
-        and update.get("kind") == "tool_progress"
+        and update.get("kind") == "tool_call_update"
+        and update.get("tool_call_id") == "acp_tc1"
         and update.get("status") == "in_progress"
         for update in updates
     )
     assert any(
         isinstance(update, dict)
-        and update.get("kind") == "update_tool_call"
+        and update.get("kind") == "tool_call_update"
+        and update.get("tool_call_id") == "acp_tc1"
         and update.get("status") == "completed"
         for update in updates
     )
@@ -564,3 +646,56 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
         for update in updates
         if not isinstance(update, dict)
     )
+
+
+@pytest.mark.asyncio
+async def test_run_acp_load_session_replays_visible_history(monkeypatch, tmp_path):
+    import worker_server.acp as acp_mod
+
+    captured: dict[str, Any] = {}
+    titles: dict[str, str] = {}
+    state = ServerState(config=WorkerConfig(), default_project_dir=str(tmp_path))
+    session_id = "existing-session"
+    state.session_provider_models[session_id] = state.config.agent.model
+    state.session_projects[session_id] = str(tmp_path)
+    state.session_thinking_levels[session_id] = "off"
+
+    async def fake_history(state_obj: ServerState, requested_session_id: str) -> list[Message]:
+        assert state_obj is state
+        assert requested_session_id == session_id
+        return [
+            Message(role=Role.USER, content="Restored user"),
+            Message(
+                role=Role.ASSISTANT,
+                reasoning="Reasoning should replay",
+                content="Restored assistant",
+            ),
+            Message(role=Role.ASSISTANT, reasoning="Reasoning-only row should be skipped"),
+        ]
+
+    async def fake_run_agent(agent: Any, **kwargs: Any) -> None:
+        assert kwargs == {"use_unstable_protocol": True}
+        conn = _FakeConn()
+        captured["conn"] = conn
+        agent.on_connect(conn)
+        captured["load_session"] = await agent.load_session(
+            cwd=str(tmp_path),
+            session_id=session_id,
+        )
+
+    _install_fake_acp(monkeypatch, run_agent=fake_run_agent)
+    _patch_acp_server_state(monkeypatch, acp_mod, state, titles)
+    monkeypatch.setattr(
+        acp_mod.server_mod,
+        "_session_history_messages",
+        fake_history,
+    )
+
+    await acp_mod.run_acp()
+
+    assert captured["load_session"].models.current_model_id == state.config.agent.model
+    updates = [update for _, update in captured["conn"].updates]
+    assert {"kind": "user_message_text", "text": "Restored user"} in updates
+    assert {"kind": "thought_text", "text": "Reasoning should replay"} in updates
+    assert {"kind": "message_text", "text": "Restored assistant"} in updates
+    assert {"kind": "thought_text", "text": "Reasoning-only row should be skipped"} not in updates

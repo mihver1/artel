@@ -143,13 +143,61 @@ class TestBuildResponsesInput:
                 content="Let me check...",
                 tool_calls=[ToolCall(id="c1", name="ls", arguments={"dir": "."})],
             ),
+            Message(
+                role=Role.TOOL,
+                tool_result=ToolResult(tool_call_id="c1", content="file list"),
+            ),
         ]
         _, items = _build_responses_input(messages)
         # Should emit text message + function_call
-        assert len(items) == 2
+        assert len(items) == 3
         assert items[0]["type"] == "message"
         assert items[0]["content"] == "Let me check..."
         assert items[1]["type"] == "function_call"
+        assert items[2] == {
+            "type": "function_call_output",
+            "call_id": "c1",
+            "output": "file list",
+        }
+
+    def test_orphan_tool_call_is_omitted(self):
+        messages = [
+            Message(role=Role.USER, content="Continue"),
+            Message(
+                role=Role.ASSISTANT,
+                content="I started checking.",
+                tool_calls=[
+                    ToolCall(
+                        id="call-orphan",
+                        name="ripgrep",
+                        arguments={"pattern": "foo"},
+                    )
+                ],
+            ),
+            Message(role=Role.USER, content="Try again"),
+        ]
+        instructions, items = _build_responses_input(messages)
+        assert instructions is None
+        assert items == [
+            {"type": "message", "role": "user", "content": "Continue"},
+            {"type": "message", "role": "assistant", "content": "I started checking."},
+            {"type": "message", "role": "user", "content": "Try again"},
+        ]
+
+    def test_orphan_tool_result_is_omitted(self):
+        messages = [
+            Message(role=Role.USER, content="Continue"),
+            Message(
+                role=Role.TOOL,
+                tool_result=ToolResult(tool_call_id="call-orphan", content="orphan output"),
+            ),
+            Message(role=Role.USER, content="Try again"),
+        ]
+        _, items = _build_responses_input(messages)
+        assert items == [
+            {"type": "message", "role": "user", "content": "Continue"},
+            {"type": "message", "role": "user", "content": "Try again"},
+        ]
 
     def test_empty_messages(self):
         instructions, items = _build_responses_input([])
