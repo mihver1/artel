@@ -1095,12 +1095,11 @@ class WorkerApp(App):
         if prior_messages:
             self._session.messages.extend(prior_messages)
             for msg in prior_messages:
-                if msg.role == Role.USER:
-                    self._add_message(msg.content, role="user")
-                elif msg.role == Role.ASSISTANT and msg.content:
-                    self._add_message(msg.content, role="assistant")
-                elif msg.role == Role.SYSTEM and msg.content:
-                    self._add_message("\U0001f4cb [Restored session]", role="tool")
+                self._render_restored_message(
+                    role=msg.role.value,
+                    content=msg.content,
+                    reasoning=msg.reasoning or "",
+                )
 
         self._provider_model = f"{provider_name}/{model_id}"
         self.sub_title = self._provider_model
@@ -1289,6 +1288,7 @@ class WorkerApp(App):
         widget: MessageWidget | None = None
         reasoning_widget: MessageWidget | None = None
         had_tool_calls = False
+        need_new_reasoning_block = False
 
         # cmux: set status to thinking
         await cmux.set_status("state", "thinking", icon="brain", color="#89b4fa")
@@ -1296,14 +1296,9 @@ class WorkerApp(App):
         async for event in self._session.run(text):
             if event.type == AgentEventType.REASONING_DELTA:
                 # Show thinking in a collapsible block
-                if reasoning_widget is None:
-                    reasoning_widget = MessageWidget("", role="reasoning")
-                    container = self.query_one("#chat-container", Vertical)
-                    collapsible = Collapsible(
-                        reasoning_widget, title="💡 thinking", collapsed=True,
-                    )
-                    container.mount(collapsible)
-                    self._tool_collapsibles.append(collapsible)
+                if reasoning_widget is None or need_new_reasoning_block:
+                    reasoning_widget = self._add_reasoning_block()
+                    need_new_reasoning_block = False
                 reasoning_widget.append_content(event.content)
 
             elif event.type == AgentEventType.TEXT_DELTA:
@@ -1311,12 +1306,12 @@ class WorkerApp(App):
                 if widget is None or had_tool_calls:
                     widget = self._add_message("", role="assistant")
                     had_tool_calls = False
-                    reasoning_widget = None  # reset for next turn
                 widget.append_content(event.content)
                 self.call_after_refresh(self._scroll_to_bottom)
 
             elif event.type == AgentEventType.TOOL_CALL:
                 had_tool_calls = True
+                need_new_reasoning_block = True
                 tool_args = ", ".join(
                     f"{k}={v!r}" for k, v in event.tool_args.items()
                 )
@@ -1384,30 +1379,26 @@ class WorkerApp(App):
         widget: MessageWidget | None = None
         reasoning_widget: MessageWidget | None = None
         had_tool_calls = False
+        need_new_reasoning_block = False
 
         try:
             async for raw in self._ws:
                 msg = json.loads(raw)
                 msg_type = msg.get("type", "")
                 if msg_type == "reasoning_delta":
-                    if reasoning_widget is None:
-                        reasoning_widget = MessageWidget("", role="reasoning")
-                        container = self.query_one("#chat-container", Vertical)
-                        collapsible = Collapsible(
-                            reasoning_widget, title="💡 thinking", collapsed=True,
-                        )
-                        container.mount(collapsible)
-                        self._tool_collapsibles.append(collapsible)
+                    if reasoning_widget is None or need_new_reasoning_block:
+                        reasoning_widget = self._add_reasoning_block()
+                        need_new_reasoning_block = False
                     reasoning_widget.append_content(msg.get("content", ""))
                 elif msg_type == "text_delta":
                     if widget is None or had_tool_calls:
                         widget = self._add_message("", role="assistant")
                         had_tool_calls = False
-                        reasoning_widget = None
                     widget.append_content(msg.get("content", ""))
                     self.call_after_refresh(self._scroll_to_bottom)
                 elif msg_type == "tool_call":
                     had_tool_calls = True
+                    need_new_reasoning_block = True
                     tool_name = str(msg.get("tool", "")).strip()
                     tool_args = msg.get("args", {})
                     if isinstance(tool_args, dict) and tool_args:
@@ -1988,12 +1979,8 @@ class WorkerApp(App):
         for message in messages_payload.get("messages", []):
             role = str(message.get("role", ""))
             content = str(message.get("content", ""))
-            if role == Role.USER.value:
-                self._add_message(content, role="user")
-            elif role == Role.ASSISTANT.value and content:
-                self._add_message(content, role="assistant")
-            elif role == Role.SYSTEM.value and content:
-                self._add_message("\U0001f4cb [Restored session]", role="tool")
+            reasoning = str(message.get("reasoning", ""))
+            self._render_restored_message(role=role, content=content, reasoning=reasoning)
 
         title = str(session.get("title", "")).strip() or session_id[:8]
         self._add_message(f"Resumed remote session: {title}", role="tool")
@@ -2074,12 +2061,11 @@ class WorkerApp(App):
 
         # Display restored messages
         for msg in messages:
-            if msg.role == Role.USER:
-                self._add_message(msg.content, role="user")
-            elif msg.role == Role.ASSISTANT and msg.content:
-                self._add_message(msg.content, role="assistant")
-            elif msg.role == Role.SYSTEM and msg.content:
-                self._add_message("\U0001f4cb [Restored session]", role="tool")
+            self._render_restored_message(
+                role=msg.role.value,
+                content=msg.content,
+                reasoning=msg.reasoning or "",
+            )
 
         title = info.title if info else session_id[:8]
         self._add_message(f"Resumed session: {title}", role="tool")
@@ -2715,6 +2701,15 @@ class WorkerApp(App):
         self._scroll_to_bottom()
         return widget
 
+    def _add_reasoning_block(self, content: str = "") -> MessageWidget:
+        container = self.query_one("#chat-container", Vertical)
+        widget = MessageWidget(content, role="reasoning")
+        collapsible = Collapsible(widget, title="💡 thinking", collapsed=True)
+        container.mount(collapsible)
+        self._tool_collapsibles.append(collapsible)
+        self._scroll_to_bottom()
+        return widget
+
     def _add_tool_message(self, content: str) -> Collapsible:
         """Add a tool message wrapped in a collapsible container."""
         container = self.query_one("#chat-container", Vertical)
@@ -2724,6 +2719,23 @@ class WorkerApp(App):
         self._tool_collapsibles.append(collapsible)
         self._scroll_to_bottom()
         return collapsible
+
+    def _render_restored_message(
+        self,
+        *,
+        role: str,
+        content: str,
+        reasoning: str = "",
+    ) -> None:
+        if role == Role.USER.value:
+            self._add_message(content, role="user")
+        elif role == Role.ASSISTANT.value:
+            if reasoning:
+                self._add_reasoning_block(reasoning)
+            if content:
+                self._add_message(content, role="assistant")
+        elif role == Role.SYSTEM.value and content:
+            self._add_message("📋 [Restored session]", role="tool")
 
     def _scroll_to_bottom(self) -> None:
         scroll = self.query_one("#chat-scroll", VerticalScroll)

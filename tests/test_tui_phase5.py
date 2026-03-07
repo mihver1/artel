@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -416,6 +417,11 @@ def _patch_tui_test_context(monkeypatch, *, prompts=None, skills=None):
         "_apply_theme",
         lambda self, name: setattr(self, "_active_theme", name),
     )
+
+
+async def _events(items):
+    for item in items:
+        yield item
 
 
 class TestSlashCommandSuggestions:
@@ -1144,6 +1150,122 @@ class TestRemoteModeCommandRouting:
         ]
 
     @pytest.mark.asyncio
+    async def test_resume_command_restores_remote_reasoning_blocks(self):
+        from worker_tui.app import WorkerApp
+
+        class _RemoteClient:
+            async def get_session(self, session_id: str):
+                return {
+                    "session": {
+                        "id": session_id,
+                        "title": "Remote issue",
+                        "model": "openai/gpt-4.1",
+                        "project_dir": "/srv/project",
+                    }
+                }
+
+            async def get_session_messages(self, session_id: str):
+                return {
+                    "messages": [
+                        {"role": "user", "content": "hello"},
+                        {
+                            "role": "assistant",
+                            "reasoning": "first thought",
+                            "content": "world",
+                        },
+                    ]
+                }
+
+        class _Container:
+            def remove_children(self) -> None:
+                pass
+
+        class _Footer:
+            def set_model(self, model: str) -> None:
+                pass
+
+            def set_cwd(self, cwd: str) -> None:
+                pass
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._remote_control_client = _RemoteClient()
+        container = _Container()
+        footer = _Footer()
+        app.query_one = lambda selector, _cls=None: (  # type: ignore[method-assign]
+            container if selector == "#chat-container" else footer
+        )
+        seen_messages: list[tuple[str, str]] = []
+        seen_reasoning: list[str] = []
+        app._add_message = (  # type: ignore[method-assign]
+            lambda content, role="assistant": seen_messages.append((content, role))
+        )
+        app._add_reasoning_block = (  # type: ignore[method-assign]
+            lambda content="": seen_reasoning.append(content)
+        )
+
+        await app._cmd_resume("remote-1")
+
+        assert seen_reasoning == ["first thought"]
+        assert seen_messages == [
+            ("hello", "user"),
+            ("world", "assistant"),
+            ("Resumed remote session: Remote issue", "tool"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_resume_command_restores_local_reasoning_blocks(self, tmp_path):
+        from worker_ai.models import Message, Role
+        from worker_core.sessions import SessionStore
+        from worker_tui.app import WorkerApp
+
+        class _Container:
+            def remove_children(self) -> None:
+                pass
+
+        class _Session:
+            def __init__(self):
+                self.session_id = "current-session"
+                self.messages = [Message(role=Role.SYSTEM, content="system")]
+                self.thinking_level = "off"
+
+        store = SessionStore(str(tmp_path / "sessions.db"))
+        await store.open()
+        try:
+            await store.create_session("local-1", "openai/gpt-4.1", title="Local issue")
+            await store.add_message("local-1", Message(role=Role.USER, content="hello"))
+            await store.add_message(
+                "local-1",
+                Message(role=Role.ASSISTANT, reasoning="first thought", content="world"),
+            )
+
+            app = WorkerApp()
+            app._store = store
+            app._session = _Session()
+            app._provider_model = "openai/gpt-4.1"
+            app._tool_collapsibles = []
+            container = _Container()
+            app.query_one = lambda selector, _cls=None: container  # type: ignore[method-assign]
+            seen_messages: list[tuple[str, str]] = []
+            seen_reasoning: list[str] = []
+            app._add_message = (  # type: ignore[method-assign]
+                lambda content, role="assistant": seen_messages.append((content, role))
+            )
+            app._add_reasoning_block = (  # type: ignore[method-assign]
+                lambda content="": seen_reasoning.append(content)
+            )
+
+            await app._resume_session("local-1")
+        finally:
+            await store.close()
+
+        assert seen_reasoning == ["first thought"]
+        assert seen_messages == [
+            ("hello", "user"),
+            ("world", "assistant"),
+            ("Resumed session: Local issue", "tool"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_resume_command_restores_local_thinking_level(self, tmp_path):
         from worker_ai.models import Message, Role
         from worker_core.sessions import SessionStore
@@ -1355,6 +1477,154 @@ class TestRemoteModeCommandRouting:
             "Reloaded remote session, 2 tui extension(s), 1 prompt(s), 1 skill(s)",
             "tool",
         )
+
+    @pytest.mark.asyncio
+    async def test_run_local_creates_new_reasoning_block_after_tool_call(self, monkeypatch):
+        from worker_core.agent import AgentEvent, AgentEventType
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp()
+        app._session = SimpleNamespace(
+            run=lambda text: _events(
+                [
+                    AgentEvent(type=AgentEventType.REASONING_DELTA, content="pre-tool "),
+                    AgentEvent(type=AgentEventType.TOOL_CALL, tool_name="read", tool_args={"path": "x"}),
+                    AgentEvent(type=AgentEventType.TOOL_RESULT, content="ok"),
+                    AgentEvent(type=AgentEventType.REASONING_DELTA, content="post-tool"),
+                    AgentEvent(type=AgentEventType.TEXT_DELTA, content="done"),
+                    AgentEvent(type=AgentEventType.DONE),
+                ]
+            ),
+            _estimate_tokens=lambda: 0,
+            context_window=0,
+        )
+        app._input_price = 0.0
+        app._output_price = 0.0
+
+        reasoning_blocks: list[str] = []
+        assistant_messages: list[str] = []
+        tool_messages: list[str] = []
+
+        class _StreamingWidget:
+            def __init__(self, sink: list[str]):
+                self.sink = sink
+                self.sink.append("")
+
+            def append_content(self, delta: str) -> None:
+                self.sink[-1] += delta
+
+        class _Footer:
+            def update_usage(self, *args, **kwargs) -> None:
+                pass
+
+            def update_context_pct(self, *args, **kwargs) -> None:
+                pass
+
+        app._add_reasoning_block = (  # type: ignore[method-assign]
+            lambda content="": _StreamingWidget(reasoning_blocks)
+        )
+
+        def _add_message(content: str, role: str = "assistant"):
+            if role == "assistant":
+                return _StreamingWidget(assistant_messages)
+            assistant_messages.append(content)
+            return None
+
+        app._add_message = _add_message  # type: ignore[method-assign]
+        app._add_tool_message = (  # type: ignore[method-assign]
+            lambda content: tool_messages.append(content)
+        )
+        app.query_one = lambda selector, _cls=None: _Footer()  # type: ignore[method-assign]
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_scroll_to_bottom", lambda: None)
+        monkeypatch.setattr(app, "_tool_collapsibles", [])
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        import worker_tui.app as tui_app
+
+        monkeypatch.setattr(tui_app.cmux, "set_status", _noop)
+        monkeypatch.setattr(tui_app.cmux, "notify", _noop)
+        monkeypatch.setattr(tui_app.cmux, "set_progress", _noop)
+        monkeypatch.setattr(tui_app.cmux, "log", _noop)
+
+        await app._run_local.__wrapped__(app, "hello")
+
+        assert reasoning_blocks == ["pre-tool ", "post-tool"]
+        assert assistant_messages == ["done"]
+
+    @pytest.mark.asyncio
+    async def test_run_remote_creates_new_reasoning_block_after_tool_call(self, monkeypatch):
+        from worker_tui.app import WorkerApp
+
+        class _WebSocket:
+            def __init__(self, messages: list[dict[str, object]]):
+                self._messages = [json.dumps(message) for message in messages]
+
+            async def send(self, raw: str) -> None:
+                pass
+
+            def __aiter__(self):
+                self._iter = iter(self._messages)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._iter)
+                except StopIteration as exc:
+                    raise StopAsyncIteration from exc
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._ws = _WebSocket(
+            [
+                {"type": "reasoning_delta", "content": "pre-tool "},
+                {"type": "tool_call", "tool": "read", "args": {"path": "x"}},
+                {"type": "tool_result", "output": "ok"},
+                {"type": "reasoning_delta", "content": "post-tool"},
+                {"type": "text_delta", "content": "done"},
+                {"type": "done"},
+            ]
+        )
+
+        reasoning_blocks: list[str] = []
+        assistant_messages: list[str] = []
+        tool_messages: list[str] = []
+
+        class _StreamingWidget:
+            def __init__(self, sink: list[str]):
+                self.sink = sink
+                self.sink.append("")
+
+            def append_content(self, delta: str) -> None:
+                self.sink[-1] += delta
+
+        class _Footer:
+            def update_usage(self, *args, **kwargs) -> None:
+                pass
+
+        app._add_reasoning_block = (  # type: ignore[method-assign]
+            lambda content="": _StreamingWidget(reasoning_blocks)
+        )
+
+        def _add_message(content: str, role: str = "assistant"):
+            if role == "assistant":
+                return _StreamingWidget(assistant_messages)
+            assistant_messages.append(content)
+            return None
+
+        app._add_message = _add_message  # type: ignore[method-assign]
+        app._add_tool_message = (  # type: ignore[method-assign]
+            lambda content: tool_messages.append(content)
+        )
+        app.query_one = lambda selector, _cls=None: _Footer()  # type: ignore[method-assign]
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_scroll_to_bottom", lambda: None)
+
+        await app._run_remote.__wrapped__(app, "hello")
+
+        assert reasoning_blocks == ["pre-tool ", "post-tool"]
+        assert assistant_messages == ["done"]
 
     @pytest.mark.asyncio
     async def test_handle_remote_permission_request_sends_selected_decision(self):

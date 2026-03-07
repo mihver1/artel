@@ -234,6 +234,185 @@ async def test_worker_acp_setters_emit_valid_session_update_notifications(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_worker_acp_file_tool_calls_publish_absolute_locations(tmp_path):
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "project"
+    support_dir = tmp_path / "support"
+    home_dir.mkdir()
+    project_dir.mkdir()
+    support_dir.mkdir()
+    (project_dir / "README.md").write_text(
+        "\n".join(f"line-{index}" for index in range(1, 10)) + "\n",
+        encoding="utf-8",
+    )
+
+    (project_dir / ".worker").mkdir()
+    (project_dir / ".worker" / "config.toml").write_text(
+        """
+[agent]
+model = "mock/mock-model"
+
+[providers.mock]
+type = "mock"
+requires_api_key = false
+
+[providers.mock.models.mock-model]
+name = "Mock Model"
+context_window = 32000
+supports_tools = true
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (support_dir / "mock_provider_runtime.py").write_text(
+        """
+from __future__ import annotations
+
+from worker_ai.models import Done, ModelInfo, TextDelta, ToolCallDelta, Usage
+from worker_ai.provider import Provider
+
+
+class MockRuntimeProvider(Provider):
+    name = "mock"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._call_index = 0
+
+    async def stream_chat(
+        self,
+        model,
+        messages,
+        *,
+        tools=None,
+        temperature=0.0,
+        max_tokens=None,
+        thinking_level="off",
+    ):
+        del model, messages, tools, temperature, max_tokens, thinking_level
+        self._call_index += 1
+        if self._call_index == 1:
+            yield ToolCallDelta(
+                id="tc_read",
+                name="read",
+                arguments={"path": "README.md", "start_line": 7},
+            )
+            yield Done(usage=Usage(input_tokens=1, output_tokens=1))
+            return
+        yield TextDelta(content="read finished")
+        yield Done(usage=Usage(input_tokens=2, output_tokens=3))
+
+    def list_models(self):
+        return [
+            ModelInfo(
+                id="mock-model",
+                provider="mock",
+                name="Mock Model",
+                context_window=32000,
+                supports_tools=True,
+            )
+        ]
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    (support_dir / "sitecustomize.py").write_text(
+        """
+from mock_provider_runtime import MockRuntimeProvider
+import worker_ai.providers as _providers
+
+_original_create_default_registry = _providers.create_default_registry
+
+
+def _patched_create_default_registry():
+    registry = _original_create_default_registry()
+    registry.register("mock", MockRuntimeProvider)
+    return registry
+
+
+_providers.create_default_registry = _patched_create_default_registry
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = (
+        f"{support_dir}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH")
+        else str(support_dir)
+    )
+
+    proc = await _start_acp_subprocess(cwd=str(project_dir), env=env)
+    try:
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"fs": {"readTextFile": True}},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            },
+        )
+        init_messages = await _read_json_messages_until(proc, response_id=0)
+        assert init_messages[-1]["result"]["protocolVersion"] == 1
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(project_dir),
+                    "mcpServers": [],
+                },
+            },
+        )
+        new_messages = await _read_json_messages_until(proc, response_id=1)
+        session_id = new_messages[-1]["result"]["sessionId"]
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "Read the README"}],
+                },
+            },
+        )
+        prompt_messages = await _read_json_messages_until(proc, response_id=2, timeout_seconds=10.0)
+        prompt_response = prompt_messages[-1]
+        assert "error" not in prompt_response
+
+        tool_updates = _session_updates(prompt_messages)
+        tool_call_updates = [
+            update
+            for update in tool_updates
+            if update.get("sessionUpdate") == "tool_call"
+            and update.get("toolCallId")
+        ]
+        assert len(tool_call_updates) == 1
+        assert tool_call_updates[0]["locations"] == [
+            {
+                "path": str((project_dir / "README.md").resolve()),
+                "line": 7,
+            }
+        ]
+    finally:
+        await _terminate_process(proc)
+
+
+@pytest.mark.asyncio
 async def test_worker_acp_lists_and_resumes_persisted_sessions_after_restart(tmp_path):
     home_dir = tmp_path / "home"
     project_dir = tmp_path / "project"

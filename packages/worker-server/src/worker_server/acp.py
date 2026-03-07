@@ -685,6 +685,7 @@ async def run_acp() -> None:
                             raw_locations = server_mod._tool_locations(
                                 event.tool_name,
                                 event.tool_args,
+                                cwd=session.project_dir,
                             ) or []
                             locations = [
                                 ToolCallLocation(

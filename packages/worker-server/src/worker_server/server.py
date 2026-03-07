@@ -92,19 +92,76 @@ def _tool_kind_for_name(tool_name: str) -> str:
     return mapping.get(tool_name, "other")
 
 
-def _tool_locations(tool_name: str, args: dict[str, Any]) -> list[dict[str, Any]] | None:
+def _positive_line_number(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = int(stripped)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _resolve_tool_path(path: str, *, cwd: str | None = None) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd or os.getcwd()).expanduser() / candidate
+    return candidate.resolve(strict=False)
+
+
+def _unique_match_line(path: Path, search: str) -> int | None:
+    if not search:
+        return None
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    first_index = content.find(search)
+    if first_index < 0:
+        return None
+    if content.find(search, first_index + 1) >= 0:
+        return None
+    return content.count("\n", 0, first_index) + 1
+
+
+def _tool_location_line(tool_name: str, args: dict[str, Any], *, path: Path) -> int | None:
+    if tool_name == "read":
+        return _positive_line_number(args.get("start_line")) or 1
+    if tool_name == "write":
+        return 1
+    if tool_name == "edit":
+        search = args.get("search")
+        if isinstance(search, str):
+            return _unique_match_line(path, search)
+    return None
+
+
+def _tool_locations(
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    cwd: str | None = None,
+) -> list[dict[str, Any]] | None:
+    if tool_name not in {"read", "write", "edit"}:
+        return None
     path = args.get("path")
     if not isinstance(path, str) or not path.strip():
         return None
-    location: dict[str, Any] = {"path": path}
-    if tool_name == "read":
-        start_line = args.get("start_line")
-        if isinstance(start_line, int) and start_line > 0:
-            location["line"] = start_line
+    resolved_path = _resolve_tool_path(path, cwd=cwd)
+    location: dict[str, Any] = {"path": str(resolved_path)}
+    line = _tool_location_line(tool_name, args, path=resolved_path)
+    if line is not None:
+        location["line"] = line
     return [location]
 
-
-def _agent_event_payload(event: Any) -> dict[str, Any]:
+def _agent_event_payload(event: Any, *, cwd: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"type": event.type.value}
     if event.type in {
         AgentEventType.TEXT_DELTA,
@@ -116,7 +173,7 @@ def _agent_event_payload(event: Any) -> dict[str, Any]:
         payload["args"] = event.tool_args
         payload["call_id"] = event.tool_call_id
         payload["kind"] = _tool_kind_for_name(event.tool_name)
-        locations = _tool_locations(event.tool_name, event.tool_args)
+        locations = _tool_locations(event.tool_name, event.tool_args, cwd=cwd)
         if locations:
             payload["locations"] = locations
     elif event.type == AgentEventType.TOOL_RESULT:
@@ -199,7 +256,7 @@ class SessionController:
                 session = await _create_server_session(self.state, self.session_id)
             asyncio.create_task(self._maybe_generate_title(session, content))
             async for event in session.run(content):
-                await self.publish(_agent_event_payload(event))
+                await self.publish(_agent_event_payload(event, cwd=session.project_dir))
         except Exception as exc:
             logger.exception("Background session run failed for %s", self.session_id)
             await self.publish({"type": "error", "error": str(exc)})

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -505,6 +506,7 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
         def __init__(self, session_id: str) -> None:
             self.session_id = session_id
             self.context_window = 100
+            self.project_dir = str(tmp_path)
 
         async def run(self, content: str):
             assert content == "Inspect README"
@@ -513,12 +515,12 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
             yield _event(
                 server_mod.AgentEventType.TOOL_CALL,
                 tool_name="read",
-                tool_args={"path": "README.md"},
+                tool_args={"path": "README.md", "start_line": 7},
                 tool_call_id="tc1",
             )
             approved = await state.permission_callbacks[self.session_id](
                 "read",
-                {"path": "README.md"},
+                {"path": "README.md", "start_line": 7},
             )
             assert approved is True
             yield _event(
@@ -612,6 +614,10 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
         isinstance(update, dict)
         and update.get("kind") == "start_tool_call"
         and update.get("tool_call_id") == "acp_tc1"
+        and len(update.get("locations") or []) == 1
+        and getattr(update["locations"][0], "path", None)
+        == str(Path(tmp_path, "README.md").resolve())
+        and getattr(update["locations"][0], "line", None) == 7
         for update in updates
     )
     assert any(
