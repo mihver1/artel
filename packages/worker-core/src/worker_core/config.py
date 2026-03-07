@@ -80,12 +80,24 @@ class ServerConfig(BaseModel):
     max_sessions: int = 10
 
 
+OFFICIAL_REGISTRY_URL = (
+    "https://raw.githubusercontent.com/mihver1/worker-agent/main/registry/extensions.toml"
+)
+
+
+class RegistryConfig(BaseModel):
+    name: str = ""
+    url: str = ""
+
+
 class ExtensionsConfig(BaseModel):
     dir: str = str(CONFIG_DIR / "extensions")
     enabled: list[str] = Field(default_factory=list)
     disabled: list[str] = Field(default_factory=list)
-    registry_url: str = (
-        "https://raw.githubusercontent.com/worker-agent/registry/main/extensions.json"
+    registries: list[RegistryConfig] = Field(
+        default_factory=lambda: [
+            RegistryConfig(name="official", url=OFFICIAL_REGISTRY_URL),
+        ]
     )
 
 
@@ -200,14 +212,14 @@ def resolve_model(config: WorkerConfig) -> tuple[str, str]:
 
 _GLOBAL_TEMPLATE = """\
 # ═══════════════════════════════════════════════════════════════
-# Worker — глобальная конфигурация
-# Документация: https://github.com/worker-agent/worker#config
+# Worker — global configuration
+# Documentation: https://github.com/worker-agent/worker#config
 # ═══════════════════════════════════════════════════════════════
 
-# ── Агент ─────────────────────────────────────────────────────
+# ── Agent ─────────────────────────────────────────────────────
 [agent]
-# Модель в формате provider/model-id
-# Примеры:
+# Model in provider/model-id format
+# Examples:
 #   "anthropic/claude-sonnet-4-20250514"
 #   "openai/gpt-4.1"
 #   "azure_openai/gpt-4.1"
@@ -220,37 +232,37 @@ _GLOBAL_TEMPLATE = """\
 #   "ollama/qwen3:32b"
 model = "anthropic/claude-sonnet-4-20250514"
 
-# Температура генерации (0.0 — детерминированный, 1.0 — креативный)
+# Generation temperature (0.0 = deterministic, 1.0 = creative)
 # temperature = 0.0
 
-# Максимум итераций агент-лупа за один запрос
+# Maximum number of agent-loop iterations per request
 # max_turns = 50
 
-# System prompt (дополнение к встроенному)
-# Можно также использовать .worker/AGENTS.md в проекте
+# System prompt (appended to the built-in prompt)
+# You can also use .worker/AGENTS.md in the project
 # system_prompt = "You are a senior Python developer."
 
-# Малая модель для утилитарных задач (компакция, авто-заголовки)
-# Формат: provider/model-id  (пустая строка = основная модель)
-# Примеры: "anthropic/claude-haiku-3" | "openai/gpt-4.1-mini"
+# Small model for utility tasks (compaction, auto-titles)
+# Format: provider/model-id  (empty string = use the main model)
+# Examples: "anthropic/claude-haiku-3" | "openai/gpt-4.1-mini"
 # small_model = ""
 
 # Extended thinking / reasoning
-# off — отключено
-# minimal | low | medium | high | xhigh — уровни бюджета
+# off — disabled
+# minimal | low | medium | high | xhigh — budget levels
 # Anthropic: budget_tokens (1024..16384)
 # OpenAI o-series: reasoning_effort (low/medium/high)
 # thinking = "off"
 
-# ── Провайдеры
-# Каждый провайдер — отдельная секция [providers.<name>]
+# ── Providers
+# Each provider is a separate [providers.<name>] section
 # type: anthropic | openai | openai_compat | kimi | google | google_vertex
 #       | vertex_anthropic
 #       | bedrock | azure_openai | github_copilot | ollama | lmstudio | huggingface
 #
-# Аутентификация: обычно api_key;
-# OAuth доступен только у части провайдеров (`worker login <provider>`)
-# Переменные окружения тоже работают:
+# Authentication usually uses api_key;
+# OAuth is available only for some providers (`worker login <provider>`)
+# Environment variables also work:
 #   ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, MOONSHOT_API_KEY,
 #   AZURE_OPENAI_API_KEY, GH_TOKEN, GITHUB_TOKEN,
 #   GROQ_API_KEY, MISTRAL_API_KEY, XAI_API_KEY,
@@ -259,36 +271,36 @@ model = "anthropic/claude-sonnet-4-20250514"
 
 # [providers.anthropic]
 # type = "anthropic"
-# api_key = "sk-ant-..."         # или ANTHROPIC_API_KEY env
-# # base_url = "https://api.anthropic.com"  # override если нужен proxy
+# api_key = "sk-ant-..."         # or ANTHROPIC_API_KEY env
+# # base_url = "https://api.anthropic.com"  # override if you need a proxy
 # # [providers.anthropic.options]
 # # beta_headers = ["files-api-2025-04-14"]
 # # interleaved_thinking = true
 # # fine_grained_tool_streaming = true
-# # OAuth login для anthropic автоматически использует Claude Code-style headers/tool naming
+# # OAuth login for anthropic automatically uses Claude Code-style headers/tool naming
 
 # [providers.openai]
 # type = "openai"
-# api_key = "sk-..."             # или OPENAI_API_KEY env
+# api_key = "sk-..."             # or OPENAI_API_KEY env
 # # base_url = "https://api.openai.com/v1"
 # # api_type = "chat"            # "chat" (completions) | "responses"
 
 # [providers.kimi]
 # type = "kimi"
-# api_key = "sk-..."             # или MOONSHOT_API_KEY env
+# api_key = "sk-..."             # or MOONSHOT_API_KEY env
 # # base_url = "https://api.kimi.com/coding/v1"
-# # Kimi For Coding использует Anthropic-compatible messages endpoint
+# # Kimi For Coding uses an Anthropic-compatible messages endpoint
 
 # [providers.google]
 # type = "google"
-# api_key = "..."                # или GEMINI_API_KEY env
+# api_key = "..."                # or GEMINI_API_KEY env
 
 # [providers.google_vertex]
 # type = "google_vertex"
-# # project = "my-gcp-project"   # или GOOGLE_VERTEX_PROJECT / GOOGLE_CLOUD_PROJECT
-# # location = "us-central1"     # default: global; также GOOGLE_VERTEX_LOCATION
+# # project = "my-gcp-project"   # or GOOGLE_VERTEX_PROJECT / GOOGLE_CLOUD_PROJECT
+# # location = "us-central1"     # default: global; also GOOGLE_VERTEX_LOCATION
 # # [providers.google_vertex.options]
-# # credentials_path = "/path/to/service-account.json"  # иначе используется ADC
+# # credentials_path = "/path/to/service-account.json"  # otherwise ADC is used
 # # scopes = ["https://www.googleapis.com/auth/cloud-platform"]
 
 # [providers.vertex_anthropic]
@@ -318,7 +330,7 @@ model = "anthropic/claude-sonnet-4-20250514"
 # type = "openai_compat"
 # api_key = "sk-or-..."
 # base_url = "https://openrouter.ai/api/v1"
-# # timeout = 300000               # миллисекунды; false = без таймаута
+# # timeout = 300000               # milliseconds; false = no timeout
 # # [providers.openrouter.headers]
 # # "HTTP-Referer" = "https://example.com"
 # # "X-Title" = "worker"
@@ -344,21 +356,21 @@ model = "anthropic/claude-sonnet-4-20250514"
 
 # [providers.ollama]
 # type = "ollama"
-# # base_url = "http://localhost:11434/v1"  # дефолт OpenAI-compatible endpoint
+# # base_url = "http://localhost:11434/v1"  # default OpenAI-compatible endpoint
 # # requires_api_key = false
-# # `/models` запрашивает список моделей напрямую у Ollama API.
-# # Модели можно указывать напрямую как ollama/<model-id>; чтобы они появились в /models,
-# # опишите их в секции ниже.
+# # `/models` fetches the model list directly from the Ollama API.
+# # Models can also be referenced directly as ollama/<model-id>; to show them in /models,
+# # define them in the section below.
 # # [providers.ollama.models."qwen3:32b"]
 # # name = "Qwen3 32B"
 # # context_window = 131072
 
 # [providers.ollama_cloud]
 # type = "ollama"
-# # api_key = "ollama_..."         # или OLLAMA_API_KEY env
+# # api_key = "ollama_..."         # or OLLAMA_API_KEY env
 # # base_url = "https://ollama.com/v1"
-# # `/models` запрашивает список моделей напрямую у Ollama Cloud API.
-# # Hosted Ollama использует тот же OpenAI-compatible runtime, что и локальный Ollama.
+# # `/models` fetches the model list directly from the Ollama Cloud API.
+# # Hosted Ollama uses the same OpenAI-compatible runtime as local Ollama.
 # # [providers.ollama_cloud.models."gpt-oss:20b"]
 # # name = "gpt-oss 20B via Ollama Cloud"
 # # context_window = 200000
@@ -366,10 +378,10 @@ model = "anthropic/claude-sonnet-4-20250514"
 # [providers.lmstudio]
 # type = "lmstudio"
 # # base_url = "http://127.0.0.1:1234/v1"
-# # requires_api_key = false        # если в LM Studio включена auth, можно задать api_key
-# # `/models` запрашивает список моделей напрямую у LM Studio API.
-# # Модели можно указывать напрямую как lmstudio/<model-id>; чтобы они появились в /models,
-# # опишите их в секции ниже.
+# # requires_api_key = false        # if auth is enabled in LM Studio, you can set api_key
+# # `/models` fetches the model list directly from the LM Studio API.
+# # Models can also be referenced directly as lmstudio/<model-id>; to show them in /models,
+# # define them in the section below.
 # # [providers.lmstudio.models."openai/gpt-oss-20b"]
 # # name = "LM Studio gpt-oss-20b"
 # # context_window = 131072
@@ -377,7 +389,7 @@ model = "anthropic/claude-sonnet-4-20250514"
 # [providers.bedrock]
 # type = "bedrock"
 # # region = "us-east-1"
-# # profile = "default"           # AWS profile из ~/.aws/credentials
+# # profile = "default"           # AWS profile from ~/.aws/credentials
 # # base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"  # optional custom endpoint
 # # Credentials can come from the AWS credential chain (env/shared config/SSO/etc.)
 # # [providers.bedrock.options]
@@ -394,101 +406,105 @@ model = "anthropic/claude-sonnet-4-20250514"
 
 # [providers.github_copilot]
 # type = "github_copilot"
-# # api_key = "github_pat_..."    # или `worker login github_copilot`
-# #                              # или COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN
-# # interactive login требует `gh` (`brew install gh` на macOS/Homebrew)
+# # api_key = "github_pat_..."    # or `worker login github_copilot`
+# #                              # or COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN
+# # interactive login requires `gh` (`brew install gh` on macOS/Homebrew)
 # # base_url = "https://api.githubcopilot.com"
 
 # [providers.github_copilot_enterprise]
 # type = "github_copilot"
-# # api_key = "github_pat_..."    # или `worker login github_copilot_enterprise`
-# # interactive login требует `gh` (`brew install gh` на macOS/Homebrew)
+# # api_key = "github_pat_..."    # or `worker login github_copilot_enterprise`
+# # interactive login requires `gh` (`brew install gh` on macOS/Homebrew)
 # # base_url = "https://api.githubcopilot.com"
 # # [providers.github_copilot_enterprise.options]
-# # github_host = "SUBDOMAIN.ghe.com"  # или GH_HOST для enterprise auth lookup via gh
+# # github_host = "SUBDOMAIN.ghe.com"  # or GH_HOST for enterprise auth lookup via gh
 
-# ── Права доступа ─────────────────────────────────────────────
+# ── Permissions ───────────────────────────────────────────────
 [permissions]
-# Политика для каждого инструмента: "allow" | "ask" | "deny"
-# "ask" — агент запросит подтверждение перед выполнением
+# Policy for each tool: "allow" | "ask" | "deny"
+# "ask" — the agent requests confirmation before executing
 
-# Редактирование файлов
+# File editing
 edit = "allow"
 
-# Создание/перезапись файлов
+# File creation/overwrite
 write = "allow"
 
-# Выполнение shell команд
+# Shell command execution
 bash = "ask"
 
-# Права для конкретных bash команд (glob patterns)
-# Последнее совпавшее правило побеждает
+# Rules for specific bash commands (glob patterns)
+# The last matching rule wins
 # [permissions.bash_commands]
 # "git *" = "allow"
 # "npm *" = "allow"
 # "rm *" = "deny"
 # "sudo *" = "deny"
 
-# ── Сервер ────────────────────────────────────────────────────
+# ── Server ────────────────────────────────────────────────────
 [server]
-# Адрес и порт для `worker serve`
+# Host and port for `worker serve`
 # host = "0.0.0.0"
 # port = 7432
 
-# Токен для аутентификации клиентов (Bearer)
-# Генерируется автоматически при первом `worker serve`
+# Bearer token for client authentication
+# Generated automatically on the first `worker serve`
 # auth_token = "wkr_..."
 
-# TLS (опционально, рекомендуется reverse proxy)
+# TLS (optional, reverse proxy recommended)
 # tls_cert = "/path/to/cert.pem"
 # tls_key = "/path/to/key.pem"
 
-# Максимум одновременных сессий
+# Maximum concurrent sessions
 # max_sessions = 10
 
-# ── Расширения ────────────────────────────────────────────────
+# ── Extensions ────────────────────────────────────────────────
 [extensions]
-# Директория для установленных расширений
+# Directory for installed extensions
 # dir = "~/.config/worker/extensions"
 
-# Включённые расширения (по имени)
+# Enabled extensions (by name)
 # enabled = ["worker-ext-websearch", "worker-ext-git"]
 
-# Отключённые расширения
+# Disabled extensions
 # disabled = []
 
-# URL реестра расширений
-# registry_url = "https://raw.githubusercontent.com/worker-agent/registry/main/extensions.json"
+# Extension registries (official is enabled by default)
+# Add a company or community registry:
+#   worker ext registry add mycompany https://example.com/extensions.toml
+# [[extensions.registries]]
+# name = "official"
+# url = "https://raw.githubusercontent.com/mihver1/worker-agent/main/registry/extensions.toml"
 
-# ── Сессии ────────────────────────────────────────────────────
+# ── Sessions ──────────────────────────────────────────────────
 [sessions]
-# Путь к базе данных сессий
+# Path to the sessions database
 # db_path = "~/.config/worker/sessions.db"
 
-# Авто-компактинг при приближении к лимиту контекста
+# Auto-compaction near the context limit
 # auto_compact = true
 
-# Порог компактинга (процент от context window)
+# Compaction threshold (fraction of the context window)
 # compact_threshold = 0.8
 
-# ── Интерфейс ─────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────
 [ui]
-# Тема: "dark" | "light" | "monokai" | "dracula"
+# Theme: "dark" | "light" | "monokai" | "dracula"
 # theme = "dark"
 
-# Показывать стоимость токенов
+# Show token cost
 # show_cost = true
 
-# Показывать reasoning/thinking блоки
+# Show reasoning/thinking blocks
 # show_reasoning = true
 
-# Markdown рендеринг в TUI
+# Markdown rendering in the TUI
 # render_markdown = true
 """
 
 _PROJECT_TEMPLATE = """\
 # ═══════════════════════════════════════════════════════════════
-# Worker — проектная конфигурация (перезаписывает глобальную)
+# Worker — project configuration (overrides global settings)
 # ═══════════════════════════════════════════════════════════════
 
 # [agent]

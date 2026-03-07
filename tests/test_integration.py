@@ -464,23 +464,64 @@ class TestCliServe:
 
 
 class TestCliExtensions:
-    def test_ext_install_uses_no_sources(self, monkeypatch):
+    def test_ext_install_uses_no_sources(self, monkeypatch, tmp_path):
         from click.testing import CliRunner
         from worker_core import cli as cli_mod
+        from worker_core import ext_manifest
 
         calls: list[list[str]] = []
 
         def fake_run(args, capture_output, text):
             calls.append(args)
-            return Mock(returncode=0)
+            return Mock(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(ext_manifest, "MANIFEST_PATH", tmp_path / "extensions.lock")
 
         runner = CliRunner()
         result = runner.invoke(cli_mod.cli, ["ext", "install", "git+https://example.com/ext.git"])
 
         assert result.exit_code == 0
         assert calls == [["uv", "pip", "install", "--no-sources", "git+https://example.com/ext.git"]]
+        # Verify manifest was updated
+        entries = ext_manifest.list_entries()
+        assert len(entries) == 1
+        assert entries[0].name == "ext"
+        assert entries[0].source == "git+https://example.com/ext.git"
+
+    def test_ext_install_resolves_name_from_registry(self, monkeypatch, tmp_path):
+        from unittest.mock import patch as _patch
+
+        from click.testing import CliRunner
+        from worker_core import cli as cli_mod
+        from worker_core import ext_manifest, ext_registry
+
+        calls: list[list[str]] = []
+
+        def fake_run(args, capture_output, text):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(ext_manifest, "MANIFEST_PATH", tmp_path / "extensions.lock")
+
+        fake_entries = [
+            ext_registry.RegistryEntry(
+                name="worker-ext-mcp",
+                repo="git+https://github.com/mihver1/worker-ext-mcp.git",
+                registry_name="official",
+            ),
+        ]
+        with _patch.object(ext_registry, "list_all", return_value=fake_entries):
+            runner = CliRunner()
+            result = runner.invoke(cli_mod.cli, ["ext", "install", "worker-ext-mcp"])
+
+        assert result.exit_code == 0
+        assert "Resolved" in result.output
+        assert calls == [
+            ["uv", "pip", "install", "--no-sources",
+             "git+https://github.com/mihver1/worker-ext-mcp.git"]
+        ]
 
     def test_ext_update_uses_no_sources(self, monkeypatch):
         from click.testing import CliRunner

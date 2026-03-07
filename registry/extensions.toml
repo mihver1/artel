@@ -1,0 +1,31 @@
+# ═══════════════════════════════════════════════════════════════
+# Worker — official extension registry
+# ═══════════════════════════════════════════════════════════════
+
+[[extensions]]
+name = "worker-ext-subagents"
+description = "Subagent orchestration for parallel task execution"
+repo = "git+https://github.com/mihver1/worker-ext-subagents.git"
+tags = ["agent", "parallel", "orchestration"]
+author = "mihver1"
+
+[[extensions]]
+name = "worker-ext-worktree"
+description = "Git worktree slash commands for parallel sessions"
+repo = "git+https://github.com/mihver1/worker-ext-worktree.git"
+tags = ["git", "worktree"]
+author = "mihver1"
+
+[[extensions]]
+name = "worker-ext-mcp"
+description = "Model Context Protocol (MCP) client — connect to MCP servers for tools and resources"
+repo = "git+https://github.com/mihver1/worker-ext-mcp.git"
+tags = ["mcp", "tools", "integration"]
+author = "mihver1"
+
+[[extensions]]
+name = "worker-ext-example"
+description = "Example extension — demonstrates tools and hooks"
+repo = "git+https://github.com/mihver1/worker-agent.git#subdirectory=extensions/worker-ext-example"
+tags = ["example", "demo"]
+author = "mihver1"

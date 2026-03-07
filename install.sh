@@ -147,6 +147,38 @@ info "Installing dependencies with uv..."
 (cd "$INSTALL_DIR" && uv sync --quiet)
 ok "Dependencies installed"
 
+# ── Step 6b: Restore extensions from manifest ────────────
+EXT_MANIFEST="${WORKER_CONFIG_DIR:-$HOME/.config/worker}/extensions.lock"
+if [[ -f "$EXT_MANIFEST" ]]; then
+    # Read sources from the JSON manifest [{"name": "...", "source": "..."}, ...]
+    EXT_SOURCES=$(
+        (cd "$INSTALL_DIR" && uv run python -c "
+import json, sys
+try:
+    entries = json.load(open('$EXT_MANIFEST'))
+    for e in entries:
+        src = e.get('source', '')
+        if src:
+            print(src)
+except Exception:
+    pass
+" 2>/dev/null) || true
+    )
+    if [[ -n "$EXT_SOURCES" ]]; then
+        EXT_COUNT=$(echo "$EXT_SOURCES" | wc -l | tr -d ' ')
+        info "Restoring $EXT_COUNT extension(s)..."
+        while IFS= read -r ext_source; do
+            [[ -z "$ext_source" ]] && continue
+            result=$(cd "$INSTALL_DIR" && uv pip install --no-sources "$ext_source" --quiet 2>&1) && \
+                status="✓" || status="✗"
+            # Extract short name for display
+            ext_short=$(echo "$ext_source" | sed 's|.*/||; s|\.git$||; s|@.*||')
+            echo "  $status $ext_short"
+        done <<< "$EXT_SOURCES"
+        ok "Extensions restored"
+    fi
+fi
+
 # ── Step 7: Create wrapper script ────────────────────────
 mkdir -p "$BIN_DIR"
 WRAPPER="$BIN_DIR/worker"
