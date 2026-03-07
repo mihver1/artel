@@ -1,0 +1,60 @@
+site_name: Worker
+site_description: Extensible Python coding agent for local, remote, and server-based workflows.
+site_url: https://mihver1.github.io/worker-agent/
+repo_url: https://github.com/mihver1/worker-agent
+repo_name: mihver1/worker-agent
+edit_uri: edit/main/docs/
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue
+      accent: blue
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue
+      accent: blue
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: installation.md
+      - Quick start: quickstart.md
+  - Guides:
+      - Configuration: configuration.md
+      - Run modes: run-modes.md
+      - Providers: providers.md
+      - Extensions: extensions.md
+  - Reference:
+      - CLI: cli.md

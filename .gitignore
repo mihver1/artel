@@ -18,4 +18,5 @@ uv.lock
 .mypy_cache/
 htmlcov/
 .coverage
+site/
 .warp/

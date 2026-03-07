@@ -2,6 +2,19 @@
 
 Extensible Python coding agent with client-server architecture.
 
+## Documentation
+
+User-facing documentation is published on GitHub Pages:
+
+- <https://mihver1.github.io/worker-agent/>
+
+Preview the docs locally:
+
+```bash
+uv sync --dev
+uv run mkdocs serve
+```
+
 ## Features
 
 - **4 built-in tools**: read, write, edit, bash
@@ -13,8 +26,11 @@ Extensible Python coding agent with client-server architecture.
 ## Quick Start
 
 ```bash
-# Install
+# Install from source
 uv sync
+
+# Or use the bootstrap installer
+curl -fsSL https://raw.githubusercontent.com/mihver1/worker-agent/main/install.sh | bash
 
 # Initialize config
 worker init

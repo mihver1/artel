@@ -213,7 +213,7 @@ def resolve_model(config: WorkerConfig) -> tuple[str, str]:
 _GLOBAL_TEMPLATE = """\
 # ═══════════════════════════════════════════════════════════════
 # Worker — global configuration
-# Documentation: https://github.com/worker-agent/worker#config
+# Documentation: https://mihver1.github.io/worker-agent/
 # ═══════════════════════════════════════════════════════════════
 
 # ── Agent ─────────────────────────────────────────────────────
