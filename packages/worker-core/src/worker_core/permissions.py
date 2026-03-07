@@ -58,11 +58,12 @@ class PermissionPolicy:
         """Determine the base decision from config."""
         if tool_name == "bash":
             return self._check_bash(args)
+        if tool_name in {"read", "grep", "find", "ls"}:
+            return Decision.ALLOW
 
         mapping = {
             "edit": self.config.edit,
             "write": self.config.write,
-            "read": "allow",
         }
         raw = mapping.get(tool_name, "ask")
         return Decision(raw)

@@ -10,8 +10,9 @@ import pytest
 from conftest import MockProvider
 from worker_ai.models import Done, TextDelta, Usage
 from worker_ai.oauth import OAuthToken, RemoteOAuthChallenge, TokenStore
+from worker_core.agent import AgentSession
 from worker_core.config import ProviderConfig, ProviderModelConfig, WorkerConfig
-from worker_core.extensions import discover_extensions
+from worker_core.extensions import HookDispatcher, discover_extensions
 from worker_core.sessions import SessionStore
 from worker_server.server import ServerState, _create_rest_app, handle_client
 
@@ -663,6 +664,47 @@ class TestRESTAPI:
             data = await resp.json()
             assert data["output"] == "remote-bash-test"
             assert data["exit_code"] == 0
+
+    @pytest.mark.asyncio
+    async def test_session_commands_endpoint_lists_and_executes_extension_commands(self, state):
+        from aiohttp.test_utils import TestClient, TestServer
+        from worker_core.extensions import Extension
+
+        class _CommandExtension(Extension):
+            def get_commands(self):
+                return {"echo": self._cmd_echo}
+
+            async def _cmd_echo(self, arg: str) -> str:
+                return f"remote:{arg}"
+
+        state.sessions["remote-session"] = AgentSession(
+            provider=MockProvider(),
+            model="test",
+            tools=[],
+            hooks=HookDispatcher([_CommandExtension()]),
+            session_id="remote-session",
+        )
+
+        app = _create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/sessions/remote-session/commands",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["commands"] == ["echo"]
+
+            resp = await client.post(
+                "/api/sessions/remote-session/commands/echo",
+                headers={"Authorization": "Bearer test_token"},
+                json={"arg": "hello"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["command"] == "echo"
+            assert data["output"] == "remote:hello"
+            assert data["session"]["id"] == "remote-session"
 
     @pytest.mark.asyncio
     async def test_session_project_endpoint_and_cd_persist_remote_cwd(self, tmp_path):

@@ -221,6 +221,37 @@ async def _session_history_messages(state: ServerState, session_id: str) -> list
     raise RuntimeError("Session not found")
 
 
+async def _get_or_create_server_session(
+    state: ServerState,
+    session_id: str,
+) -> AgentSession:
+    session = state.sessions.get(session_id)
+    if session is not None:
+        return session
+    if len(state.sessions) >= state.config.server.max_sessions:
+        raise RuntimeError(f"Maximum sessions reached ({state.config.server.max_sessions})")
+    return await _create_server_session(state, session_id)
+
+
+async def _session_extension_commands(state: ServerState, session_id: str) -> list[str]:
+    session = await _get_or_create_server_session(state, session_id)
+    return sorted(session.hooks.commands)
+
+
+async def _run_session_extension_command(
+    state: ServerState,
+    session_id: str,
+    command_name: str,
+    arg: str,
+) -> tuple[str | None, dict[str, Any]]:
+    session = await _get_or_create_server_session(state, session_id)
+    handler = session.hooks.commands.get(command_name)
+    if handler is None:
+        raise RuntimeError(f"Unknown command: {command_name}")
+    result = await handler(arg)
+    return result, await _serialize_session(state, session_id)
+
+
 async def _list_serialized_sessions(
     state: ServerState,
     *,
@@ -494,28 +525,11 @@ async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: Serv
         await ws.send(json.dumps({"type": "error", "error": "Empty message"}))
         return
 
-    # Get or create session
-    if session_id not in state.sessions:
-        if len(state.sessions) >= state.config.server.max_sessions:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "error",
-                        "error": (
-                            f"Maximum sessions reached "
-                            f"({state.config.server.max_sessions})"
-                        ),
-                    }
-                )
-            )
-            return
-        try:
-            session = await _create_server_session(state, session_id)
-        except Exception as e:
-            await ws.send(json.dumps({"type": "error", "error": str(e)}))
-            return
-
-    session = state.sessions[session_id]
+    try:
+        session = await _get_or_create_server_session(state, session_id)
+    except Exception as e:
+        await ws.send(json.dumps({"type": "error", "error": str(e)}))
+        return
 
     async for event in session.run(content):
         payload: dict[str, Any] = {"type": event.type.value}
@@ -627,6 +641,42 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             return web.json_response({"error": str(exc)}, status=404)
         return web.json_response(
             {"messages": [_serialize_message(message) for message in messages]}
+        )
+
+    async def handle_session_commands_get(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        try:
+            commands = await _session_extension_commands(state, sid)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"commands": commands})
+
+    async def handle_session_command_post(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        command_name = request.match_info["command_name"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        arg = str(payload.get("arg", ""))
+        try:
+            output, session = await _run_session_extension_command(
+                state,
+                sid,
+                command_name,
+                arg,
+            )
+        except RuntimeError as exc:
+            status = 404 if str(exc).startswith("Unknown command: ") else 400
+            return web.json_response({"error": str(exc)}, status=status)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            {
+                "command": command_name,
+                "output": output,
+                "session": session,
+            }
         )
 
     async def handle_session_model_put(request: web.Request) -> web.Response:
@@ -871,6 +921,11 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
     app.router.add_get("/api/sessions", handle_sessions_list)
     app.router.add_get("/api/sessions/{session_id}", handle_session_get)
     app.router.add_get("/api/sessions/{session_id}/messages", handle_session_messages_get)
+    app.router.add_get("/api/sessions/{session_id}/commands", handle_session_commands_get)
+    app.router.add_post(
+        "/api/sessions/{session_id}/commands/{command_name}",
+        handle_session_command_post,
+    )
     app.router.add_put("/api/sessions/{session_id}/model", handle_session_model_put)
     app.router.add_put("/api/sessions/{session_id}/project", handle_session_project_put)
     app.router.add_put("/api/sessions/{session_id}/thinking", handle_session_thinking_put)
