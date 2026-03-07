@@ -90,6 +90,15 @@ async def test_read_always_allowed():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["grep", "find", "ls"])
+async def test_readonly_search_tools_are_allowed(tool_name: str):
+    config = PermissionsConfig(edit="deny", write="deny", bash="deny")
+    policy = PermissionPolicy(config)
+    result = await policy.check(tool_name, {})
+    assert result.allowed is True
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_asks():
     config = PermissionsConfig()
 

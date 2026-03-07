@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -86,6 +86,21 @@ class RemoteControlClient:
 
     async def get_session_tree(self, session_id: str) -> dict[str, Any]:
         return await self.request("GET", f"/api/sessions/{session_id}/tree")
+    async def list_session_commands(self, session_id: str) -> dict[str, Any]:
+        return await self.request("GET", f"/api/sessions/{session_id}/commands")
+
+    async def run_session_command(
+        self,
+        session_id: str,
+        command_name: str,
+        arg: str = "",
+    ) -> dict[str, Any]:
+        encoded_name = quote(command_name, safe="")
+        return await self.request(
+            "POST",
+            f"/api/sessions/{session_id}/commands/{encoded_name}",
+            json_data={"arg": arg},
+        )
 
     async def set_session_model(self, session_id: str, model: str) -> dict[str, Any]:
         return await self.request(

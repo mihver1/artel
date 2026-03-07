@@ -133,17 +133,26 @@ def ext() -> None:
 @ext.command("install")
 @click.argument("source")
 def ext_install(source: str) -> None:
-    """Install an extension from git+ssh://, git+https://, or local path."""
+    """Install an extension by name, git URL, or local path.
+
+    If SOURCE is a plain package name (no '/', ':', '.'), it is looked up
+    in the configured registries first.
+    """
     import subprocess
 
-    click.echo(f"Installing extension from {source}...")
+    from worker_core import ext_manifest
+
+    install_source = _resolve_install_source(source)
+    click.echo(f"Installing extension from {install_source}...")
     try:
         result = subprocess.run(
-            ["uv", "pip", "install", "--no-sources", source],
+            ["uv", "pip", "install", "--no-sources", install_source],
             capture_output=True,
             text=True,
         )
         if result.returncode == 0:
+            pkg_name = _parse_installed_package_name(result.stdout, install_source)
+            ext_manifest.add(pkg_name, install_source)
             click.echo("Extension installed.")
         else:
             click.echo(f"Install failed:\n{result.stderr}", err=True)
@@ -171,6 +180,8 @@ def ext_remove(name: str) -> None:
     """Remove an installed extension."""
     import subprocess
 
+    from worker_core import ext_manifest
+
     click.echo(f"Removing extension {name}...")
     try:
         result = subprocess.run(
@@ -179,6 +190,7 @@ def ext_remove(name: str) -> None:
             text=True,
         )
         if result.returncode == 0:
+            ext_manifest.remove(name)
             click.echo(f"Extension '{name}' removed.")
         else:
             click.echo(f"Remove failed:\n{result.stderr}", err=True)
@@ -192,12 +204,16 @@ def ext_update(name: str | None) -> None:
     """Update an extension (or all if no name given)."""
     import subprocess
 
+    from worker_core import ext_manifest
     from worker_core.extensions import discover_extensions
 
     if name:
+        # Prefer the original source from manifest so VCS extensions update correctly
+        entry = next((e for e in ext_manifest.list_entries() if e.name == name), None)
+        source = entry.source if entry else name
         click.echo(f"Updating extension '{name}'...")
         result = subprocess.run(
-            ["uv", "pip", "install", "--no-sources", "--upgrade", name],
+            ["uv", "pip", "install", "--no-sources", "--upgrade", source],
             capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -210,9 +226,12 @@ def ext_update(name: str | None) -> None:
             click.echo("No extensions to update.")
             return
         click.echo(f"Updating {len(extensions)} extension(s)...")
+        manifest_entries = {e.name: e for e in ext_manifest.list_entries()}
         for ext_name in extensions:
+            entry = manifest_entries.get(ext_name)
+            source = entry.source if entry else ext_name
             result = subprocess.run(
-                ["uv", "pip", "install", "--no-sources", "--upgrade", ext_name],
+                ["uv", "pip", "install", "--no-sources", "--upgrade", source],
                 capture_output=True, text=True,
             )
             status = "\u2713" if result.returncode == 0 else "\u2717"
@@ -222,30 +241,109 @@ def ext_update(name: str | None) -> None:
 @ext.command("search")
 @click.argument("query")
 def ext_search(query: str) -> None:
-    """Search the extension registry."""
-    import httpx as _httpx
+    """Search across all configured extension registries."""
+    from worker_core.ext_registry import search_all
 
     config = load_config(os.getcwd())
-    registry_url = config.extensions.registry_url
     click.echo(f"Searching for '{query}'...")
     try:
-        resp = _httpx.get(registry_url, timeout=10)
-        resp.raise_for_status()
-        entries = resp.json()
-        matches = [
-            e for e in entries
-            if query.lower() in e.get("name", "").lower()
-            or query.lower() in e.get("description", "").lower()
-            or any(query.lower() in t.lower() for t in e.get("tags", []))
-        ]
-        if not matches:
-            click.echo("No extensions found.")
-            return
-        for m in matches:
-            click.echo(f"  {m['name']} — {m.get('description', '')}")
-            click.echo(f"    install: worker ext install {m.get('repo', m['name'])}")
+        matches = search_all(config.extensions.registries, query)
     except Exception as e:
         click.echo(f"Search failed: {e}", err=True)
+        return
+    if not matches:
+        click.echo("No extensions found.")
+        return
+    for m in matches:
+        label = f"  {m.name}"
+        if m.registry_name:
+            label += f"  [{m.registry_name}]"
+        click.echo(f"{label} — {m.description}")
+        click.echo(f"    install: worker ext install {m.repo or m.name}")
+
+
+# ── ext registry subgroup ─────────────────────────────────────────
+
+
+@ext.group("registry")
+def ext_registry_group() -> None:
+    """Manage extension registries."""
+
+
+@ext_registry_group.command("list")
+def ext_registry_list() -> None:
+    """List configured extension registries."""
+    config = load_config(os.getcwd())
+    regs = config.extensions.registries
+    if not regs:
+        click.echo("No registries configured.")
+        return
+    for r in regs:
+        click.echo(f"  {r.name}: {r.url}")
+
+
+@ext_registry_group.command("add")
+@click.argument("name")
+@click.argument("url")
+def ext_registry_add(name: str, url: str) -> None:
+    """Add a custom extension registry."""
+    import tomllib
+
+    import tomli_w
+
+    from worker_core.config import GLOBAL_CONFIG
+
+    # Read current config
+    data: dict = {}
+    if GLOBAL_CONFIG.exists():
+        with open(GLOBAL_CONFIG, "rb") as f:
+            data = tomllib.load(f)
+
+    ext_section = data.setdefault("extensions", {})
+    registries = ext_section.setdefault("registries", [])
+
+    # Check for duplicate name
+    for r in registries:
+        if r.get("name") == name:
+            click.echo(f"Registry '{name}' already exists. Remove it first.")
+            return
+
+    registries.append({"name": name, "url": url})
+    GLOBAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    GLOBAL_CONFIG.write_text(tomli_w.dumps(data), encoding="utf-8")
+    click.echo(f"Registry '{name}' added: {url}")
+
+
+@ext_registry_group.command("remove")
+@click.argument("name")
+def ext_registry_remove(name: str) -> None:
+    """Remove a custom extension registry (cannot remove 'official')."""
+    import tomllib
+
+    import tomli_w
+
+    from worker_core.config import GLOBAL_CONFIG
+
+    if name == "official":
+        click.echo("Cannot remove the built-in 'official' registry.")
+        return
+
+    data: dict = {}
+    if GLOBAL_CONFIG.exists():
+        with open(GLOBAL_CONFIG, "rb") as f:
+            data = tomllib.load(f)
+
+    ext_section = data.get("extensions", {})
+    registries = ext_section.get("registries", [])
+    new_regs = [r for r in registries if r.get("name") != name]
+    if len(new_regs) == len(registries):
+        click.echo(f"Registry '{name}' not found.")
+        return
+
+    ext_section["registries"] = new_regs
+    data["extensions"] = ext_section
+    GLOBAL_CONFIG.write_text(tomli_w.dumps(data), encoding="utf-8")
+    click.echo(f"Registry '{name}' removed.")
 
 
 @cli.group(invoke_without_command=True)
@@ -462,6 +560,67 @@ async def _resolve_api_key(config, provider_name: str) -> tuple[str | None, str]
         if token:
             return token, "api"
     return None, "api"
+
+
+def _resolve_install_source(source: str) -> str:
+    """If *source* looks like a plain package name, resolve it via registries.
+
+    URLs, paths and VCS prefixes are returned as-is.
+    """
+    # Heuristic: plain name has no path separators, no URL scheme, no VCS prefix
+    if any(ch in source for ch in (":", "/", "@", ".")):
+        return source
+
+    from worker_core.ext_registry import list_all
+
+    config = load_config(os.getcwd())
+    entries = list_all(config.extensions.registries)
+    for entry in entries:
+        if entry.name == source and entry.repo:
+            click.echo(f"Resolved '{source}' → {entry.repo}  [{entry.registry_name}]")
+            return entry.repo
+    # Not found — return as-is, pip will try PyPI
+    return source
+
+
+def _parse_installed_package_name(pip_stdout: str, source: str) -> str:
+    """Extract the canonical package name from uv pip install output or source.
+
+    uv outputs lines like "Installed 1 package ... worker-ext-foo v0.1.0".
+    Falls back to the source string (basename without VCS prefix).
+    """
+    import re
+
+    # Try to parse from "Installed ... <name>" in uv output
+    for line in pip_stdout.splitlines():
+        # uv format: " + package-name==version"
+        m = re.match(r"^\s*\+\s+([a-zA-Z0-9_.-]+)", line)
+        if m:
+            return m.group(1)
+
+    # Fallback: derive from source
+    # Strip VCS prefixes like git+https://...
+    clean = re.sub(r"^(git|hg|svn|bzr)\+", "", source)
+    # SCP-style: git@github.com:org/repo.git  (no ://)
+    scp_match = re.match(r"^[^@]+@[^:]+:(.+)$", clean)
+    if scp_match:
+        path_part = scp_match.group(1)
+    elif "://" in clean:
+        # Take the path part after the authority (handles user@host correctly)
+        path_part = clean.split("://", 1)[1]
+    else:
+        # Non-URL: strip @branch/tag suffix then take basename
+        clean = clean.split("@")[0]
+        return clean.rstrip("/").rsplit("/", 1)[-1]
+
+    # Strip query/fragment
+    path_part = re.split(r"[?#]", path_part)[0]
+    # The repo name is the last slash-separated segment
+    name = path_part.rstrip("/").rsplit("/", 1)[-1]
+    # Strip .git suffix and @branch/commit suffix on the segment
+    name = re.sub(r"\.git(@.*)?$", "", name)
+    name = name.split("@")[0] if "@" in name else name
+    return name
 
 
 def main() -> None:

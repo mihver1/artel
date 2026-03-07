@@ -603,6 +603,7 @@ class WorkerApp(App):
         self._remote_session_id = str(uuid.uuid4())
         self._remote_control_client: RemoteControlClient | None = None
         self._remote_project_dir: str = ""
+        self._remote_extension_commands: set[str] = set()
         self._prompts: dict[str, str] = {}  # loaded prompt templates
         self._skills: dict[str, Any] = {}  # loaded skills (Skill objects)
         self._active_theme: str = "dark"
@@ -714,6 +715,48 @@ class WorkerApp(App):
                         await self._resume_remote_session(session_id)
                         return
         await self._sync_remote_session_state()
+        await self._sync_remote_extension_commands()
+    def _set_remote_extension_commands(self, commands: list[Any]) -> None:
+        normalized: set[str] = set()
+        for command in commands:
+            name = str(command).strip()
+            if name:
+                normalized.add(name)
+        self._remote_extension_commands = normalized
+
+    async def _sync_remote_extension_commands(self) -> None:
+        if not self.remote_url:
+            return
+        try:
+            payload = await self._remote_control().list_session_commands(self._remote_session_id)
+        except Exception:
+            self._remote_extension_commands = set()
+            return
+        self._set_remote_extension_commands(payload.get("commands", []))
+
+    async def _maybe_handle_remote_extension_command(self, cmd_name: str, arg: str) -> bool:
+        if not self.remote_url:
+            return False
+        if cmd_name not in self._remote_extension_commands:
+            await self._sync_remote_extension_commands()
+        if cmd_name not in self._remote_extension_commands:
+            return False
+        try:
+            payload = await self._remote_control().run_session_command(
+                self._remote_session_id,
+                cmd_name,
+                arg,
+            )
+        except Exception as exc:
+            self._add_message(f"Command error: {exc}", role="error")
+            return True
+        session = payload.get("session")
+        if isinstance(session, dict):
+            self._apply_remote_session_state(session)
+        output = payload.get("output")
+        if output:
+            self._add_message(str(output), role="tool")
+        return True
 
     async def _forward_remote_credentials(self, config: Any) -> None:
         exports, skipped = await collect_forward_credentials(
@@ -820,6 +863,11 @@ class WorkerApp(App):
             for name in sorted(self._session.hooks.commands):
                 suggestions.append(
                     SlashCommandSuggestion(f"/{name}", "extension command")
+                )
+        elif self.remote_url:
+            for name in sorted(self._remote_extension_commands):
+                suggestions.append(
+                    SlashCommandSuggestion(f"/{name}", "remote extension command")
                 )
 
         deduped: list[SlashCommandSuggestion] = []
@@ -1168,6 +1216,8 @@ class WorkerApp(App):
             cmd_name = cmd.lstrip("/")
             if cmd_name in self._prompts:
                 self._cmd_use_prompt(cmd_name, arg)
+            elif await self._maybe_handle_remote_extension_command(cmd_name, arg):
+                return
             # Check extension commands
             elif self._session and cmd_name in self._session.hooks.commands:
                 handler = self._session.hooks.commands[cmd_name]
@@ -1873,6 +1923,7 @@ class WorkerApp(App):
         session = session_payload.get("session", {})
         self._remote_session_id = session_id
         self._apply_remote_session_state(session)
+        await self._sync_remote_extension_commands()
 
         container = self.query_one("#chat-container", Vertical)
         container.remove_children()

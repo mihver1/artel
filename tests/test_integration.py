@@ -10,8 +10,9 @@ import pytest
 from conftest import MockProvider
 from worker_ai.models import Done, TextDelta, Usage
 from worker_ai.oauth import OAuthToken, RemoteOAuthChallenge, TokenStore
+from worker_core.agent import AgentSession
 from worker_core.config import ProviderConfig, ProviderModelConfig, WorkerConfig
-from worker_core.extensions import discover_extensions
+from worker_core.extensions import HookDispatcher, discover_extensions
 from worker_core.sessions import SessionStore
 from worker_server.server import ServerState, _create_rest_app, handle_client
 
@@ -575,23 +576,64 @@ class TestCliAcp:
 
 
 class TestCliExtensions:
-    def test_ext_install_uses_no_sources(self, monkeypatch):
+    def test_ext_install_uses_no_sources(self, monkeypatch, tmp_path):
         from click.testing import CliRunner
         from worker_core import cli as cli_mod
+        from worker_core import ext_manifest
 
         calls: list[list[str]] = []
 
         def fake_run(args, capture_output, text):
             calls.append(args)
-            return Mock(returncode=0)
+            return Mock(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(ext_manifest, "MANIFEST_PATH", tmp_path / "extensions.lock")
 
         runner = CliRunner()
         result = runner.invoke(cli_mod.cli, ["ext", "install", "git+https://example.com/ext.git"])
 
         assert result.exit_code == 0
         assert calls == [["uv", "pip", "install", "--no-sources", "git+https://example.com/ext.git"]]
+        # Verify manifest was updated
+        entries = ext_manifest.list_entries()
+        assert len(entries) == 1
+        assert entries[0].name == "ext"
+        assert entries[0].source == "git+https://example.com/ext.git"
+
+    def test_ext_install_resolves_name_from_registry(self, monkeypatch, tmp_path):
+        from unittest.mock import patch as _patch
+
+        from click.testing import CliRunner
+        from worker_core import cli as cli_mod
+        from worker_core import ext_manifest, ext_registry
+
+        calls: list[list[str]] = []
+
+        def fake_run(args, capture_output, text):
+            calls.append(args)
+            return Mock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(ext_manifest, "MANIFEST_PATH", tmp_path / "extensions.lock")
+
+        fake_entries = [
+            ext_registry.RegistryEntry(
+                name="worker-ext-mcp",
+                repo="git+https://github.com/mihver1/worker-ext-mcp.git",
+                registry_name="official",
+            ),
+        ]
+        with _patch.object(ext_registry, "list_all", return_value=fake_entries):
+            runner = CliRunner()
+            result = runner.invoke(cli_mod.cli, ["ext", "install", "worker-ext-mcp"])
+
+        assert result.exit_code == 0
+        assert "Resolved" in result.output
+        assert calls == [
+            ["uv", "pip", "install", "--no-sources",
+             "git+https://github.com/mihver1/worker-ext-mcp.git"]
+        ]
 
     def test_ext_update_uses_no_sources(self, monkeypatch):
         from click.testing import CliRunner
@@ -792,6 +834,47 @@ class TestRESTAPI:
             data = await resp.json()
             assert data["output"] == "remote-bash-test"
             assert data["exit_code"] == 0
+
+    @pytest.mark.asyncio
+    async def test_session_commands_endpoint_lists_and_executes_extension_commands(self, state):
+        from aiohttp.test_utils import TestClient, TestServer
+        from worker_core.extensions import Extension
+
+        class _CommandExtension(Extension):
+            def get_commands(self):
+                return {"echo": self._cmd_echo}
+
+            async def _cmd_echo(self, arg: str) -> str:
+                return f"remote:{arg}"
+
+        state.sessions["remote-session"] = AgentSession(
+            provider=MockProvider(),
+            model="test",
+            tools=[],
+            hooks=HookDispatcher([_CommandExtension()]),
+            session_id="remote-session",
+        )
+
+        app = _create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/sessions/remote-session/commands",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["commands"] == ["echo"]
+
+            resp = await client.post(
+                "/api/sessions/remote-session/commands/echo",
+                headers={"Authorization": "Bearer test_token"},
+                json={"arg": "hello"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["command"] == "echo"
+            assert data["output"] == "remote:hello"
+            assert data["session"]["id"] == "remote-session"
 
     @pytest.mark.asyncio
     async def test_session_project_endpoint_and_cd_persist_remote_cwd(self, tmp_path):

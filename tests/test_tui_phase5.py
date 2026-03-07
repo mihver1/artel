@@ -910,6 +910,39 @@ class TestRemoteModeCommandRouting:
             ("Thinking level set to: high", "tool"),
         ]
 
+    def test_remote_extension_commands_appear_in_command_suggestions(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._remote_extension_commands = {"delegate"}
+
+        values = [suggestion.value for suggestion in app._command_suggestions()]
+
+        assert "/delegate" in values
+
+    @pytest.mark.asyncio
+    async def test_handle_command_dispatches_remote_extension_command(self):
+        from worker_tui.app import WorkerApp
+
+        class _RemoteClient:
+            async def list_session_commands(self, session_id: str):
+                return {"commands": ["delegate"]}
+
+            async def run_session_command(self, session_id: str, command_name: str, arg: str):
+                return {"command": command_name, "output": f"delegated:{arg}"}
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._remote_control_client = _RemoteClient()
+        seen_messages: list[tuple[str, str]] = []
+        app._add_message = (  # type: ignore[method-assign]
+            lambda content, role="assistant": seen_messages.append((content, role))
+        )
+
+        await app._handle_command("/delegate inspect src")
+
+        assert app._remote_extension_commands == {"delegate"}
+        assert seen_messages == [("delegated:inspect src", "tool")]
+
     @pytest.mark.asyncio
     async def test_restore_initial_remote_session_continue_uses_latest_session(self):
         from worker_tui.app import WorkerApp
