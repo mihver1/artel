@@ -1,17 +1,17 @@
 # Configuration
 
-Worker loads configuration from a global file and then overlays project-specific settings on top.
+Artel loads configuration from a global file and then overlays project-specific settings on top.
 
 ## Config files
 
-- Global: `~/.config/worker/config.toml`
-- Project: `.worker/config.toml`
-- Project instructions: `.worker/AGENTS.md`
+- Global: `~/.config/artel/config.toml`
+- Project: `.artel/config.toml`
+- Project instructions: `.artel/AGENTS.md`
 
 Run this once to generate fully commented templates:
 
 ```bash
-worker init
+artel init
 ```
 
 ## Overlay model
@@ -70,7 +70,7 @@ Provider blocks can also carry:
 
 ### `permissions`
 
-Control how much autonomy Worker gets for file and shell operations:
+Control how much autonomy Artel gets for file and shell operations:
 
 ```toml
 [permissions]
@@ -87,7 +87,7 @@ Supported policy values are `allow`, `ask`, and `deny`.
 
 ### `server`
 
-Settings for `worker serve`, including:
+Settings for `artel serve`, including:
 
 - `host`
 - `port`
@@ -117,23 +117,23 @@ Lets you override Textual keybindings with a simple mapping.
 Show config file paths:
 
 ```bash
-worker config
+artel config
 ```
 
 Print only the global config path:
 
 ```bash
-worker config --global
+artel config --global
 ```
 
 Print only the project config path:
 
 ```bash
-worker config --project
+artel config --project
 ```
 
 Print the merged effective configuration:
 
 ```bash
-worker config print
+artel config print
 ```

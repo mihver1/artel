@@ -6,7 +6,7 @@ import json
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from worker_ai.models import Done, Message, ReasoningDelta, Role, TextDelta
+from worker_ai.models import Done, ImageAttachment, Message, ReasoningDelta, Role, TextDelta
 from worker_ai.providers import create_default_registry
 from worker_ai.providers.azure_openai import AzureOpenAIProvider
 from worker_ai.providers.openai_compat import OpenAIProvider
@@ -146,6 +146,37 @@ class TestAzureOpenAIProviderRuntime:
         assert body["stream_options"] == {"include_usage": True}
         assert headers["api-key"] == "azure-key"
         assert "authorization" not in headers
+
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_includes_image_parts_for_vision_input(self, tmp_path):
+        provider = AzureOpenAIProvider(
+            api_key="azure-key",
+            base_url="https://demo.openai.azure.com",
+            api_version="2024-10-21",
+        )
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+        _path, body, _headers = provider._build_chat_completions_request(
+            "gpt-4.1",
+            [
+                Message(
+                    role=Role.USER,
+                    content="Look",
+                    attachments=[
+                        ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+                    ],
+                )
+            ],
+        )
+
+        assert body["messages"][0]["content"][0] == {"type": "text", "text": "Look"}
+        assert body["messages"][0]["content"][1]["type"] == "image_url"
+        assert body["messages"][0]["content"][1]["image_url"]["url"].startswith(
+            "data:image/png;base64,"
+        )
 
         await provider.close()
 

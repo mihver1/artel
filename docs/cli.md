@@ -1,11 +1,11 @@
 # CLI reference
 
-This page summarizes the main commands exposed by the `worker` CLI.
+This page summarizes the main commands exposed by the `artel` CLI.
 
 ## Top-level usage
 
 ```bash
-worker [OPTIONS] [COMMAND]
+artel [OPTIONS] [COMMAND]
 ```
 
 Top-level options:
@@ -16,19 +16,19 @@ Top-level options:
 
 ## Core commands
 
-### `worker`
+### `artel`
 
 Starts the local TUI when you do not provide a subcommand or `--prompt`.
 
-### `worker init`
+### `artel init`
 
 Creates:
 
-- `~/.config/worker/config.toml`
-- `.worker/config.toml`
-- `.worker/AGENTS.md`
+- `~/.config/artel/config.toml`
+- `.artel/config.toml`
+- `.artel/AGENTS.md`
 
-### `worker serve`
+### `artel serve`
 
 Starts the headless server daemon.
 
@@ -37,16 +37,29 @@ Options:
 - `--host TEXT`
 - `--port INTEGER`
 
-### `worker connect URL`
+### `artel connect URL`
 
-Connects the TUI to a remote Worker server.
+Connects the TUI to a remote Artel server.
 
 Options:
 
 - `--token TEXT`
 - `--forward-credentials TEXT`
 
-### `worker config`
+### `artel web`
+
+Starts the NiceGUI-based web UI.
+
+Options:
+
+- `--host TEXT`
+- `--port INTEGER`
+- `--remote-url TEXT`
+- `--token TEXT`
+- `--native`
+- `--no-open-browser`
+
+### `artel config`
 
 Shows config file paths.
 
@@ -57,63 +70,63 @@ Options:
 
 Subcommands:
 
-- `worker config print` — print merged effective config as TOML
+- `artel config print` — print merged effective config as TOML
 
-### `worker rpc`
+### `artel rpc`
 
 Starts a JSON-RPC server on stdin and stdout for embedding scenarios.
 
-### `worker acp`
+### `artel acp`
 
 Starts an ACP agent on stdin and stdout for ACP-compatible clients.
 See [ACP integration](acp.md) for session behavior, supported controls, and permission flow details.
 
-### `worker login PROVIDER`
+### `artel login PROVIDER`
 
 Attempts OAuth login for a supported provider.
 
 ## Extension commands
 
-### `worker ext install SOURCE`
+### `artel ext install SOURCE`
 
 Install an extension from a name, URL, or local path.
 
-### `worker ext list`
+### `artel ext list`
 
 List installed extensions.
 
-### `worker ext remove NAME`
+### `artel ext remove NAME`
 
 Remove an installed extension.
 
-### `worker ext update [NAME]`
+### `artel ext update [NAME]`
 
 Update one extension or all installed extensions.
 
-### `worker ext search QUERY`
+### `artel ext search QUERY`
 
 Search configured extension registries.
 
-### `worker ext registry list`
+### `artel ext registry list`
 
 List configured extension registries.
 
-### `worker ext registry add NAME URL`
+### `artel ext registry add NAME URL`
 
 Add a custom registry.
 
-### `worker ext registry remove NAME`
+### `artel ext registry remove NAME`
 
 Remove a custom registry.
 
 ## Useful examples
 
 ```bash
-worker -p "review the latest changes"
-worker --continue
-worker --resume 7f1f7f80-0000-0000-0000-000000000000
-worker serve --host 0.0.0.0 --port 7432
-worker connect ws://example.com:7432 --token wkr_example
-worker config print
-worker ext search git
+artel -p "review the latest changes"
+artel --continue
+artel --resume 7f1f7f80-0000-0000-0000-000000000000
+artel serve --host 0.0.0.0 --port 7432
+artel connect ws://example.com:7432 --token artel_example
+artel config print
+artel ext search git
 ```

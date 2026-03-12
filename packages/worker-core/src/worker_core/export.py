@@ -7,10 +7,9 @@ inline CSS styling.  No external dependencies (no Jinja2).
 from __future__ import annotations
 
 import html
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from worker_ai.models import Message, Role
-
 
 _HTML_TEMPLATE = """\
 <!DOCTYPE html>
@@ -94,12 +93,12 @@ def _render_message(msg: Message) -> str:
 def export_html(
     messages: list[Message],
     *,
-    title: str = "Worker Session",
+    title: str = "Artel Session",
     model: str = "",
     session_id: str = "",
 ) -> str:
     """Render a list of messages as a standalone HTML string."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     meta_parts = [now]
     if model:
         meta_parts.append(f"Model: {model}")

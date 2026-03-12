@@ -15,19 +15,48 @@ from worker_core.extensions import Extension, HookDispatcher, hook
 
 
 class TestAgentsMdLoading:
+    @pytest.fixture(autouse=True)
+    def _isolate_global_context_files(self, tmp_path, monkeypatch):
+        import worker_core.config as cfg_mod
+
+        global_dir = tmp_path / "global"
+        monkeypatch.setattr(cfg_mod, "GLOBAL_AGENTS_FILE", global_dir / "AGENTS.md")
+        monkeypatch.setattr(
+            cfg_mod,
+            "LEGACY_GLOBAL_AGENTS_FILE",
+            global_dir / "legacy-AGENTS.md",
+        )
+        monkeypatch.setattr(cfg_mod, "GLOBAL_SYSTEM_OVERRIDE", global_dir / "SYSTEM.md")
+        monkeypatch.setattr(
+            cfg_mod,
+            "LEGACY_GLOBAL_SYSTEM_OVERRIDE",
+            global_dir / "legacy-SYSTEM.md",
+        )
+        monkeypatch.setattr(
+            cfg_mod,
+            "GLOBAL_APPEND_SYSTEM",
+            global_dir / "APPEND_SYSTEM.md",
+        )
+        monkeypatch.setattr(
+            cfg_mod,
+            "LEGACY_GLOBAL_APPEND_SYSTEM",
+            global_dir / "legacy-APPEND_SYSTEM.md",
+        )
+        monkeypatch.setattr(cfg_mod, "SKILLS_DIR", global_dir / "skills")
+        monkeypatch.setattr(cfg_mod, "LEGACY_SKILLS_DIR", global_dir / "legacy-skills")
     def test_system_prompt_includes_agents_md(self, tmp_path):
-        worker_dir = tmp_path / ".worker"
-        worker_dir.mkdir()
-        (worker_dir / "AGENTS.md").write_text("# My Project\nAlways use pytest.\n")
+        artel_dir = tmp_path / ".artel"
+        artel_dir.mkdir()
+        (artel_dir / "AGENTS.md").write_text("# My Project\nAlways use pytest.\n")
 
         prompt = AgentSession._build_system_prompt("", str(tmp_path))
         assert "Always use pytest." in prompt
-        assert "Worker" in prompt  # default prompt still there
+        assert "Artel" in prompt  # default prompt still there
 
     def test_system_prompt_custom_plus_agents_md(self, tmp_path):
-        worker_dir = tmp_path / ".worker"
-        worker_dir.mkdir()
-        (worker_dir / "AGENTS.md").write_text("Use black for formatting.\n")
+        artel_dir = tmp_path / ".artel"
+        artel_dir.mkdir()
+        (artel_dir / "AGENTS.md").write_text("Use black for formatting.\n")
 
         prompt = AgentSession._build_system_prompt("Be concise.", str(tmp_path))
         assert "Be concise." in prompt
@@ -35,23 +64,31 @@ class TestAgentsMdLoading:
 
     def test_system_prompt_no_agents_md(self, tmp_path):
         prompt = AgentSession._build_system_prompt("", str(tmp_path))
-        assert "Worker" in prompt
-        # No crash when .worker/AGENTS.md doesn't exist
+        assert "Artel" in prompt
+        # No crash when .artel/AGENTS.md doesn't exist
 
     def test_system_prompt_empty_agents_md(self, tmp_path):
-        worker_dir = tmp_path / ".worker"
-        worker_dir.mkdir()
-        (worker_dir / "AGENTS.md").write_text("   \n")
+        artel_dir = tmp_path / ".artel"
+        artel_dir.mkdir()
+        (artel_dir / "AGENTS.md").write_text("   \n")
 
         prompt = AgentSession._build_system_prompt("", str(tmp_path))
         # Empty content should not add extra sections
-        assert prompt.count("\n\n") == 0 or "Worker" in prompt
+        assert prompt.count("\n\n") == 0 or "Artel" in prompt
+
+    def test_system_prompt_legacy_worker_agents_md_still_loads(self, tmp_path):
+        worker_dir = tmp_path / ".worker"
+        worker_dir.mkdir()
+        (worker_dir / "AGENTS.md").write_text("Legacy rule: keep compatibility.\n")
+
+        prompt = AgentSession._build_system_prompt("", str(tmp_path))
+        assert "Legacy rule: keep compatibility." in prompt
 
     @pytest.mark.asyncio
     async def test_session_uses_agents_md(self, tmp_path):
-        worker_dir = tmp_path / ".worker"
-        worker_dir.mkdir()
-        (worker_dir / "AGENTS.md").write_text("Project rule: always test.\n")
+        artel_dir = tmp_path / ".artel"
+        artel_dir.mkdir()
+        (artel_dir / "AGENTS.md").write_text("Project rule: always test.\n")
 
         provider = MockProvider()
         session = AgentSession(
@@ -300,6 +337,28 @@ class TestOAuthFallback:
 
         key, auth_type = await _resolve_api_key(WorkerConfig(), "ollama-cloud")
         assert key == "ollama_env_token"
+        assert auth_type == "api"
+
+    @pytest.mark.asyncio
+    async def test_zai_alias_reads_api_key_from_builtin_env(self, monkeypatch):
+        from worker_core.cli import _resolve_api_key
+        from worker_core.config import WorkerConfig
+
+        monkeypatch.setenv("ZHIPU_API_KEY", "zhipu_env_token")
+
+        key, auth_type = await _resolve_api_key(WorkerConfig(), "z.ai")
+        assert key == "zhipu_env_token"
+        assert auth_type == "api"
+
+    @pytest.mark.asyncio
+    async def test_minimax_reads_api_key_from_builtin_env(self, monkeypatch):
+        from worker_core.cli import _resolve_api_key
+        from worker_core.config import WorkerConfig
+
+        monkeypatch.setenv("MINIMAX_API_KEY", "minimax_env_token")
+
+        key, auth_type = await _resolve_api_key(WorkerConfig(), "minimax")
+        assert key == "minimax_env_token"
         assert auth_type == "api"
 
     @pytest.mark.asyncio

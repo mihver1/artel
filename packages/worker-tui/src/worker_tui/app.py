@@ -1,11 +1,13 @@
-"""Worker TUI — Textual application."""
+"""Artel TUI — Textual application."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import os
+import shlex
 import tempfile
 import urllib.parse
 import uuid
@@ -21,6 +23,7 @@ import worker_core.cmux as cmux
 from rich.markdown import Markdown
 from rich.text import Text
 from textual import events, work
+from textual.timer import Timer
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -31,12 +34,24 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Markdown as MarkdownWidget,
     OptionList,
     Static,
+    TextArea,
 )
 from textual.widgets.option_list import Option
-from worker_ai.models import Role
+from worker_ai.attachments import is_supported_image_path, normalize_image_attachment
+from worker_ai.models import ImageAttachment, Role
 from worker_core.agent import AgentEventType, AgentSession
+from worker_core.board import (
+    add_task_to_markdown,
+    operator_notes_path,
+    read_project_board_file,
+    render_numbered_text,
+    tasks_path,
+    update_task_in_markdown,
+    write_project_board_file,
+)
 from worker_core.bootstrap import (
     bootstrap_runtime,
     create_agent_session_from_bootstrap,
@@ -56,12 +71,52 @@ from worker_core.provider_resolver import (
     get_provider_config,
     get_provider_env_vars,
 )
+from worker_core.rules import (
+    SessionRuleOverrides,
+    add_rule,
+    clear_session_rule_overrides,
+    delete_rule,
+    deserialize_session_rule_overrides,
+    effective_rule_state,
+    get_rule,
+    list_rules,
+    move_rule,
+    reset_rule_for_session,
+    set_rule_enabled_for_session,
+    update_rule,
+)
 from worker_core.sessions import SessionStore
 from worker_core.skills import inject_skill, load_skills
 from worker_core.tools.builtins import create_builtin_tools
 
 from worker_tui.credential_forwarding import collect_forward_credentials
+from worker_tui.local_server import restart_managed_local_server
 from worker_tui.remote_control import RemoteControlClient
+
+
+class ComposerTextArea(TextArea):
+    """Composer textarea with chat-style submit/newline shortcuts."""
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.app.call_next(self.app.action_submit_composer)
+            return
+        if event.key == "shift+enter":
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        await super()._on_key(event)
+
+    async def _on_paste(self, event: events.Paste) -> None:
+        handled = await self.app._maybe_handle_pasted_image_reference(event.text)
+        if handled:
+            event.stop()
+            event.prevent_default()
+            return
+        await super()._on_paste(event)
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +280,9 @@ class SlashCommandSuggestion:
 
     value: str
     description: str
+    completion: str = ""
+    search_text: str = ""
+    current: bool = False
 
 @dataclass(slots=True)
 class PendingPermissionRequest:
@@ -237,6 +295,16 @@ class PendingPermissionRequest:
 
 BUILTIN_COMMAND_SUGGESTIONS: tuple[SlashCommandSuggestion, ...] = (
     SlashCommandSuggestion("/help", "show available commands"),
+    SlashCommandSuggestion("/rules", "list configured rules"),
+    SlashCommandSuggestion("/rule", "manage rules"),
+    SlashCommandSuggestion("/rule add", "add a rule via dialog"),
+    SlashCommandSuggestion("/rule edit", "edit a rule via dialog"),
+    SlashCommandSuggestion("/rule delete", "delete a rule"),
+    SlashCommandSuggestion("/rule enable", "enable a rule for this session"),
+    SlashCommandSuggestion("/rule disable", "disable a rule for this session"),
+    SlashCommandSuggestion("/rule persist", "change persisted rule state"),
+    SlashCommandSuggestion("/rule move", "move a rule to change precedence"),
+    SlashCommandSuggestion("/rule reset", "reset session rule override"),
     SlashCommandSuggestion("/model", "show current model or switch model"),
     SlashCommandSuggestion("/models", "list available models"),
     SlashCommandSuggestion("/project", "show or change the active project"),
@@ -256,11 +324,142 @@ BUILTIN_COMMAND_SUGGESTIONS: tuple[SlashCommandSuggestion, ...] = (
     SlashCommandSuggestion("/theme", "switch the active theme"),
     SlashCommandSuggestion("/export", "export the session to HTML"),
     SlashCommandSuggestion("/reload", "reload extensions, prompts, and skills"),
+    SlashCommandSuggestion("/image", "attach an image file to the next message"),
+    SlashCommandSuggestion("/image-paste", "paste an image from the clipboard"),
+    SlashCommandSuggestion("/image-clear", "clear pending image attachments"),
+    SlashCommandSuggestion("/image-remove", "remove a pending image attachment by index"),
+    SlashCommandSuggestion("/copy", "copy the last assistant message"),
+    SlashCommandSuggestion("/tasks", "show the shared task board"),
+    SlashCommandSuggestion("/task-add", "add a task to the shared task board"),
+    SlashCommandSuggestion("/task-done", "mark a task as done"),
+    SlashCommandSuggestion("/notes", "show operator notes"),
+    SlashCommandSuggestion("/notes-open", "focus the operator notes editor"),
+    SlashCommandSuggestion("/cancel", "cancel the active run"),
+    SlashCommandSuggestion("/server-restart", "restart the managed local Artel server"),
     SlashCommandSuggestion("/split", "open a cmux split pane"),
     SlashCommandSuggestion("/browser", "open a cmux browser pane"),
+    SlashCommandSuggestion("/new", "start a new session in the current window"),
     SlashCommandSuggestion("/clear", "clear chat and start a new session"),
     SlashCommandSuggestion("/quit", "exit the TUI"),
 )
+
+
+class PendingAttachmentsBar(Static):
+    """Inline composer attachment list."""
+
+    DEFAULT_CSS = """
+    PendingAttachmentsBar {
+        display: none;
+        margin: 0 1;
+        padding: 0 1;
+        background: $surface;
+        color: $text-muted;
+    }
+    PendingAttachmentsBar.visible {
+        display: block;
+    }
+    """
+
+    def set_attachments(self, attachments: list[ImageAttachment]) -> None:
+        if attachments:
+            lines: list[str] = []
+            for index, attachment in enumerate(attachments, start=1):
+                name = attachment.name or Path(attachment.path).name
+                size = ""
+                try:
+                    bytes_size = Path(attachment.path).stat().st_size
+                    if bytes_size >= 1024 * 1024:
+                        size = f" — {bytes_size / (1024 * 1024):.1f} MB"
+                    elif bytes_size >= 1024:
+                        size = f" — {bytes_size / 1024:.1f} KB"
+                    else:
+                        size = f" — {bytes_size} B"
+                except Exception:
+                    pass
+                mime = f" ({attachment.mime_type})" if attachment.mime_type else ""
+                lines.append(f"📎 [{index}] {name}{mime}{size}")
+            self.update("\n".join(lines))
+            self.add_class("visible")
+        else:
+            self.update("")
+            self.remove_class("visible")
+
+
+class BoardSidebar(Static):
+    """Right sidebar with tasks and operator notes."""
+
+    DEFAULT_CSS = """
+    BoardSidebar {
+        display: none;
+        width: 36;
+        min-width: 28;
+        max-width: 48;
+        height: 1fr;
+        margin: 0 1 0 0;
+        padding: 0 1;
+        background: $surface;
+        border-left: tall $primary 30%;
+    }
+    BoardSidebar.visible {
+        display: block;
+    }
+    #board-title, #notes-title {
+        text-style: bold;
+        margin-top: 1;
+    }
+    #board-help, #notes-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #tasks-editor {
+        height: 1fr;
+        min-height: 8;
+    }
+    #notes-editor {
+        height: 8;
+        min-height: 5;
+    }
+    #board-status {
+        color: $text-muted;
+        margin: 1 0 0 0;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("Tasks", id="board-title")
+        yield Static("Shared project work board for you and the agent", id="board-help")
+        yield TextArea("", id="tasks-editor")
+        yield Static("Operator Notes", id="notes-title")
+        yield Static("Private scratchpad; agent reads only on request", id="notes-help")
+        yield TextArea("", id="notes-editor")
+        yield Static("", id="board-status")
+
+    def set_visible(self, visible: bool) -> None:
+        if visible:
+            self.add_class("visible")
+        else:
+            self.remove_class("visible")
+
+    def set_tasks(self, content: str) -> None:
+        self.query_one("#tasks-editor", TextArea).load_text(content)
+
+    def set_notes(self, content: str) -> None:
+        self.query_one("#notes-editor", TextArea).load_text(content)
+
+    def tasks_text(self) -> str:
+        return self.query_one("#tasks-editor", TextArea).text
+
+    def notes_text(self) -> str:
+        return self.query_one("#notes-editor", TextArea).text
+
+    def focus_tasks(self) -> None:
+        self.query_one("#tasks-editor", TextArea).focus()
+
+    def focus_notes(self) -> None:
+        self.query_one("#notes-editor", TextArea).focus()
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#board-status", Static).update(text)
 
 
 class MessageWidget(Static):
@@ -271,12 +470,21 @@ class MessageWidget(Static):
         margin: 0 1;
         padding: 0 1;
     }
+    MessageWidget > Markdown {
+        background: transparent;
+        margin: 0;
+        padding: 0;
+    }
     .user-message {
         background: $primary-background;
         color: $text;
         border-left: thick $primary;
     }
     .assistant-message {
+        background: $surface;
+        color: $text;
+    }
+    .reasoning-message {
         background: $surface;
         color: $text;
     }
@@ -295,24 +503,78 @@ class MessageWidget(Static):
         super().__init__(**kwargs)
         self.role = role
         self._content = content
+        self._markdown: MarkdownWidget | None = None
+        self._markdown_stream: Any | None = None
+        self._scroll_callback: Callable[[], None] | None = None
+        self._scroll_timer: Timer | None = None
         self.add_class(f"{role}-message")
 
-    def render(self) -> Markdown | Text:
+    def compose(self) -> ComposeResult:
+        if self.role in {"assistant", "reasoning"}:
+            self._markdown = MarkdownWidget(self._content)
+            yield self._markdown
+
+    def render(self) -> Markdown | Text | str:
+        if self.role in {"assistant", "reasoning"}:
+            return ""
         if self.role == "user":
             return Text(f"❯ {self._content}")
         if self.role == "tool":
             return Text(self._content)
         if self.role == "error":
             return Text(f"✗ {self._content}")
-        # assistant — render markdown
-        try:
-            return Markdown(self._content)
-        except Exception:
-            return Text(self._content)
+        return Text(self._content)
+
+    @property
+    def content(self) -> str:
+        return self._content
+
+    def set_scroll_callback(self, callback: Callable[[], None] | None) -> None:
+        self._scroll_callback = callback
+
+    async def on_mount(self) -> None:
+        if self._markdown is not None:
+            self._markdown_stream = MarkdownWidget.get_stream(self._markdown)
+
+    async def on_unmount(self, event: events.Unmount) -> None:
+        del event
+        await self._stop_markdown_stream()
+
+    async def _stop_markdown_stream(self) -> None:
+        stream = self._markdown_stream
+        self._markdown_stream = None
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                await stream.stop()
+
+    def _schedule_scroll(self) -> None:
+        if self._scroll_callback is None:
+            return
+        if self._scroll_timer is not None:
+            self._scroll_timer.stop()
+        self._scroll_timer = self.set_timer(0.016, self._run_scheduled_scroll)
+
+    def _run_scheduled_scroll(self) -> None:
+        self._scroll_timer = None
+        if self._scroll_callback is not None:
+            self._scroll_callback()
 
     def append_content(self, delta: str) -> None:
+        if not delta:
+            return
         self._content += delta
-        self.refresh(layout=True)
+        if self._markdown is not None:
+            if self._markdown_stream is not None:
+                self.run_worker(
+                    self._markdown_stream.write(delta),
+                    exclusive=False,
+                    thread=False,
+                )
+            else:
+                self._markdown.append(delta)
+            self._schedule_scroll()
+        else:
+            self.refresh(layout=True)
 
 
 class StatusFooter(Static):
@@ -330,17 +592,28 @@ class StatusFooter(Static):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._model: str = ""
+        self._thinking_level: str = ""
         self._total_input: int = 0
         self._total_output: int = 0
         self._total_cost: float = 0.0
         self._context_pct: float = 0.0
         self._cwd: str = ""
+        self._activity_label: str = "idle"
+        self._busy: bool = False
         self._in_cmux: bool = is_cmux()
 
     def render(self) -> Text:
         parts: list[str] = []
         if self._model:
-            parts.append(self._model)
+            model_label = self._model
+            if self._thinking_level:
+                model_label = f"{model_label} [{self._thinking_level}]"
+            parts.append(model_label)
+        activity = self._activity_label.strip() or "idle"
+        if self._busy:
+            parts.append(f"● {activity}")
+        else:
+            parts.append(activity)
         parts.append(f"{self._total_input + self._total_output} tok")
         if self._total_cost > 0:
             parts.append(f"${self._total_cost:.4f}")
@@ -380,8 +653,17 @@ class StatusFooter(Static):
         self._model = model
         self.refresh()
 
+    def set_thinking_level(self, level: str) -> None:
+        self._thinking_level = level.strip()
+        self.refresh()
+
     def set_cwd(self, cwd: str) -> None:
         self._cwd = cwd
+        self.refresh()
+
+    def set_activity(self, label: str, *, busy: bool) -> None:
+        self._activity_label = label.strip() or ("working" if busy else "idle")
+        self._busy = busy
         self.refresh()
 
 
@@ -578,17 +860,110 @@ class TextInputScreen(ModalScreen[str | None]):
         self.dismiss(value or None)
 
 
+class RuleEditorScreen(ModalScreen[dict[str, Any] | None]):
+    """Modal dialog for adding/editing a rule."""
+
+    CSS = """
+    RuleEditorScreen {
+        align: center middle;
+    }
+    #rule-editor-dialog {
+        width: 90;
+        height: 24;
+        padding: 1 2;
+        background: $surface;
+        border: thick $primary;
+    }
+    #rule-editor-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #rule-editor-help {
+        margin-bottom: 1;
+        color: $text-muted;
+    }
+    #rule-editor-scope,
+    #rule-editor-enabled {
+        margin-bottom: 1;
+    }
+    #rule-editor-text {
+        height: 10;
+        margin-bottom: 1;
+    }
+    #rule-editor-buttons {
+        height: 3;
+        align: center middle;
+    }
+    #rule-editor-buttons Button {
+        margin: 0 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        text: str = "",
+        scope: str = "project",
+        enabled: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._title = title
+        self._text = text
+        self._scope = scope if scope in {"project", "global"} else "project"
+        self._enabled = enabled
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="rule-editor-dialog"):
+            yield Static(self._title, id="rule-editor-title")
+            yield Static("Set scope, enter rule text, then save.", id="rule-editor-help")
+            yield Input(value=self._scope, placeholder="project or global", id="rule-editor-scope")
+            yield Input(value="true" if self._enabled else "false", placeholder="true or false", id="rule-editor-enabled")
+            yield TextArea(self._text, id="rule-editor-text")
+            with Horizontal(id="rule-editor-buttons"):
+                yield Button("Save", id="btn-save-rule", variant="primary")
+                yield Button("Cancel", id="btn-cancel-rule", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#rule-editor-text", TextArea).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-save-rule":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _submit(self) -> None:
+        scope = self.query_one("#rule-editor-scope", Input).value.strip().lower()
+        enabled_raw = self.query_one("#rule-editor-enabled", Input).value.strip().lower()
+        text = self.query_one("#rule-editor-text", TextArea).text.strip()
+        if scope not in {"project", "global"}:
+            scope = "project"
+        enabled = enabled_raw not in {"false", "0", "no", "off", "disabled"}
+        self.dismiss({"scope": scope, "enabled": enabled, "text": text})
+
+
 # ── Main App ──────────────────────────────────────────────────
 
 
 class WorkerApp(App):
-    """Textual TUI for the Worker coding agent."""
+    """Textual TUI for the Artel coding agent."""
 
-    TITLE = "Worker"
+    TITLE = "Artel"
 
     CSS = """
+    #app-body {
+        height: 1fr;
+    }
     #main-content {
         height: 1fr;
+        width: 1fr;
     }
     #chat-scroll {
         height: 1fr;
@@ -607,8 +982,9 @@ class WorkerApp(App):
         display: block;
     }
     #input-bar {
-        height: auto;
-        max-height: 6;
+        height: 6;
+        min-height: 3;
+        max-height: 12;
         margin: 0 1;
     }
     """
@@ -617,6 +993,10 @@ class WorkerApp(App):
         Binding("ctrl+c", "quit", "Quit"),
         Binding("ctrl+l", "clear", "Clear"),
         Binding("ctrl+o", "toggle_tools", "Toggle tools"),
+        Binding("ctrl+b", "toggle_sidebar", "Toggle board"),
+        Binding("ctrl+t", "focus_tasks", "Focus tasks", show=False),
+        Binding("ctrl+n", "focus_notes", "Focus notes", show=False),
+        Binding("ctrl+shift+c", "copy_last_assistant_message", "Copy last reply", show=False),
     ]
 
     def __init__(
@@ -648,27 +1028,58 @@ class WorkerApp(App):
         self._prompts: dict[str, str] = {}  # loaded prompt templates
         self._skills: dict[str, Any] = {}  # loaded skills (Skill objects)
         self._active_theme: str = "dark"
+        self._remote_rule_overrides: dict[str, Any] = {}
+        self._local_rule_overrides = SessionRuleOverrides.empty()
         self._tool_collapsibles: list[Collapsible] = []
         self._input_price: float = 0.0  # per 1M tokens
         self._output_price: float = 0.0
         self._auto_approve_all: bool = False
         self._provider_model: str = ""  # "provider/model" for DB storage
+        self._model_autocomplete_refs: list[str] = []
+        self._model_autocomplete_descriptions: dict[str, str] = {}
+        self._model_autocomplete_loaded: bool = False
+        self._model_autocomplete_loading: bool = False
+        self._resume_autocomplete_suggestions: list[SlashCommandSuggestion] = []
+        self._resume_autocomplete_loaded: bool = False
+        self._resume_autocomplete_loading: bool = False
+        self._fork_autocomplete_suggestions: list[SlashCommandSuggestion] = []
+        self._fork_autocomplete_loaded: bool = False
+        self._fork_autocomplete_loading: bool = False
         self._suppress_next_command_menu_update: bool = False
         self._pending_permission_requests: list[PendingPermissionRequest] = []
         self._active_permission_request: PendingPermissionRequest | None = None
+        self._run_busy: bool = False
+        self._assistant_message_history: list[MessageWidget] = []
+        self._pending_attachments: list[ImageAttachment] = []
+        self._sidebar_visible: bool = False
+        self._suspend_board_editor_events: bool = False
+        self._tasks_save_task: asyncio.Task[None] | None = None
+        self._notes_save_task: asyncio.Task[None] | None = None
+        self._board_save_delay: float = 0.35
+        self._last_loaded_tasks_text: str = ""
+        self._last_loaded_notes_text: str = ""
+        self._board_poll_inflight: bool = False
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with Vertical(id="main-content"):
-            yield PermissionPanel(self._resolve_permission_panel_decision, id="permission-panel")
-            with VerticalScroll(id="chat-scroll"):
-                yield Vertical(id="chat-container")
-            yield OptionList(id="command-suggestions", compact=True)
-            yield Input(placeholder="Type a message... (Enter to send)", id="input-bar")
-            yield StatusFooter(id="status-footer")
+        with Horizontal(id="app-body"):
+            with Vertical(id="main-content"):
+                yield PermissionPanel(self._resolve_permission_panel_decision, id="permission-panel")
+                with VerticalScroll(id="chat-scroll"):
+                    yield Vertical(id="chat-container")
+                yield OptionList(id="command-suggestions", compact=True)
+                yield PendingAttachmentsBar(id="pending-attachments")
+                yield ComposerTextArea(
+                    "",
+                    placeholder="Type a message… (Enter to send, Shift+Enter for newline)",
+                    id="input-bar",
+                )
+                yield StatusFooter(id="status-footer")
+            yield BoardSidebar(id="board-sidebar")
         yield Footer()
 
     async def on_mount(self) -> None:
+        self.set_interval(self._board_poll_interval_seconds(), self._poll_board_state)
         config = load_config(os.getcwd())
         if self.remote_url:
             self.sub_title = f"remote: {self.remote_url}"
@@ -694,11 +1105,334 @@ class WorkerApp(App):
             if self._forward_credentials_spec:
                 await self._forward_remote_credentials(config)
 
+        self._sync_pending_attachments_bar()
+        await self._load_board_state()
         self.call_after_refresh(self._focus_input)
 
     def _focus_input(self) -> None:
         """Keep the main input focused for immediate typing."""
-        self.query_one("#input-bar", Input).focus()
+        self.query_one("#input-bar", TextArea).focus()
+
+    def _board_sidebar(self) -> BoardSidebar:
+        return self.query_one("#board-sidebar", BoardSidebar)
+
+    def _set_board_status(self, text: str) -> None:
+        try:
+            self._board_sidebar().set_status(text)
+        except Exception:
+            pass
+
+    def _board_poll_interval_seconds(self) -> float:
+        return 1.0 if self._sidebar_visible else 3.0
+
+    def _poll_board_state(self) -> None:
+        self.run_worker(self._poll_board_state_once, exclusive=False, thread=False)
+
+    async def _poll_board_state_once(self) -> None:
+        if self._board_poll_inflight:
+            return
+        self._board_poll_inflight = True
+        try:
+            project_dir = self._board_project_dir()
+            if self.remote_url:
+                try:
+                    tasks_payload = await self._remote_control().get_session_tasks(self._remote_session_id)
+                    notes_payload = await self._remote_control().get_session_notes(self._remote_session_id)
+                except Exception:
+                    return
+                tasks = str(tasks_payload.get("content", ""))
+                notes = str(notes_payload.get("content", ""))
+            else:
+                tasks = await read_project_board_file(tasks_path(project_dir))
+                notes = await read_project_board_file(operator_notes_path(project_dir))
+            if tasks == self._last_loaded_tasks_text and notes == self._last_loaded_notes_text:
+                return
+            await self._load_board_state()
+        finally:
+            self._board_poll_inflight = False
+
+    async def _load_board_state(self) -> None:
+        project_dir = self._board_project_dir()
+        if self.remote_url:
+            try:
+                tasks_payload = await self._remote_control().get_session_tasks(self._remote_session_id)
+                notes_payload = await self._remote_control().get_session_notes(self._remote_session_id)
+            except Exception:
+                tasks_payload = {}
+                notes_payload = {}
+            tasks = str(tasks_payload.get("content", ""))
+            notes = str(notes_payload.get("content", ""))
+        else:
+            tasks = await read_project_board_file(tasks_path(project_dir))
+            notes = await read_project_board_file(operator_notes_path(project_dir))
+        self._suspend_board_editor_events = True
+        try:
+            try:
+                sidebar = self._board_sidebar()
+            except Exception:
+                return
+            if not hasattr(sidebar, "set_tasks") or not hasattr(sidebar, "set_notes"):
+                return
+            sidebar.set_tasks(tasks)
+            sidebar.set_notes(notes)
+            self._last_loaded_tasks_text = tasks
+            self._last_loaded_notes_text = notes
+            sidebar.set_visible(self._sidebar_visible)
+            sidebar.set_status(f"Board files: {tasks_path(project_dir).name}, {operator_notes_path(project_dir).name}")
+        finally:
+            self._suspend_board_editor_events = False
+
+    def _board_project_dir(self) -> str:
+        if self.remote_url and self._remote_project_dir:
+            return self._remote_project_dir
+        return os.getcwd()
+
+    def _cancel_board_save_task(self, task: asyncio.Task[None] | None) -> None:
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_tasks_save(self, content: str) -> None:
+        self._cancel_board_save_task(self._tasks_save_task)
+        self._tasks_save_task = asyncio.create_task(self._debounced_save_tasks_text(content))
+        self._set_board_status("Tasks modified…")
+
+    def _schedule_notes_save(self, content: str) -> None:
+        self._cancel_board_save_task(self._notes_save_task)
+        self._notes_save_task = asyncio.create_task(self._debounced_save_notes_text(content))
+        self._set_board_status("Operator notes modified…")
+
+    async def _debounced_save_tasks_text(self, content: str) -> None:
+        try:
+            await asyncio.sleep(self._board_save_delay)
+            await self._save_tasks_text(content)
+        except asyncio.CancelledError:
+            return
+
+    async def _debounced_save_notes_text(self, content: str) -> None:
+        try:
+            await asyncio.sleep(self._board_save_delay)
+            await self._save_notes_text(content)
+        except asyncio.CancelledError:
+            return
+
+    async def _save_tasks_text(self, content: str) -> None:
+        self._set_board_status("Saving tasks…")
+        try:
+            if self.remote_url:
+                await self._remote_control().put_session_tasks(self._remote_session_id, content)
+            else:
+                await write_project_board_file(tasks_path(self._board_project_dir()), content)
+        except Exception as exc:
+            self._set_board_status(f"Failed to save tasks: {exc}")
+            return
+        self._set_board_status("Tasks saved")
+
+    async def _save_notes_text(self, content: str) -> None:
+        self._set_board_status("Saving operator notes…")
+        try:
+            if self.remote_url:
+                await self._remote_control().put_session_notes(self._remote_session_id, content)
+            else:
+                await write_project_board_file(operator_notes_path(self._board_project_dir()), content)
+        except Exception as exc:
+            self._set_board_status(f"Failed to save operator notes: {exc}")
+            return
+        self._set_board_status("Operator notes saved")
+
+    def _handle_board_tool_event(self, kind: str, payload: dict[str, Any]) -> None:
+        self.run_worker(self._refresh_board_after_tool_event, kind, payload, exclusive=False, thread=False)
+
+    async def _refresh_board_after_tool_event(self, kind: str, payload: dict[str, Any]) -> None:
+        await self._load_board_state()
+        if kind == "task_added":
+            title = str(payload.get("title", "")).strip() or "task"
+            task_id = payload.get("task_id")
+            self._add_message(f"🗂 Added task #{task_id}: {title}", role="tool")
+        elif kind == "task_updated":
+            task_id = payload.get("task_id")
+            status = str(payload.get("status", "")).strip()
+            suffix = f" ({status})" if status else ""
+            self._add_message(f"☑ Updated task #{task_id}{suffix}", role="tool")
+        elif kind == "operator_notes_appended":
+            self._add_message("📝 Appended to operator notes", role="tool")
+
+    def _set_run_activity(self, label: str, *, busy: bool) -> None:
+        self._run_busy = busy
+        footer = self.query_one("#status-footer", StatusFooter)
+        set_activity = getattr(footer, "set_activity", None)
+        if callable(set_activity):
+            set_activity(label, busy=busy)
+
+    def _set_footer_thinking_level(self, level: str) -> None:
+        try:
+            footer = self.query_one("#status-footer", StatusFooter)
+        except Exception:
+            return
+        set_level = getattr(footer, "set_thinking_level", None)
+        if callable(set_level):
+            set_level(level)
+
+    def _composer(self) -> TextArea:
+        return self.query_one("#input-bar", TextArea)
+
+    def _composer_text(self) -> str:
+        return self._composer().text
+
+    def _set_composer_text(self, text: str) -> None:
+        composer = self._composer()
+        composer.load_text(text)
+        lines = text.split("\n") if text else [""]
+        composer.move_cursor((len(lines) - 1, len(lines[-1])))
+
+    def _clear_composer(self) -> None:
+        self._composer().load_text("")
+
+    def _sync_pending_attachments_bar(self) -> None:
+        try:
+            self.query_one("#pending-attachments", PendingAttachmentsBar).set_attachments(
+                self._pending_attachments
+            )
+        except Exception:
+            pass
+
+    def _consume_pending_attachments(self) -> list[ImageAttachment]:
+        attachments = list(self._pending_attachments)
+        self._pending_attachments.clear()
+        self._sync_pending_attachments_bar()
+        return attachments
+
+    def _format_attachment_summary(self, attachment: ImageAttachment, *, index: int | None = None) -> str:
+        name = attachment.name or Path(attachment.path).name
+        prefix = f"[{index}] " if index is not None else ""
+        size = ""
+        try:
+            bytes_size = Path(attachment.path).stat().st_size
+            if bytes_size >= 1024 * 1024:
+                size = f" — {bytes_size / (1024 * 1024):.1f} MB"
+            elif bytes_size >= 1024:
+                size = f" — {bytes_size / 1024:.1f} KB"
+            else:
+                size = f" — {bytes_size} B"
+        except Exception:
+            pass
+        mime = f" ({attachment.mime_type})" if attachment.mime_type else ""
+        return f"📎 {prefix}{name}{mime}{size}"
+
+    def _pending_attachment_label(self) -> str:
+        if not self._pending_attachments:
+            return ""
+        return "\n".join(
+            self._format_attachment_summary(attachment)
+            for attachment in self._pending_attachments
+        )
+
+    def _render_user_submission(self, text: str, attachments: list[ImageAttachment] | None = None) -> str:
+        prefix = self._pending_attachment_label() if attachments is None else "\n".join(
+            self._format_attachment_summary(attachment)
+            for attachment in attachments
+        )
+        if prefix and text:
+            return f"{prefix}\n{text}"
+        if prefix:
+            return prefix
+        return text
+
+    def _queue_attachment(self, attachment: ImageAttachment) -> None:
+        self._pending_attachments.append(attachment)
+        self._sync_pending_attachments_bar()
+
+    def _remove_pending_attachment(self, index: int) -> ImageAttachment | None:
+        if index < 1 or index > len(self._pending_attachments):
+            return None
+        attachment = self._pending_attachments.pop(index - 1)
+        self._sync_pending_attachments_bar()
+        return attachment
+
+    def _clear_pending_attachments(self) -> int:
+        count = len(self._pending_attachments)
+        self._pending_attachments.clear()
+        self._sync_pending_attachments_bar()
+        return count
+
+    def _clipboard_image_output_path(self) -> Path:
+        return Path(tempfile.mkdtemp(prefix="artel-image-")) / "clipboard.png"
+
+    def _extract_image_paths_from_paste(self, text: str) -> list[str]:
+        import shlex
+
+        stripped = text.strip()
+        if not stripped:
+            return []
+        try:
+            tokens = shlex.split(stripped)
+        except Exception:
+            tokens = [line.strip() for line in stripped.splitlines() if line.strip()]
+        paths: list[str] = []
+        for token in tokens:
+            candidate = token.strip()
+            if candidate.startswith("file://"):
+                candidate = urllib.parse.unquote(urllib.parse.urlparse(candidate).path)
+            if not candidate:
+                continue
+            try:
+                resolved = str(Path(candidate).expanduser().resolve())
+            except Exception:
+                continue
+            if Path(resolved).exists() and Path(resolved).is_file() and is_supported_image_path(resolved):
+                paths.append(resolved)
+        return paths
+
+    async def _maybe_handle_pasted_image_reference(self, text: str) -> bool:
+        image_paths = self._extract_image_paths_from_paste(text)
+        if not image_paths:
+            return False
+        if not await self._model_supports_vision():
+            self._add_message("Current model does not support image input.", role="error")
+            return True
+        for image_path in image_paths:
+            self._queue_attachment(normalize_image_attachment(image_path))
+        names = ", ".join(Path(path).name for path in image_paths)
+        self._add_message(f"Attached pasted image reference(s): {names}", role="tool")
+        return True
+
+    def _paste_image_from_clipboard(self) -> ImageAttachment:
+        output_path = self._clipboard_image_output_path()
+        commands = [
+            ["pngpaste", str(output_path)],
+            ["wl-paste", "--type", "image", "--no-newline"],
+            ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$img=[Windows.Forms.Clipboard]::GetImage(); "
+                    "if ($img -eq $null) { exit 1 }; "
+                    "$img.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png)"
+                ),
+                str(output_path),
+            ],
+        ]
+        for command in commands:
+            try:
+                if command[0] in {"wl-paste", "xclip"}:
+                    import subprocess
+
+                    result = subprocess.run(command, check=True, capture_output=True)
+                    if result.stdout:
+                        output_path.write_bytes(result.stdout)
+                else:
+                    import subprocess
+
+                    subprocess.run(command, check=True, capture_output=True)
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    return normalize_image_attachment(str(output_path))
+            except Exception:
+                continue
+        raise RuntimeError(
+            "Clipboard image paste is unavailable on this system. Supported helpers: pngpaste, wl-paste, xclip, powershell."
+        )
 
     def _remote_control(self) -> RemoteControlClient:
         if self._remote_control_client is None:
@@ -714,10 +1448,16 @@ class WorkerApp(App):
         if model:
             self._provider_model = model
             footer.set_model(model)
+        thinking_level = str(session.get("thinking_level", "")).strip()
+        if thinking_level:
+            self._set_footer_thinking_level(thinking_level)
         project_dir = str(session.get("project_dir", "")).strip()
         if project_dir:
             self._remote_project_dir = project_dir
             footer.set_cwd(project_dir)
+        overrides = session.get("rule_overrides")
+        if isinstance(overrides, dict):
+            self._remote_rule_overrides = overrides
 
     async def _sync_remote_session_state(self) -> None:
         if not self.remote_url:
@@ -734,6 +1474,9 @@ class WorkerApp(App):
             if model:
                 self._provider_model = model
                 footer.set_model(model)
+            thinking_level = str(payload.get("thinking_level", "")).strip()
+            if thinking_level:
+                self._set_footer_thinking_level(thinking_level)
             project_dir = str(payload.get("project_dir", "")).strip()
             if project_dir:
                 self._remote_project_dir = project_dir
@@ -882,6 +1625,502 @@ class WorkerApp(App):
             return clean
         return clean[: limit - 1] + "…"
 
+    def _current_thinking_level(self) -> str:
+        if self._session is not None:
+            return str(self._session.thinking_level).strip().lower()
+        try:
+            footer = self.query_one("#status-footer", StatusFooter)
+        except Exception:
+            return ""
+        return str(getattr(footer, "_thinking_level", "")).strip().lower()
+
+    def _current_project_value(self) -> str:
+        if self.remote_url:
+            return self._remote_project_dir.strip()
+        return os.getcwd()
+
+    def _current_theme_value(self) -> str:
+        return self._active_theme.strip().lower()
+
+    def _current_connect_provider(self) -> str:
+        model = self._provider_model.strip().lower()
+        if "/" in model:
+            return model.split("/", 1)[0]
+        return ""
+
+    def _is_current_model(self, model_ref: str) -> bool:
+        return model_ref.strip().lower() == self._provider_model.strip().lower()
+
+    def _thinking_levels(self) -> tuple[str, ...]:
+        return ("off", "minimal", "low", "medium", "high", "xhigh")
+
+    def _available_theme_names(self) -> list[str]:
+        from worker_tui.themes import list_themes
+
+        return list_themes(os.getcwd())
+
+    def _provider_ids_for_autocomplete(self) -> list[str]:
+        config = load_config(os.getcwd())
+        return _provider_ids_for_listing(config)
+
+    def _unquote_path_prefix(self, prefix: str) -> tuple[str, bool]:
+        stripped = prefix.lstrip()
+        if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+            return stripped[1:-1], True
+        if stripped[:1] in {"'", '"'}:
+            return stripped[1:], True
+        return prefix, False
+
+    def _quote_completion_path(self, path: str, *, force: bool = False) -> str:
+        if force or any(char.isspace() for char in path):
+            return shlex.quote(path)
+        return path
+
+    def _project_path_suggestions(self, prefix: str) -> list[tuple[str, str]]:
+        raw_prefix, was_quoted = self._unquote_path_prefix(prefix)
+        expanded = os.path.expanduser(raw_prefix) if raw_prefix else ""
+        if expanded:
+            base_dir = expanded if os.path.isdir(expanded) else os.path.dirname(expanded)
+            partial = os.path.basename(expanded)
+            if not base_dir:
+                base_dir = "."
+        else:
+            base_dir = os.getcwd()
+            partial = ""
+
+        try:
+            entries = sorted(
+                (entry for entry in os.scandir(base_dir) if entry.is_dir()),
+                key=lambda entry: entry.name.lower(),
+            )
+        except OSError:
+            return []
+
+        suggestions: list[tuple[str, str]] = []
+        for entry in entries:
+            if partial and partial.lower() not in entry.name.lower():
+                continue
+            full_path = os.path.abspath(os.path.join(base_dir, entry.name))
+            display_path = os.path.expanduser(full_path)
+            if raw_prefix.startswith("~"):
+                home = str(Path.home())
+                if display_path.startswith(home):
+                    display_path = "~" + display_path[len(home) :]
+            completion_path = self._quote_completion_path(display_path, force=was_quoted)
+            suggestions.append((display_path, completion_path))
+            if len(suggestions) >= 25:
+                break
+        return suggestions
+
+    async def _ensure_model_autocomplete_data(self) -> None:
+        if self._model_autocomplete_loaded or self._model_autocomplete_loading:
+            return
+        self._model_autocomplete_loading = True
+        try:
+            refs: list[str] = []
+            descriptions: dict[str, str] = {}
+            if self.remote_url:
+                try:
+                    payload = await self._remote_control().list_models()
+                except Exception:
+                    providers = []
+                else:
+                    providers = payload.get("providers", [])
+                for provider in providers:
+                    provider_id = str(provider.get("id", "")).strip()
+                    provider_name = str(provider.get("name", provider_id)).strip() or provider_id
+                    if not provider_id:
+                        continue
+                    for model in provider.get("models", []):
+                        model_id = str(model.get("id", "")).strip()
+                        if not model_id:
+                            continue
+                        ref = f"{provider_id}/{model_id}"
+                        refs.append(ref)
+                        model_name = str(model.get("name", model_id)).strip() or model_id
+                        context_window = model.get("context_window") or 0
+                        ctx = f", {context_window // 1000}k ctx" if context_window else ""
+                        descriptions[ref] = f"{provider_name} — {model_name}{ctx}"
+            else:
+                from worker_core.cli import _resolve_api_key
+
+                config = load_config(os.getcwd())
+                catalog = await get_effective_provider_catalog(config)
+                for provider_id, provider in catalog.items():
+                    requires_key = provider_requires_api_key(config, provider_id)
+                    api_key, _ = await _resolve_api_key(config, provider_id)
+                    if not api_key and requires_key:
+                        continue
+                    for model in provider.models:
+                        ref = f"{provider_id}/{model.id}"
+                        refs.append(ref)
+                        ctx = f", {model.context_window // 1000}k ctx" if model.context_window else ""
+                        descriptions[ref] = f"{provider.name} — {model.name}{ctx}"
+            self._model_autocomplete_refs = sorted(set(refs))
+            self._model_autocomplete_descriptions = descriptions
+            self._model_autocomplete_loaded = True
+        finally:
+            self._model_autocomplete_loading = False
+
+    async def _ensure_resume_autocomplete_data(self) -> None:
+        if self._resume_autocomplete_loaded or self._resume_autocomplete_loading:
+            return
+        self._resume_autocomplete_loading = True
+        try:
+            suggestions: list[SlashCommandSuggestion] = []
+            if self.remote_url:
+                try:
+                    payload = await self._remote_control().list_sessions()
+                except Exception:
+                    sessions = []
+                else:
+                    sessions = payload.get("sessions", [])
+                for index, session in enumerate(sessions, start=1):
+                    session_id = str(session.get("id", "")).strip()
+                    if not session_id:
+                        continue
+                    title = str(session.get("title", "")).strip() or "(untitled)"
+                    model = str(session.get("model", "")).strip() or "remote"
+                    project_dir = str(session.get("project_dir", "")).strip()
+                    project_hint = f" @ {project_dir}" if project_dir else ""
+                    description = f"{title} ({model}){project_hint}"
+                    suggestions.append(
+                        SlashCommandSuggestion(
+                            str(index),
+                            description,
+                            completion=f"/resume {index}",
+                            search_text=f"{index} {session_id} {title} {model} {project_dir}".lower(),
+                        )
+                    )
+                    suggestions.append(
+                        SlashCommandSuggestion(
+                            session_id,
+                            description,
+                            completion=f"/resume {session_id}",
+                            search_text=f"{session_id} {index} {title} {model} {project_dir}".lower(),
+                        )
+                    )
+            elif self._store is not None:
+                try:
+                    sessions = await self._store.list_sessions(limit=20)
+                except Exception:
+                    sessions = []
+                home = str(Path.home())
+                for index, session in enumerate(sessions, start=1):
+                    title = session.title or "(untitled)"
+                    project_dir = session.project_dir
+                    if project_dir.startswith(home):
+                        project_dir = "~" + project_dir[len(home) :]
+                    project_hint = f" @ {project_dir}" if project_dir else ""
+                    description = f"{title} ({session.model}){project_hint}"
+                    suggestions.append(
+                        SlashCommandSuggestion(
+                            str(index),
+                            description,
+                            completion=f"/resume {index}",
+                            search_text=f"{index} {session.id} {title} {session.model} {project_dir}".lower(),
+                        )
+                    )
+                    suggestions.append(
+                        SlashCommandSuggestion(
+                            session.id,
+                            description,
+                            completion=f"/resume {session.id}",
+                            search_text=f"{session.id} {index} {title} {session.model} {project_dir}".lower(),
+                        )
+                    )
+            deduped: list[SlashCommandSuggestion] = []
+            seen: set[str] = set()
+            for suggestion in suggestions:
+                key = suggestion.completion or suggestion.value
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(suggestion)
+            self._resume_autocomplete_suggestions = deduped
+            self._resume_autocomplete_loaded = True
+        finally:
+            self._resume_autocomplete_loading = False
+
+    async def _ensure_fork_autocomplete_data(self) -> None:
+        if self._fork_autocomplete_loaded or self._fork_autocomplete_loading:
+            return
+        self._fork_autocomplete_loading = True
+        try:
+            nodes: list[dict[str, Any]] = []
+            if self.remote_url:
+                try:
+                    payload = await self._remote_control().get_session_tree(self._remote_session_id)
+                except Exception:
+                    nodes = []
+                else:
+                    raw_nodes = payload.get("nodes", [])
+                    nodes = raw_nodes if isinstance(raw_nodes, list) else []
+            elif self._store is not None and self._session is not None:
+                try:
+                    nodes = await self._store.get_message_nodes(self._session.session_id)
+                except Exception:
+                    nodes = []
+            suggestions: list[SlashCommandSuggestion] = []
+            for index, node in enumerate(nodes):
+                role = str(node.get("role", "")).strip() or "message"
+                content = str(node.get("content", "") or "").replace("\n", " ").strip()
+                preview = content[:60] + ("…" if len(content) > 60 else "")
+                description = f"[{role}] {preview}" if preview else f"[{role}]"
+                suggestions.append(
+                    SlashCommandSuggestion(
+                        str(index),
+                        description,
+                        completion=f"/fork {index}",
+                        search_text=f"{index} {role} {content}".lower(),
+                    )
+                )
+            self._fork_autocomplete_suggestions = suggestions
+            self._fork_autocomplete_loaded = True
+        finally:
+            self._fork_autocomplete_loading = False
+
+    def _image_path_suggestions(self, prefix: str) -> list[tuple[str, str]]:
+        raw_prefix, was_quoted = self._unquote_path_prefix(prefix)
+        expanded = os.path.expanduser(raw_prefix) if raw_prefix else ""
+        if expanded:
+            base_dir = expanded if os.path.isdir(expanded) else os.path.dirname(expanded)
+            partial = os.path.basename(expanded)
+            if not base_dir:
+                base_dir = "."
+        else:
+            base_dir = os.getcwd()
+            partial = ""
+
+        try:
+            entries = sorted(os.scandir(base_dir), key=lambda entry: entry.name.lower())
+        except OSError:
+            return []
+
+        suggestions: list[tuple[str, str]] = []
+        for entry in entries:
+            if partial and partial.lower() not in entry.name.lower():
+                continue
+            full_path = os.path.abspath(os.path.join(base_dir, entry.name))
+            if entry.is_dir():
+                continue
+            if not is_supported_image_path(full_path):
+                continue
+            display_path = os.path.expanduser(full_path)
+            if raw_prefix.startswith("~"):
+                home = str(Path.home())
+                if display_path.startswith(home):
+                    display_path = "~" + display_path[len(home) :]
+            completion_path = self._quote_completion_path(display_path, force=was_quoted)
+            suggestions.append((display_path, completion_path))
+            if len(suggestions) >= 25:
+                break
+        return suggestions
+
+    def _pending_attachment_index_suggestions(self) -> list[SlashCommandSuggestion]:
+        suggestions: list[SlashCommandSuggestion] = []
+        for index, attachment in enumerate(self._pending_attachments, start=1):
+            suggestions.append(
+                SlashCommandSuggestion(
+                    str(index),
+                    attachment.name or Path(attachment.path).name,
+                    completion=f"/image-remove {index}",
+                )
+            )
+        return suggestions
+
+    def _command_argument_suggestions(self, text: str) -> list[SlashCommandSuggestion]:
+        stripped = text.lstrip()
+        if not stripped.startswith("/"):
+            return []
+        body = stripped[1:]
+        if not body:
+            return []
+        if " " not in body:
+            return []
+        cmd_name, raw_arg = body.split(" ", 1)
+        cmd = f"/{cmd_name.lower()}"
+        arg = raw_arg.lstrip()
+
+        if cmd == "/thinking":
+            current_thinking = self._current_thinking_level()
+            return [
+                SlashCommandSuggestion(
+                    level,
+                    f"set thinking to {level}",
+                    completion=f"/thinking {level}",
+                    current=(level == current_thinking),
+                )
+                for level in self._thinking_levels()
+                if level.startswith(arg.lower())
+            ]
+
+        if cmd == "/theme":
+            current_theme = self._current_theme_value()
+            return [
+                SlashCommandSuggestion(
+                    theme,
+                    "switch theme",
+                    completion=f"/theme {theme}",
+                    current=(theme.lower() == current_theme),
+                )
+                for theme in self._available_theme_names()
+                if theme.lower().startswith(arg.lower())
+            ]
+
+        if cmd == "/connect":
+            current_provider = self._current_connect_provider()
+            return [
+                SlashCommandSuggestion(
+                    provider_id,
+                    "connect provider",
+                    completion=f"/connect {provider_id}",
+                    current=(provider_id.lower() == current_provider),
+                )
+                for provider_id in self._provider_ids_for_autocomplete()
+                if provider_id.lower().startswith(arg.lower())
+            ]
+
+        if cmd == "/resume":
+            lowered = arg.lower()
+            ranked = [
+                suggestion
+                for suggestion in self._resume_autocomplete_suggestions
+                if (suggestion.search_text or suggestion.value.lower()).find(lowered) >= 0
+            ]
+            ranked.sort(
+                key=lambda suggestion: (
+                    0 if suggestion.value.isdigit() else 1,
+                    0 if (suggestion.value.lower().startswith(lowered) or (suggestion.search_text or "").startswith(lowered)) else 1,
+                    suggestion.value.lower(),
+                )
+            )
+            return ranked
+
+        if cmd in {"/project", "/cd"}:
+            current_project = self._current_project_value()
+            return [
+                SlashCommandSuggestion(
+                    display_path,
+                    "change project directory",
+                    completion=f"{cmd} {completion_path}",
+                    search_text=display_path.lower(),
+                    current=(os.path.abspath(os.path.expanduser(display_path)) == os.path.abspath(os.path.expanduser(current_project))),
+                )
+                for display_path, completion_path in self._project_path_suggestions(arg)
+            ]
+
+        if cmd == "/image":
+            return [
+                SlashCommandSuggestion(
+                    display_path,
+                    "attach image",
+                    completion=f"/image {completion_path}",
+                    search_text=display_path.lower(),
+                )
+                for display_path, completion_path in self._image_path_suggestions(arg)
+            ]
+
+        if cmd == "/image-remove":
+            return [
+                suggestion
+                for suggestion in self._pending_attachment_index_suggestions()
+                if suggestion.value.startswith(arg)
+            ]
+
+        if cmd == "/fork":
+            lowered = arg.lower()
+            ranked = [
+                suggestion
+                for suggestion in self._fork_autocomplete_suggestions
+                if (suggestion.search_text or suggestion.value.lower()).find(lowered) >= 0
+            ]
+            ranked.sort(
+                key=lambda suggestion: (
+                    0 if (suggestion.value.startswith(arg) or (suggestion.search_text or "").startswith(lowered)) else 1,
+                    int(suggestion.value) if suggestion.value.isdigit() else 10**9,
+                )
+            )
+            return ranked
+
+        if cmd == "/browser":
+            browser_hints = ["https://", "http://", "about:blank"]
+            return [
+                SlashCommandSuggestion(
+                    hint,
+                    "open browser pane",
+                    completion=f"/browser {hint}",
+                )
+                for hint in browser_hints
+                if hint.startswith(arg.lower())
+            ]
+
+        if cmd == "/model":
+            current_model = self._provider_model.strip().lower()
+            current_provider = current_model.split("/", 1)[0] if "/" in current_model else ""
+            lowered = arg.lower()
+            if "/" not in arg:
+                provider_ids = self._provider_ids_for_autocomplete()
+                provider_matches: list[str] = []
+                for provider_id in provider_ids:
+                    provider_lower = provider_id.lower()
+                    if lowered in provider_lower:
+                        provider_matches.append(provider_id)
+                        continue
+                    if any(
+                        ref.lower().startswith(provider_lower + "/")
+                        and (
+                            lowered in ref.lower()
+                            or lowered in self._model_autocomplete_descriptions.get(ref, "").lower()
+                        )
+                        for ref in self._model_autocomplete_refs
+                    ):
+                        provider_matches.append(provider_id)
+                provider_matches = list(dict.fromkeys(provider_matches))
+                provider_matches.sort(
+                    key=lambda provider_id: (
+                        0 if provider_id.lower() == current_provider else 1,
+                        0 if provider_id.lower().startswith(lowered) else 1,
+                        provider_id.lower(),
+                    )
+                )
+                return [
+                    SlashCommandSuggestion(
+                        f"{provider_id}/",
+                        "select provider",
+                        completion=f"/model {provider_id}/",
+                        search_text=provider_id.lower(),
+                        current=(provider_id.lower() == current_provider),
+                    )
+                    for provider_id in provider_matches
+                ]
+            model_matches = [
+                ref
+                for ref in self._model_autocomplete_refs
+                if lowered in ref.lower()
+                or lowered in self._model_autocomplete_descriptions.get(ref, "").lower()
+            ]
+            model_matches.sort(
+                key=lambda ref: (
+                    0 if ref.lower() == current_model else 1,
+                    0 if ref.lower().startswith(lowered) else 1,
+                    0 if ref.lower().startswith(current_provider + "/") else 1,
+                    ref.lower(),
+                )
+            )
+            return [
+                SlashCommandSuggestion(
+                    ref,
+                    self._model_autocomplete_descriptions.get(ref, "switch model"),
+                    completion=f"/model {ref}",
+                    search_text=(ref + " " + self._model_autocomplete_descriptions.get(ref, "")).lower(),
+                    current=self._is_current_model(ref),
+                )
+                for ref in model_matches
+            ]
+
+        return []
+
     def _command_suggestions(self) -> list[SlashCommandSuggestion]:
         suggestions = list(BUILTIN_COMMAND_SUGGESTIONS)
 
@@ -925,8 +2164,10 @@ class WorkerApp(App):
 
     def _matching_command_suggestions(self, text: str) -> list[SlashCommandSuggestion]:
         query = text.strip().lower()
-        if not query.startswith("/") or " " in query:
+        if not query.startswith("/"):
             return []
+        if " " in query:
+            return self._command_argument_suggestions(text)
         return [
             suggestion
             for suggestion in self._command_suggestions()
@@ -942,9 +2183,16 @@ class WorkerApp(App):
 
         options = [
             Option(
-                f"{suggestion.value} — "
-                f"{self._truncate_command_description(suggestion.description)}",
-                id=suggestion.value,
+                (
+                    f"✓ {suggestion.value} — "
+                    f"{self._truncate_command_description(suggestion.description)}"
+                )
+                if getattr(suggestion, "current", False)
+                else (
+                    f"{suggestion.value} — "
+                    f"{self._truncate_command_description(suggestion.description)}"
+                ),
+                id=suggestion.completion or suggestion.value,
             )
             for suggestion in matches
         ]
@@ -977,22 +2225,21 @@ class WorkerApp(App):
         *,
         only_if_completion_needed: bool = False,
     ) -> bool:
-        input_bar = self.query_one("#input-bar", Input)
+        input_bar = self._composer()
         command = command or self._selected_command_suggestion()
         if not command:
             return False
-        if only_if_completion_needed and input_bar.value.strip() == command:
+        if only_if_completion_needed and input_bar.text.strip() == command:
             return False
         self._suppress_next_command_menu_update = True
 
-        input_bar.value = command
-        input_bar.cursor_position = len(command)
+        self._set_composer_text(command)
         self._hide_command_menu()
         self.call_after_refresh(self._focus_input)
         return True
 
     def on_key(self, event: events.Key) -> None:
-        input_bar = self.query_one("#input-bar", Input)
+        input_bar = self._composer()
         if not input_bar.has_focus or not self._command_menu_visible():
             return
 
@@ -1011,14 +2258,28 @@ class WorkerApp(App):
         event.stop()
         event.prevent_default()
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "input-bar":
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "input-bar":
+            if self._suppress_next_command_menu_update:
+                self._suppress_next_command_menu_update = False
+                self._hide_command_menu()
+                return
+            self._update_command_menu(event.text_area.text)
+            normalized = event.text_area.text.strip().lower()
+            if normalized.startswith("/model "):
+                self.run_worker(self._ensure_model_autocomplete_data, exclusive=True, thread=False)
+            if normalized.startswith("/resume "):
+                self.run_worker(self._ensure_resume_autocomplete_data, exclusive=True, thread=False)
+            if normalized.startswith("/fork "):
+                self.run_worker(self._ensure_fork_autocomplete_data, exclusive=True, thread=False)
             return
-        if self._suppress_next_command_menu_update:
-            self._suppress_next_command_menu_update = False
-            self._hide_command_menu()
+
+        if self._suspend_board_editor_events:
             return
-        self._update_command_menu(event.value)
+        if event.text_area.id == "tasks-editor":
+            self._schedule_tasks_save(event.text_area.text)
+        elif event.text_area.id == "notes-editor":
+            self._schedule_notes_save(event.text_area.text)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id != "command-suggestions":
@@ -1028,6 +2289,8 @@ class WorkerApp(App):
 
     async def _init_local_session(self) -> None:
         from worker_core.cli import _resolve_api_key
+
+
 
         config = load_config(os.getcwd())
         provider_name, model_id = resolve_model(config)
@@ -1088,6 +2351,9 @@ class WorkerApp(App):
             session_id=session_id,
             permission_callback=self._ask_permission,
         )
+        self._session.rule_overrides = self._local_rule_overrides
+        self._session.refresh_system_prompt()
+        self._session.board_event_callback = self._handle_board_tool_event  # type: ignore[attr-defined]
         if resumed_info and resumed_info.thinking_level:
             self._session.thinking_level = resumed_info.thinking_level  # type: ignore[assignment]
 
@@ -1099,27 +2365,50 @@ class WorkerApp(App):
                     role=msg.role.value,
                     content=msg.content,
                     reasoning=msg.reasoning or "",
+                    attachments=msg.attachments,
                 )
 
         self._provider_model = f"{provider_name}/{model_id}"
         self.sub_title = self._provider_model
         self.query_one("#status-footer", StatusFooter).set_model(self._provider_model)
+        current_thinking = (
+            self._session.thinking_level if self._session is not None else config.agent.thinking
+        )
+        self._set_footer_thinking_level(str(current_thinking))
+
+    async def action_submit_composer(self) -> None:
+        composer = self._composer()
+        await self._submit_text(composer.text, clear_widget=True)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        if not text:
+        await self._submit_text(event.value, clear_widget=False)
+
+    async def _submit_text(self, raw_text: str, *, clear_widget: bool) -> None:
+        text = raw_text.strip()
+        attachments = self._consume_pending_attachments()
+        if not text and not attachments:
             return
         if self._command_menu_visible() and self._apply_command_suggestion(
             only_if_completion_needed=True
         ):
             return
 
-        event.input.value = ""
+        if attachments and not await self._model_supports_vision():
+            self._pending_attachments = attachments + self._pending_attachments
+            self._add_message("Current model does not support image input.", role="error")
+            return
+
+        if clear_widget:
+            self._clear_composer()
         self._hide_command_menu()
         self.call_after_refresh(self._focus_input)
 
         # Handle bash commands: !! = local only, ! = send output to LLM
         if text.startswith("!!"):
+            if attachments:
+                self._pending_attachments = attachments + self._pending_attachments
+                self._add_message("Image attachments are only supported for normal chat messages.", role="error")
+                return
             cmd = text[2:].strip()
             if cmd:
                 self._add_message(f"$ {cmd}", role="user")
@@ -1129,6 +2418,10 @@ class WorkerApp(App):
                     self._run_bash(cmd, send_to_llm=False)
             return
         if text.startswith("!"):
+            if attachments:
+                self._pending_attachments = attachments + self._pending_attachments
+                self._add_message("Image attachments are only supported for normal chat messages.", role="error")
+                return
             cmd = text[1:].strip()
             if cmd:
                 self._add_message(f"$ {cmd}", role="user")
@@ -1140,10 +2433,34 @@ class WorkerApp(App):
 
         # Handle slash commands
         if text.startswith("/"):
+            self._pending_attachments = attachments + self._pending_attachments
             await self._handle_command(text)
             return
 
-        self._add_message(text, role="user")
+        if self._run_busy:
+            if attachments:
+                self._pending_attachments = attachments + self._pending_attachments
+                self._add_message("Image attachments are not supported for steering messages.", role="error")
+                return
+            self._add_message(text, role="user")
+            if self.remote_url:
+                try:
+                    await self._send_remote_event(
+                        {
+                            "type": "steer",
+                            "content": text,
+                            "session_id": self._remote_session_id,
+                        }
+                    )
+                    self._add_message("Steering queued.", role="tool")
+                except Exception as exc:
+                    self._add_message(f"Failed to steer remote run: {exc}", role="error")
+            elif self._session is not None:
+                self._session.steer(text)
+                self._add_message("Steering queued.", role="tool")
+            return
+
+        self._add_message(self._render_user_submission(text, attachments), role="user")
 
         # Auto-title session from first user message (async, non-blocking)
         if self._store and self._session and not text.startswith("/"):
@@ -1152,17 +2469,25 @@ class WorkerApp(App):
                 self._generate_title(text)
 
         if self.remote_url:
-            self._run_remote(text)
+            if attachments:
+                self._run_remote(text, attachments=attachments)
+            else:
+                self._run_remote(text)
         else:
-            self._run_local(text)
+            if attachments:
+                self._run_local(text, attachments=attachments)
+            else:
+                self._run_local(text)
 
     async def _handle_command(self, text: str) -> None:
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        if cmd == "/clear":
+        if cmd in {"/clear", "/new"}:
             await self.action_clear()
+        elif cmd == "/cancel":
+            await self._cmd_cancel()
         elif cmd == "/quit":
             await self._cleanup()
             self.exit()
@@ -1177,6 +2502,18 @@ class WorkerApp(App):
                 "  /cd <path>          — alias for /project <path>\n"
                 "  /providers          — list supported providers and setup hints\n"
                 "  /connect <provider> — login to a provider\n"
+                "  /rules              — list configured rules\n"
+                "  /rule add           — add a rule via dialog\n"
+                "  /rule edit <id>     — edit a rule via dialog\n"
+                "  /rule delete <id>   — delete a rule\n"
+                "  /rule enable <id>   — enable a rule for this session\n"
+                "  /rule disable <id>  — disable a rule for this session\n"
+                "  /rule persist enable <id>  — enable a rule in storage\n"
+                "  /rule persist disable <id> — disable a rule in storage\n"
+                "  /rule move <id> up|down   — move a rule in precedence order\n"
+                "  /rule move <id> to <n>    — move a rule to a 1-based position\n"
+                "  /rule reset <id>    — reset a session rule override\n"
+                "  /rule reset all     — reset all session rule overrides\n"
                 "  /resume             — list and resume a session\n"
                 "  /sessions           — list recent sessions\n"
                 "  /compact [prompt]   — compact conversation history\n"
@@ -1190,13 +2527,32 @@ class WorkerApp(App):
                 "  /theme [name]       — switch theme (dark/light/monokai/dracula)\n"
                 "  /export [file]      — export session to HTML\n"
                 "  /reload             — hot-reload extensions, prompts, skills\n"
+                "  /image <path>       — attach an image to the next message\n"
+                "  /image-paste        — paste an image from the clipboard\n"
+                "  /image-clear        — clear pending image attachments\n"
+                "  /image-remove <n>   — remove one pending image attachment\n"
+                "  /copy               — copy the last assistant message\n"
+                "  /tasks              — show the shared task board\n"
+                "  /task-add <title>   — add a task to the shared task board\n"
+                "  /task-done <id>     — mark a task as done\n"
+                "  /notes              — show operator notes\n"
+                "  /notes-open         — focus the operator notes editor\n"
+                "  /cancel             — cancel the active run\n"
+                "  /server-restart     — restart managed local Artel server\n"
                 "  /split [dir]        — open cmux split pane (cmux only)\n"
                 "  /browser [url]      — open browser pane (cmux only)\n"
+                "  /new                — start a new session in this window\n"
                 "  /clear              — clear chat & start new session\n"
                 "  /quit               — exit\n"
                 "  ! <command>         — run cmd on the active host & send output to LLM\n"
                 "  !! <command>        — run cmd on the active host\n"
-                "  Ctrl+O              — toggle tool output",
+                "  Ctrl+O              — toggle tool output\n"
+                "  Ctrl+B              — toggle task board / notes sidebar\n"
+                "  Ctrl+T              — focus tasks editor\n"
+                "  Ctrl+N              — focus notes editor\n"
+                "  Enter               — send composer contents\n"
+                "  Shift+Enter         — insert new line\n"
+                "  Ctrl+Shift+C        — copy last assistant reply",
                 role="tool",
             )
         elif cmd == "/model":
@@ -1220,6 +2576,10 @@ class WorkerApp(App):
             await self._cmd_project(arg)
         elif cmd == "/providers":
             await self._list_providers()
+        elif cmd == "/rules":
+            await self._cmd_rules()
+        elif cmd == "/rule":
+            await self._cmd_rule(arg)
         elif cmd == "/connect":
             if not arg:
                 self._add_message(
@@ -1259,6 +2619,28 @@ class WorkerApp(App):
             await self._cmd_browser(arg)
         elif cmd == "/reload":
             await self._cmd_reload()
+        elif cmd == "/image":
+            await self._cmd_image(arg)
+        elif cmd == "/image-paste":
+            await self._cmd_image_paste()
+        elif cmd == "/image-clear":
+            self._cmd_image_clear()
+        elif cmd == "/image-remove":
+            self._cmd_image_remove(arg)
+        elif cmd == "/copy":
+            self.action_copy_last_assistant_message()
+        elif cmd == "/tasks":
+            await self._cmd_tasks()
+        elif cmd == "/task-add":
+            await self._cmd_task_add(arg)
+        elif cmd == "/task-done":
+            await self._cmd_task_done(arg)
+        elif cmd == "/notes":
+            await self._cmd_notes()
+        elif cmd == "/notes-open":
+            self.action_focus_notes()
+        elif cmd == "/server-restart":
+            await self._cmd_server_restart()
         else:
             # Check prompt templates as /name commands
             cmd_name = cmd.lstrip("/")
@@ -1278,8 +2660,105 @@ class WorkerApp(App):
             else:
                 self._add_message(f"Unknown command: {cmd}. Type /help for list.", role="error")
 
+    async def _model_supports_vision(self) -> bool:
+        try:
+            config = load_config(os.getcwd())
+            provider_name, model_id = resolve_model(config)
+            model_ref = self._provider_model.strip()
+            if "/" in model_ref:
+                provider_name, model_id = model_ref.split("/", 1)
+            model = await get_effective_model_info(config, provider_name, model_id)
+            return bool(model and model.supports_vision)
+        except Exception:
+            return False
+
+    async def _cmd_image(self, arg: str) -> None:
+        if not arg:
+            self._add_message("Usage: /image <path-to-image>", role="error")
+            return
+        try:
+            attachment = normalize_image_attachment(arg)
+        except Exception as exc:
+            self._add_message(f"Failed to attach image: {exc}", role="error")
+            return
+        if not Path(attachment.path).exists():
+            self._add_message(f"Image not found: {attachment.path}", role="error")
+            return
+        if not Path(attachment.path).is_file():
+            self._add_message(f"Not a file: {attachment.path}", role="error")
+            return
+        if not is_supported_image_path(attachment.path):
+            self._add_message("Only image files are supported for /image.", role="error")
+            return
+        if not await self._model_supports_vision():
+            self._add_message("Current model does not support image input.", role="error")
+            return
+        self._queue_attachment(attachment)
+        self._add_message(f"Attached image: {attachment.name or Path(attachment.path).name}", role="tool")
+
+    async def _cmd_image_paste(self) -> None:
+        if not await self._model_supports_vision():
+            self._add_message("Current model does not support image input.", role="error")
+            return
+        try:
+            attachment = self._paste_image_from_clipboard()
+        except Exception as exc:
+            self._add_message(str(exc), role="error")
+            return
+        self._queue_attachment(attachment)
+        self._add_message(f"Attached image from clipboard: {attachment.name or Path(attachment.path).name}", role="tool")
+
+    def _cmd_image_clear(self) -> None:
+        count = self._clear_pending_attachments()
+        if count:
+            self._add_message(f"Cleared {count} pending image attachment(s).", role="tool")
+        else:
+            self._add_message("No pending image attachments.", role="tool")
+
+    def _cmd_image_remove(self, arg: str) -> None:
+        if not arg:
+            self._add_message("Usage: /image-remove <index>", role="error")
+            return
+        try:
+            index = int(arg)
+        except ValueError:
+            self._add_message("Usage: /image-remove <index>", role="error")
+            return
+        removed = self._remove_pending_attachment(index)
+        if removed is None:
+            self._add_message(f"No pending image attachment at index {index}.", role="error")
+            return
+        self._add_message(
+            f"Removed pending image: {removed.name or Path(removed.path).name}",
+            role="tool",
+        )
+
+    async def _cmd_cancel(self) -> None:
+        if self.remote_url:
+            if not self._run_busy:
+                self._add_message("No active remote run.", role="tool")
+                return
+            try:
+                await self._send_remote_event(
+                    {
+                        "type": "cancel",
+                        "session_id": self._remote_session_id,
+                    }
+                )
+            except Exception as exc:
+                self._add_message(f"Failed to cancel remote run: {exc}", role="error")
+                return
+            self._add_message("Cancellation requested.", role="tool")
+            return
+
+        if not self._session or not self._run_busy:
+            self._add_message("No active local run.", role="tool")
+            return
+        self._session.abort()
+        self._add_message("Cancellation requested.", role="tool")
+
     @work(exclusive=True, thread=False)
-    async def _run_local(self, text: str) -> None:
+    async def _run_local(self, text: str, attachments: list[ImageAttachment] | None = None) -> None:
         """Run a query through the local agent session."""
         if not self._session:
             self._add_message("Session not initialized.", role="error")
@@ -1289,80 +2768,81 @@ class WorkerApp(App):
         reasoning_widget: MessageWidget | None = None
         had_tool_calls = False
         need_new_reasoning_block = False
+        footer = self.query_one("#status-footer", StatusFooter)
 
-        # cmux: set status to thinking
+        self._set_run_activity("thinking", busy=True)
         await cmux.set_status("state", "thinking", icon="brain", color="#89b4fa")
 
-        async for event in self._session.run(text):
-            if event.type == AgentEventType.REASONING_DELTA:
-                # Show thinking in a collapsible block
-                if reasoning_widget is None or need_new_reasoning_block:
-                    reasoning_widget = self._add_reasoning_block()
-                    need_new_reasoning_block = False
-                reasoning_widget.append_content(event.content)
+        try:
+            run_iter = (
+                self._session.run(text, attachments=attachments)
+                if attachments
+                else self._session.run(text)
+            )
+            async for event in run_iter:
+                if event.type == AgentEventType.REASONING_DELTA:
+                    self._set_run_activity("thinking", busy=True)
+                    if reasoning_widget is None or need_new_reasoning_block:
+                        reasoning_widget = self._add_reasoning_block()
+                        need_new_reasoning_block = False
+                    reasoning_widget.append_content(event.content)
 
-            elif event.type == AgentEventType.TEXT_DELTA:
-                # After tool calls, create a new widget so text appears AFTER tools
-                if widget is None or had_tool_calls:
-                    widget = self._add_message("", role="assistant")
-                    had_tool_calls = False
-                widget.append_content(event.content)
-                self.call_after_refresh(self._scroll_to_bottom)
+                elif event.type == AgentEventType.TEXT_DELTA:
+                    self._set_run_activity("responding", busy=True)
+                    if widget is None or had_tool_calls:
+                        widget = self._add_message("", role="assistant")
+                        had_tool_calls = False
+                    widget.append_content(event.content)
 
-            elif event.type == AgentEventType.TOOL_CALL:
-                had_tool_calls = True
-                need_new_reasoning_block = True
-                tool_args = ", ".join(
-                    f"{k}={v!r}" for k, v in event.tool_args.items()
-                )
-                tool_label = f"⚙ {event.tool_name}({tool_args})"
-                self._add_tool_message(tool_label)
-                # cmux: update status to tool call
-                await cmux.set_status(
-                    "state",
-                    f"tool: {event.tool_name}",
-                    icon="gear",
-                    color="#f9e2af",
-                )
-                await cmux.log(f"tool: {event.tool_name}", source="worker")
-
-            elif event.type == AgentEventType.TOOL_RESULT:
-                output = event.content[:200] + "..." if len(event.content) > 200 else event.content
-                self._add_tool_message(f"  → {output}")
-
-            elif event.type == AgentEventType.ERROR:
-                self._add_message(event.error, role="error")
-                await cmux.log(event.error, level="error", source="worker")
-
-            elif event.type == AgentEventType.COMPACT:
-                self._add_message("\U0001f4cb Session auto-compacted.", role="tool")
-
-            elif event.type == AgentEventType.DONE:
-                footer = self.query_one("#status-footer", StatusFooter)
-                if event.usage:
-                    footer.update_usage(
-                        event.usage.input_tokens,
-                        event.usage.output_tokens,
-                        self._input_price,
-                        self._output_price,
+                elif event.type == AgentEventType.TOOL_CALL:
+                    had_tool_calls = True
+                    need_new_reasoning_block = True
+                    tool_args = ", ".join(f"{k}={v!r}" for k, v in event.tool_args.items())
+                    tool_label = f"⚙ {event.tool_name}({tool_args})"
+                    self._add_tool_message(tool_label)
+                    self._set_run_activity(f"tool: {event.tool_name}", busy=True)
+                    await cmux.set_status(
+                        "state",
+                        f"tool: {event.tool_name}",
+                        icon="gear",
+                        color="#f9e2af",
                     )
-                # Update context % in footer
-                if self._session:
-                    est = self._session._estimate_tokens()
-                    footer.update_context_pct(est, self._session.context_window)
-                    # cmux: update progress bar with context usage
-                    if self._session.context_window > 0:
-                        pct = est / self._session.context_window
-                        await cmux.set_progress(min(pct, 1.0), label=f"ctx {pct:.0%}")
+                    await cmux.log(f"tool: {event.tool_name}", source="artel")
 
-        # cmux: set status to idle, notify completion
-        await cmux.set_status("state", "idle", icon="check", color="#a6e3a1")
-        await cmux.notify("Worker", subtitle="Task complete")
+                elif event.type == AgentEventType.TOOL_RESULT:
+                    output = event.content[:200] + "..." if len(event.content) > 200 else event.content
+                    self._add_tool_message(f"  → {output}")
+                    self._set_run_activity("thinking", busy=True)
 
-        self._scroll_to_bottom()
+                elif event.type == AgentEventType.ERROR:
+                    self._add_message(event.error, role="error")
+                    await cmux.log(event.error, level="error", source="artel")
+
+                elif event.type == AgentEventType.COMPACT:
+                    self._add_message("\U0001f4cb Session auto-compacted.", role="tool")
+
+                elif event.type == AgentEventType.DONE:
+                    if event.usage:
+                        footer.update_usage(
+                            event.usage.input_tokens,
+                            event.usage.output_tokens,
+                            self._input_price,
+                            self._output_price,
+                        )
+                    if self._session:
+                        est = self._session._estimate_tokens()
+                        footer.update_context_pct(est, self._session.context_window)
+                        if self._session.context_window > 0:
+                            pct = est / self._session.context_window
+                            await cmux.set_progress(min(pct, 1.0), label=f"ctx {pct:.0%}")
+        finally:
+            self._set_run_activity("idle", busy=False)
+            await cmux.set_status("state", "idle", icon="check", color="#a6e3a1")
+            await cmux.notify("Artel", subtitle="Task complete")
+            self._scroll_to_bottom()
 
     @work(exclusive=True, thread=False)
-    async def _run_remote(self, text: str) -> None:
+    async def _run_remote(self, text: str, attachments: list[ImageAttachment] | None = None) -> None:
         """Send a query to the remote server via WebSocket."""
         import websockets
 
@@ -1375,27 +2855,37 @@ class WorkerApp(App):
             except Exception as e:
                 self._add_message(f"Connection failed: {e}", role="error")
                 return
-        await self._ws.send(json.dumps(self._remote_message_payload(text)))
+
+        try:
+            await self._ws.send(json.dumps(self._remote_message_payload(text, attachments=attachments)))
+        except Exception as e:
+            self._add_message(f"Connection error: {e}", role="error")
+            self._ws = None
+            return
+
         widget: MessageWidget | None = None
         reasoning_widget: MessageWidget | None = None
         had_tool_calls = False
         need_new_reasoning_block = False
+        footer = self.query_one("#status-footer", StatusFooter)
+        self._set_run_activity("thinking", busy=True)
 
         try:
             async for raw in self._ws:
                 msg = json.loads(raw)
                 msg_type = msg.get("type", "")
                 if msg_type == "reasoning_delta":
+                    self._set_run_activity("thinking", busy=True)
                     if reasoning_widget is None or need_new_reasoning_block:
                         reasoning_widget = self._add_reasoning_block()
                         need_new_reasoning_block = False
                     reasoning_widget.append_content(msg.get("content", ""))
                 elif msg_type == "text_delta":
+                    self._set_run_activity("responding", busy=True)
                     if widget is None or had_tool_calls:
                         widget = self._add_message("", role="assistant")
                         had_tool_calls = False
                     widget.append_content(msg.get("content", ""))
-                    self.call_after_refresh(self._scroll_to_bottom)
                 elif msg_type == "tool_call":
                     had_tool_calls = True
                     need_new_reasoning_block = True
@@ -1409,23 +2899,39 @@ class WorkerApp(App):
                     else:
                         tool_label = f"⚙ {tool_name}"
                     self._add_tool_message(tool_label)
+                    self._set_run_activity(f"tool: {tool_name}", busy=True)
                 elif msg_type == "tool_result":
                     output = msg.get("output", "")
                     if len(output) > 200:
                         output = output[:200] + "..."
                     self._add_tool_message(f"  → {output}")
+                    self._set_run_activity("thinking", busy=True)
                 elif msg_type == "permission_request":
                     await self._handle_remote_permission_request(msg)
                 elif msg_type == "session_updated":
                     session = msg.get("session")
                     if isinstance(session, dict):
                         self._apply_remote_session_state(session)
+                elif msg_type == "board_event":
+                    event_name = str(msg.get("event", "")).strip()
+                    payload = msg.get("payload", {})
+                    if isinstance(payload, dict) and event_name:
+                        await self._refresh_board_after_tool_event(event_name, payload)
+                elif msg_type == "status":
+                    state_label = str(msg.get("state", "")).strip() or str(msg.get("label", "")).strip()
+                    self._set_run_activity(state_label or "working", busy=bool(msg.get("busy", True)))
                 elif msg_type == "error":
-                    self._add_message(msg.get("error", "Unknown error"), role="error")
+                    error_text = str(msg.get("error", "Unknown error"))
+                    self._add_message(error_text, role="error")
+                    if "Unknown type: steer" in error_text:
+                        self._add_message(
+                            "Remote server does not support steering yet. Run /server-restart to reload the local managed server.",
+                            role="tool",
+                        )
+                    break
                 elif msg_type == "done":
                     usage = msg.get("usage")
                     if usage:
-                        footer = self.query_one("#status-footer", StatusFooter)
                         footer.update_usage(
                             int(usage.get("input", 0)),
                             int(usage.get("output", 0)),
@@ -1436,8 +2942,9 @@ class WorkerApp(App):
         except Exception as e:
             self._add_message(f"Connection error: {e}", role="error")
             self._ws = None
-
-        self._scroll_to_bottom()
+        finally:
+            self._set_run_activity("idle", busy=False)
+            self._scroll_to_bottom()
 
     async def _handle_remote_permission_request(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("request_id", "")).strip()
@@ -1498,6 +3005,8 @@ class WorkerApp(App):
             return
         from worker_core.cli import _resolve_api_key
 
+
+
         config = load_config(os.getcwd())
         catalog = await get_effective_provider_catalog(config)
         lines: list[str] = []
@@ -1544,6 +3053,7 @@ class WorkerApp(App):
             self._add_message(format_provider_setup_entries(entries), role="tool")
             return
         from worker_core.cli import _resolve_api_key
+
 
         config = load_config(os.getcwd())
         entries = await collect_provider_setup_entries(config, _resolve_api_key)
@@ -1637,6 +3147,9 @@ class WorkerApp(App):
             session_id=session_id,
             permission_callback=self._ask_permission,
         )
+        self._session.rule_overrides = self._local_rule_overrides
+        self._session.refresh_system_prompt()
+        self._session.board_event_callback = self._handle_board_tool_event  # type: ignore[attr-defined]
         self._session.thinking_level = current_thinking  # type: ignore[assignment]
 
         # Restore prior messages into new session
@@ -1646,6 +3159,8 @@ class WorkerApp(App):
         self._provider_model = f"{provider_name}/{model_id}"
         self.sub_title = self._provider_model
         self.query_one("#status-footer", StatusFooter).set_model(self._provider_model)
+        self._set_footer_thinking_level(str(current_thinking))
+        await self._load_board_state()
         self._add_message(f"Switched to {self._provider_model}", role="tool")
 
     # ── Provider login ────────────────────────────────────────────
@@ -1782,7 +3297,7 @@ class WorkerApp(App):
     async def _run_remote_forwarded_oauth_login(self, provider_name: str, config: Any) -> None:
         from worker_ai.oauth import TokenStore, get_oauth_provider
 
-        with tempfile.TemporaryDirectory(prefix="worker-remote-oauth-") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="artel-remote-oauth-") as temp_dir:
             temp_store = TokenStore(path=Path(temp_dir) / "auth.json")
             oauth = get_oauth_provider(
                 provider_name,
@@ -1859,7 +3374,7 @@ class WorkerApp(App):
                         )
                 body = (
                     "<html><body><h1>Authorized!</h1>"
-                    "<p>You can close this tab and return to Worker.</p>"
+                    "<p>You can close this tab and return to Artel.</p>"
                     "</body></html>"
                 )
                 response = (
@@ -1918,8 +3433,404 @@ class WorkerApp(App):
 
         session = payload.get("session", {})
         self._apply_remote_session_state(session)
+        await self._load_board_state()
         project_dir = str(session.get("project_dir", "")).strip() or arg
         self._add_message(f"Switched remote project to: {project_dir}", role="tool")
+
+    async def _cmd_rules(self) -> None:
+        if self.remote_url:
+            try:
+                payload = await self._remote_control().list_rules(project_dir=self._current_rules_project_dir())
+                overrides_payload = await self._remote_control().get_session_rule_overrides(self._remote_session_id)
+            except Exception as exc:
+                self._add_message(f"Failed to load remote rules: {exc}", role="error")
+                return
+            rules = payload.get("rules", [])
+            overrides = overrides_payload.get("rule_overrides", {})
+            self._remote_rule_overrides = overrides if isinstance(overrides, dict) else {}
+            if not rules:
+                self._add_message("No rules configured.", role="tool")
+                return
+            disabled_ids = set(self._remote_rule_overrides.get("disabled_rule_ids", []))
+            enabled_ids = set(self._remote_rule_overrides.get("enabled_rule_ids", []))
+            lines = ["Configured rules:"]
+            for rule in rules:
+                rule_id = str(rule.get("id", ""))
+                base_enabled = bool(rule.get("enabled", True))
+                persisted = "enabled" if base_enabled else "disabled"
+                if rule_id in disabled_ids:
+                    override = "disabled"
+                    effective = "disabled"
+                elif rule_id in enabled_ids and not base_enabled:
+                    override = "enabled"
+                    effective = "enabled"
+                else:
+                    override = "-"
+                    effective = persisted
+                order = int(rule.get('order', 0) or 0)
+                lines.append(
+                    f"  {order}. {rule_id} [{rule.get('scope', '')}] persisted={persisted} session={override} effective={effective} {rule.get('text', '')}"
+                )
+            self._add_message("\n".join(lines), role="tool")
+            return
+        rules = list_rules(self._current_rules_project_dir())
+        if not rules:
+            self._add_message("No rules configured.", role="tool")
+            return
+        lines = ["Configured rules:"]
+        for rule in rules:
+            persisted = "enabled" if rule.enabled else "disabled"
+            effective = effective_rule_state(rule, self._local_rule_overrides)
+            if effective == "session-disabled":
+                override = "disabled"
+                effective_label = "disabled"
+            elif effective == "session-enabled":
+                override = "enabled"
+                effective_label = "enabled"
+            else:
+                override = "-"
+                effective_label = effective
+            lines.append(
+                f"  {rule.order}. {rule.id} [{rule.scope}] persisted={persisted} session={override} effective={effective_label} {rule.text}"
+            )
+        self._add_message("\n".join(lines), role="tool")
+
+    async def _cmd_rule(self, arg: str) -> None:
+        parts = arg.split(maxsplit=1)
+        action = parts[0].strip().lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if action == "add":
+            self._run_rule_editor_dialog()
+            return
+        if action == "edit":
+            if not rest:
+                self._add_message("Usage: /rule edit <rule-id>", role="error")
+                return
+            self._run_rule_editor_dialog(rule_id=rest)
+            return
+        if action in {"delete", "remove", "rm"}:
+            if not rest:
+                self._add_message("Usage: /rule delete <rule-id>", role="error")
+                return
+            if self.remote_url:
+                try:
+                    payload = await self._remote_control().delete_rule(rest, project_dir=self._current_rules_project_dir())
+                except Exception as exc:
+                    self._add_message(f"Failed to delete rule: {exc}", role="error")
+                    return
+                deleted = payload.get("rule", {})
+                self._add_message(f"Deleted rule {deleted.get('id', rest)}.", role="tool")
+                return
+            deleted = delete_rule(rest, self._current_rules_project_dir())
+            if deleted is None:
+                self._add_message(f"Rule '{rest}' not found.", role="error")
+                return
+            self._add_message(f"Deleted rule {deleted.id}.", role="tool")
+            return
+        if action == "enable":
+            if not rest:
+                self._add_message("Usage: /rule enable <rule-id>", role="error")
+                return
+            try:
+                if self.remote_url:
+                    payload = await self._remote_control().set_session_rule_enabled(
+                        self._remote_session_id,
+                        rest,
+                        enabled=True,
+                    )
+                    self._remote_rule_overrides = payload.get("rule_overrides", {})
+                    rule_id = str(payload.get("rule_id", rest))
+                else:
+                    set_rule_enabled_for_session(self._local_rule_overrides, rest, True)
+                    if self._session is not None:
+                        self._session.rule_overrides = self._local_rule_overrides
+                        self._session.refresh_system_prompt()
+                    rule_id = rest
+            except Exception as exc:
+                self._add_message(f"Failed to enable rule: {exc}", role="error")
+                return
+            self._add_message(f"Enabled rule {rule_id} for this session.", role="tool")
+            return
+        if action == "disable":
+            if not rest:
+                self._add_message("Usage: /rule disable <rule-id>", role="error")
+                return
+            try:
+                if self.remote_url:
+                    payload = await self._remote_control().set_session_rule_enabled(
+                        self._remote_session_id,
+                        rest,
+                        enabled=False,
+                    )
+                    self._remote_rule_overrides = payload.get("rule_overrides", {})
+                    rule_id = str(payload.get("rule_id", rest))
+                else:
+                    set_rule_enabled_for_session(self._local_rule_overrides, rest, False)
+                    if self._session is not None:
+                        self._session.rule_overrides = self._local_rule_overrides
+                        self._session.refresh_system_prompt()
+                    rule_id = rest
+            except Exception as exc:
+                self._add_message(f"Failed to disable rule: {exc}", role="error")
+                return
+            self._add_message(f"Disabled rule {rule_id} for this session.", role="tool")
+            return
+        if action == "persist":
+            persist_parts = rest.split(maxsplit=1)
+            persist_action = persist_parts[0].strip().lower() if persist_parts else ""
+            persist_rule_id = persist_parts[1].strip() if len(persist_parts) > 1 else ""
+            if persist_action not in {"enable", "disable"} or not persist_rule_id:
+                self._add_message("Usage: /rule persist enable <rule-id> | /rule persist disable <rule-id>", role="error")
+                return
+            try:
+                if self.remote_url:
+                    payload = await self._remote_control().edit_rule(
+                        persist_rule_id,
+                        project_dir=self._current_rules_project_dir(),
+                        enabled=(persist_action == "enable"),
+                    )
+                    rule_id = str(payload.get("rule", {}).get("id", persist_rule_id))
+                else:
+                    rule = update_rule(
+                        persist_rule_id,
+                        project_dir=self._current_rules_project_dir(),
+                        enabled=(persist_action == "enable"),
+                    )
+                    rule_id = rule.id
+                    if self._session is not None:
+                        self._session.refresh_system_prompt()
+            except Exception as exc:
+                self._add_message(f"Failed to update persisted rule state: {exc}", role="error")
+                return
+            self._add_message(
+                f"Persistently {'enabled' if persist_action == 'enable' else 'disabled'} rule {rule_id}.",
+                role="tool",
+            )
+            return
+        if action == "move":
+            move_parts = rest.split()
+            if len(move_parts) < 2:
+                self._add_message("Usage: /rule move <rule-id> up|down|to <n>", role="error")
+                return
+            move_rule_id = move_parts[0].strip()
+            move_action = move_parts[1].strip().lower()
+            position = None
+            offset = None
+            if move_action == "up":
+                offset = -1
+            elif move_action == "down":
+                offset = 1
+            elif move_action == "to" and len(move_parts) >= 3:
+                try:
+                    position = int(move_parts[2])
+                except ValueError:
+                    self._add_message("Usage: /rule move <rule-id> to <position>", role="error")
+                    return
+            else:
+                self._add_message("Usage: /rule move <rule-id> up|down|to <n>", role="error")
+                return
+            try:
+                if self.remote_url:
+                    payload = await self._remote_control().move_rule(
+                        move_rule_id,
+                        project_dir=self._current_rules_project_dir(),
+                        position=position,
+                        offset=offset,
+                    )
+                    moved = payload.get("rule", {})
+                    moved_id = str(moved.get("id", move_rule_id))
+                    moved_order = int(moved.get("order", 0) or 0)
+                else:
+                    moved_rule = move_rule(
+                        move_rule_id,
+                        project_dir=self._current_rules_project_dir(),
+                        position=position,
+                        offset=offset,
+                    )
+                    moved_id = moved_rule.id
+                    moved_order = moved_rule.order
+                    if self._session is not None:
+                        self._session.refresh_system_prompt()
+            except Exception as exc:
+                self._add_message(f"Failed to move rule: {exc}", role="error")
+                return
+            self._add_message(f"Moved rule {moved_id} to position {moved_order}.", role="tool")
+            return
+        if action == "reset":
+            if not rest:
+                self._add_message("Usage: /rule reset <rule-id|all>", role="error")
+                return
+            if self.remote_url:
+                try:
+                    if rest == "all":
+                        payload = await self._remote_control().set_session_rule_enabled(
+                            self._remote_session_id,
+                            "*",
+                            enabled=None,
+                        )
+                    else:
+                        payload = await self._remote_control().set_session_rule_enabled(
+                            self._remote_session_id,
+                            rest,
+                            enabled=None,
+                        )
+                    self._remote_rule_overrides = payload.get("rule_overrides", {})
+                except Exception as exc:
+                    self._add_message(f"Failed to reset session rule override: {exc}", role="error")
+                    return
+            else:
+                if rest == "all":
+                    clear_session_rule_overrides(self._local_rule_overrides)
+                else:
+                    reset_rule_for_session(self._local_rule_overrides, rest)
+                if self._session is not None:
+                    self._session.rule_overrides = self._local_rule_overrides
+                    self._session.refresh_system_prompt()
+            self._add_message(
+                "Reset all session rule overrides." if rest == "all" else f"Reset session override for rule {rest}.",
+                role="tool",
+            )
+            return
+        self._add_message(
+            "Usage: /rule add | /rule edit <id> | /rule delete <id> | /rule enable <id> | /rule disable <id> | /rule persist enable <id> | /rule persist disable <id> | /rule move <id> up|down|to <n> | /rule reset <id|all>",
+            role="tool",
+        )
+
+    def _current_rules_project_dir(self) -> str:
+        if self.remote_url and self._remote_project_dir:
+            return self._remote_project_dir
+        return os.getcwd()
+
+    @work(exclusive=True, thread=False)
+    async def _run_rule_editor_dialog(self, rule_id: str = "") -> None:
+        existing = None
+        if rule_id:
+            if self.remote_url:
+                try:
+                    payload = await self._remote_control().list_rules(project_dir=self._current_rules_project_dir())
+                except Exception as exc:
+                    self._add_message(f"Failed to load remote rules: {exc}", role="error")
+                    return
+                for item in payload.get("rules", []):
+                    if str(item.get("id", "")).strip() == rule_id:
+                        existing = item
+                        break
+            else:
+                existing = get_rule(rule_id, self._current_rules_project_dir())
+            if existing is None:
+                self._add_message(f"Rule '{rule_id}' not found.", role="error")
+                return
+        payload = await self.push_screen_wait(
+            RuleEditorScreen(
+                title="Edit rule" if existing is not None else "Add rule",
+                text=(existing.get("text", "") if isinstance(existing, dict) else existing.text) if existing is not None else "",
+                scope=(existing.get("scope", "project") if isinstance(existing, dict) else existing.scope) if existing is not None else "project",
+                enabled=(bool(existing.get("enabled", True)) if isinstance(existing, dict) else existing.enabled) if existing is not None else True,
+            )
+        )
+        if not payload:
+            self._add_message("Rule edit cancelled.", role="tool")
+            return
+        try:
+            if self.remote_url:
+                if existing is None:
+                    response = await self._remote_control().add_rule(
+                        scope=str(payload.get("scope", "project")),
+                        text=str(payload.get("text", "")),
+                        project_dir=self._current_rules_project_dir(),
+                        enabled=bool(payload.get("enabled", True)),
+                    )
+                    rule_id_value = str(response.get("rule", {}).get("id", ""))
+                    self._add_message(f"Added rule {rule_id_value}.", role="tool")
+                else:
+                    existing_id = str(existing.get("id", "")) if isinstance(existing, dict) else existing.id
+                    response = await self._remote_control().edit_rule(
+                        existing_id,
+                        project_dir=self._current_rules_project_dir(),
+                        text=str(payload.get("text", "")),
+                        scope=str(payload.get("scope", "project")),
+                        enabled=bool(payload.get("enabled", True)),
+                    )
+                    rule_id_value = str(response.get("rule", {}).get("id", existing_id))
+                    self._add_message(f"Updated rule {rule_id_value}.", role="tool")
+                return
+            if existing is None:
+                rule = add_rule(
+                    scope=str(payload.get("scope", "project")),
+                    text=str(payload.get("text", "")),
+                    project_dir=self._current_rules_project_dir(),
+                    enabled=bool(payload.get("enabled", True)),
+                )
+                self._add_message(f"Added rule {rule.id}.", role="tool")
+            else:
+                existing_id = existing.id
+                rule = update_rule(
+                    existing_id,
+                    project_dir=self._current_rules_project_dir(),
+                    text=str(payload.get("text", "")),
+                    scope=str(payload.get("scope", existing.scope)),
+                    enabled=bool(payload.get("enabled", existing.enabled)),
+                )
+                self._add_message(f"Updated rule {rule.id}.", role="tool")
+        except Exception as exc:
+            self._add_message(f"Rule save failed: {exc}", role="error")
+
+    async def _cmd_tasks(self) -> None:
+        await self._load_board_state()
+        content = self._board_sidebar().tasks_text()
+        if not content.strip():
+            self._add_message("No tasks yet.", role="tool")
+            return
+        self._add_message(render_numbered_text(content), role="tool")
+
+    async def _cmd_task_add(self, arg: str) -> None:
+        if not arg:
+            self._add_message("Usage: /task-add <title>", role="error")
+            return
+        content = self._board_sidebar().tasks_text()
+        try:
+            updated, task_id = add_task_to_markdown(content, arg)
+        except Exception as exc:
+            self._add_message(f"Failed to add task: {exc}", role="error")
+            return
+        self._suspend_board_editor_events = True
+        try:
+            self._board_sidebar().set_tasks(updated)
+        finally:
+            self._suspend_board_editor_events = False
+        await self._save_tasks_text(updated)
+        self._add_message(f"Added task #{task_id}: {arg}", role="tool")
+
+    async def _cmd_task_done(self, arg: str) -> None:
+        if not arg:
+            self._add_message("Usage: /task-done <task-id>", role="error")
+            return
+        try:
+            task_id = int(arg)
+        except ValueError:
+            self._add_message("Usage: /task-done <task-id>", role="error")
+            return
+        content = self._board_sidebar().tasks_text()
+        try:
+            updated = update_task_in_markdown(content, task_id, status="done")
+        except Exception as exc:
+            self._add_message(f"Failed to complete task: {exc}", role="error")
+            return
+        self._suspend_board_editor_events = True
+        try:
+            self._board_sidebar().set_tasks(updated)
+        finally:
+            self._suspend_board_editor_events = False
+        await self._save_tasks_text(updated)
+        self._add_message(f"Completed task #{task_id}", role="tool")
+
+    async def _cmd_notes(self) -> None:
+        await self._load_board_state()
+        content = self._board_sidebar().notes_text()
+        if not content.strip():
+            self._add_message("Operator notes are empty.", role="tool")
+            return
+        self._add_message(render_numbered_text(content), role="tool")
     async def _cmd_resume_remote(self, arg: str) -> None:
         """List or resume server-backed remote sessions."""
         if arg and not arg.isdigit():
@@ -1970,6 +3881,7 @@ class WorkerApp(App):
         session = session_payload.get("session", {})
         self._remote_session_id = session_id
         self._apply_remote_session_state(session)
+        await self._load_board_state()
         await self._sync_remote_extension_commands()
 
         container = self.query_one("#chat-container", Vertical)
@@ -1980,7 +3892,22 @@ class WorkerApp(App):
             role = str(message.get("role", ""))
             content = str(message.get("content", ""))
             reasoning = str(message.get("reasoning", ""))
-            self._render_restored_message(role=role, content=content, reasoning=reasoning)
+            attachments_payload = message.get("attachments", [])
+            attachments = [
+                ImageAttachment(
+                    path=str(item.get("path", "")),
+                    mime_type=str(item.get("mime_type", "image/png") or "image/png"),
+                    name=str(item.get("name", "") or ""),
+                )
+                for item in attachments_payload
+                if isinstance(item, dict) and str(item.get("path", "")).strip()
+            ]
+            self._render_restored_message(
+                role=role,
+                content=content,
+                reasoning=reasoning,
+                attachments=attachments or None,
+            )
 
         title = str(session.get("title", "")).strip() or session_id[:8]
         self._add_message(f"Resumed remote session: {title}", role="tool")
@@ -2057,6 +3984,7 @@ class WorkerApp(App):
         self._session.messages = [self._session.messages[0]]  # Keep system prompt
         if info and info.thinking_level:
             self._session.thinking_level = info.thinking_level  # type: ignore[assignment]
+        self._set_footer_thinking_level(str(self._session.thinking_level))
         self._session.messages.extend(messages)
 
         # Display restored messages
@@ -2065,6 +3993,7 @@ class WorkerApp(App):
                 role=msg.role.value,
                 content=msg.content,
                 reasoning=msg.reasoning or "",
+                attachments=msg.attachments,
             )
 
         title = info.title if info else session_id[:8]
@@ -2219,9 +4148,12 @@ class WorkerApp(App):
     def _cmd_prompts(self) -> None:
         """List available prompt templates."""
         if not self._prompts:
-            self._add_message("No prompt templates found.\n"
-                              "Place .md files in ~/.config/worker/prompts/ "
-                              "or .worker/prompts/", role="tool")
+            self._add_message(
+                "No prompt templates found.\n"
+                "Place .md files in ~/.config/artel/prompts/ or .artel/prompts/.\n"
+                "Legacy Worker prompt paths are still supported.",
+                role="tool",
+            )
             return
         lines = ["Prompt templates (use /<name> [args]):"]
         for name in sorted(self._prompts):
@@ -2261,9 +4193,12 @@ class WorkerApp(App):
     def _cmd_skills_list(self) -> None:
         """List available skills."""
         if not self._skills:
-            self._add_message("No skills found.\n"
-                              "Place .md files in ~/.config/worker/skills/ "
-                              "or .worker/skills/", role="tool")
+            self._add_message(
+                "No skills found.\n"
+                "Place .md files in ~/.config/artel/skills/ or .artel/skills/.\n"
+                "Legacy Worker skill paths are still supported.",
+                role="tool",
+            )
             return
         lines = ["Available skills (use /skill:<name> to load):"]
         for sk in sorted(self._skills.values(), key=lambda s: s.name):
@@ -2346,6 +4281,7 @@ class WorkerApp(App):
                 return
             session = payload.get("session", {})
             applied_level = str(session.get("thinking_level", "")).strip() or level
+            self._set_footer_thinking_level(applied_level)
             self._add_message(f"Thinking level set to: {applied_level}", role="tool")
             return
         if not self._session:
@@ -2367,6 +4303,7 @@ class WorkerApp(App):
             )
             return
         self._session.thinking_level = level  # type: ignore[assignment]
+        self._set_footer_thinking_level(level)
         if self._store:
             await self._store.update_session_thinking(self._session.session_id, level)
         self._add_message(f"Thinking level set to: {level}", role="tool")
@@ -2376,6 +4313,7 @@ class WorkerApp(App):
     def _cmd_theme(self, name: str) -> None:
         """Switch or list themes."""
         from worker_tui.themes import load_themes
+
 
         themes = load_themes(os.getcwd())
 
@@ -2450,11 +4388,11 @@ class WorkerApp(App):
 
         html = export_html(
             messages,
-            title=f"Worker — {model}",
+            title=f"Artel — {model}",
             model=model,
             session_id=self._remote_session_id if self.remote_url else self._session.session_id,
         )
-        filename = arg or f"worker-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
+        filename = arg or f"artel-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}.html"
         try:
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(html)
@@ -2615,6 +4553,33 @@ class WorkerApp(App):
         result = await cmux.browser_open(arg)
         self._add_message(f"Browser opened: {result or arg or '(empty)'}", role="tool")
 
+    async def _cmd_server_restart(self) -> None:
+        """Restart the managed local Artel server for this project."""
+        if not self.remote_url:
+            self._add_message(
+                "Server restart is only available when connected to a managed local server.",
+                role="error",
+            )
+            return
+        if not self.remote_url.startswith("ws://127.0.0.1:") and not self.remote_url.startswith(
+            "ws://localhost:"
+        ):
+            self._add_message(
+                "Server restart is only supported for local managed Artel servers.",
+                role="error",
+            )
+            return
+        try:
+            handle = await restart_managed_local_server(os.getcwd())
+        except Exception as exc:
+            self._add_message(f"Failed to restart managed local server: {exc}", role="error")
+            return
+        self.remote_url = handle.remote_url
+        self.auth_token = handle.auth_token
+        self._remote_control_client = None
+        self._add_message(f"Managed local Artel server restarted: {handle.remote_url}", role="tool")
+        await self._sync_remote_session_state()
+
     # ── Auto-title ───────────────────────────────────────
 
     @work(thread=False)
@@ -2684,7 +4649,7 @@ class WorkerApp(App):
             "state", f"permission: {tool_name}", icon="lock", color="#fab387",
         )
         await cmux.notify(
-            "Worker", subtitle=f"Permission required: {tool_name}",
+            "Artel", subtitle=f"Permission required: {tool_name}",
         )
         result = await self._request_permission_decision(tool_name, args)
         if result == "all":
@@ -2697,13 +4662,17 @@ class WorkerApp(App):
     def _add_message(self, content: str, role: str = "assistant") -> MessageWidget:
         container = self.query_one("#chat-container", Vertical)
         widget = MessageWidget(content, role=role)
+        widget.set_scroll_callback(self._scroll_to_bottom)
         container.mount(widget)
+        if role == "assistant":
+            self._assistant_message_history.append(widget)
         self._scroll_to_bottom()
         return widget
 
     def _add_reasoning_block(self, content: str = "") -> MessageWidget:
         container = self.query_one("#chat-container", Vertical)
         widget = MessageWidget(content, role="reasoning")
+        widget.set_scroll_callback(self._scroll_to_bottom)
         collapsible = Collapsible(widget, title="💡 thinking", collapsed=True)
         container.mount(collapsible)
         self._tool_collapsibles.append(collapsible)
@@ -2726,16 +4695,33 @@ class WorkerApp(App):
         role: str,
         content: str,
         reasoning: str = "",
+        attachments: list[ImageAttachment] | None = None,
     ) -> None:
+        rendered = self._render_user_submission(content, attachments) if role == Role.USER.value else content
         if role == Role.USER.value:
-            self._add_message(content, role="user")
+            self._add_message(rendered, role="user")
         elif role == Role.ASSISTANT.value:
             if reasoning:
                 self._add_reasoning_block(reasoning)
-            if content:
-                self._add_message(content, role="assistant")
-        elif role == Role.SYSTEM.value and content:
+            if rendered:
+                self._add_message(rendered, role="assistant")
+        elif role == Role.SYSTEM.value and rendered:
             self._add_message("📋 [Restored session]", role="tool")
+
+    def _last_assistant_message_text(self) -> str:
+        for widget in reversed(self._assistant_message_history):
+            content = getattr(widget, "content", "")
+            if content:
+                return str(content)
+        return ""
+
+    def action_copy_last_assistant_message(self) -> None:
+        content = self._last_assistant_message_text().strip()
+        if not content:
+            self._add_message("No assistant message available to copy.", role="tool")
+            return
+        self.copy_to_clipboard(content)
+        self._add_message("Copied last assistant message to clipboard.", role="tool")
 
     def _scroll_to_bottom(self) -> None:
         scroll = self.query_one("#chat-scroll", VerticalScroll)
@@ -2746,17 +4732,57 @@ class WorkerApp(App):
             return {}
         return {"Authorization": f"Bearer {self.auth_token}"}
 
-    def _remote_message_payload(self, text: str) -> dict[str, Any]:
-        return {
+    def _remote_message_payload(
+        self,
+        text: str,
+        attachments: list[ImageAttachment] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
             "type": "message",
             "content": text,
             "session_id": self._remote_session_id,
         }
+        if attachments:
+            payload["attachments"] = [
+                {
+                    "path": attachment.path,
+                    "mime_type": attachment.mime_type,
+                    "name": attachment.name,
+                }
+                for attachment in attachments
+            ]
+        return payload
+
+    async def _send_remote_event(self, payload: dict[str, Any]) -> None:
+        import websockets
+
+        if not self._ws:
+            self._ws = await websockets.connect(
+                self.remote_url,
+                additional_headers=self._remote_connect_headers(),
+            )
+        await self._ws.send(json.dumps(payload))
 
     def action_toggle_tools(self) -> None:
         """Ctrl+O: toggle all tool output collapsibles."""
         for c in self._tool_collapsibles:
             c.collapsed = not c.collapsed
+
+    def action_toggle_sidebar(self) -> None:
+        self._sidebar_visible = not self._sidebar_visible
+        self._board_sidebar().set_visible(self._sidebar_visible)
+        if self._sidebar_visible:
+            self._board_sidebar().set_status("Board visible")
+
+    def action_focus_tasks(self) -> None:
+        if not self._sidebar_visible:
+            self.action_toggle_sidebar()
+        self._board_sidebar().focus_tasks()
+
+    def action_focus_notes(self) -> None:
+        if not self._sidebar_visible:
+            self.action_toggle_sidebar()
+        self._board_sidebar().focus_notes()
 
     async def action_quit(self) -> None:
         """Override default quit to clean up async resources."""
@@ -2765,6 +4791,8 @@ class WorkerApp(App):
 
     async def _cleanup(self) -> None:
         """Close all open async resources."""
+        self._cancel_board_save_task(self._tasks_save_task)
+        self._cancel_board_save_task(self._notes_save_task)
         await self._close_store()
         if self._session and self._session.provider:
             with suppress(Exception):
@@ -2779,10 +4807,15 @@ class WorkerApp(App):
         container.remove_children()
         self._tool_collapsibles.clear()
         self._hide_command_menu()
+        self._clear_pending_attachments()
         if self.remote_url:
             self._remote_session_id = str(uuid.uuid4())
+            self._remote_rule_overrides = {}
             await self._sync_remote_session_state()
         if self._session:
+            self._local_rule_overrides = SessionRuleOverrides.empty()
+            self._session.rule_overrides = self._local_rule_overrides
+            self._session.refresh_system_prompt()
             new_id = str(uuid.uuid4())
             if self._store:
                 await self._store.create_session(
@@ -2793,7 +4826,12 @@ class WorkerApp(App):
                 )
             self._session.session_id = new_id
             self._session.messages = self._session.messages[:1]
+            self._set_footer_thinking_level(str(self._session.thinking_level))
+        await self._load_board_state()
         self.call_after_refresh(self._focus_input)
+
+
+ArtelApp = WorkerApp
 
 
 def run_tui(

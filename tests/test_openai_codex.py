@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from worker_ai.models import (
     Done,
+    ImageAttachment,
     Message,
     ReasoningDelta,
     Role,
@@ -106,6 +107,26 @@ class TestBuildResponsesInput:
         assert len(items) == 2
         assert items[0] == {"type": "message", "role": "user", "content": "Hello"}
         assert items[1] == {"type": "message", "role": "assistant", "content": "Hi there!"}
+
+    def test_user_message_with_image_attachment(self, tmp_path):
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+        messages = [
+            Message(
+                role=Role.USER,
+                content="Look",
+                attachments=[
+                    ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+                ],
+            )
+        ]
+        instructions, items = _build_responses_input(messages)
+        assert instructions is None
+        assert items[0]["type"] == "message"
+        assert items[0]["role"] == "user"
+        assert items[0]["content"][0] == {"type": "input_text", "text": "Look"}
+        assert items[0]["content"][1]["type"] == "input_image"
+        assert items[0]["content"][1]["image_url"].startswith("data:image/png;base64,")
 
     def test_tool_calls_and_results(self):
         messages = [

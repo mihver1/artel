@@ -38,3 +38,4 @@ def test_mkdocs_build_strict(tmp_path) -> None:
     assert (site_dir / "acp" / "index.html").exists()
     assert (site_dir / "configuration" / "index.html").exists()
     assert (site_dir / "cli" / "index.html").exists()
+    assert (site_dir / "web" / "index.html").exists()

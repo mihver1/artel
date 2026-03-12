@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from worker_ai.attachments import attachment_data_base64
 from worker_ai.models import (
     Done,
     Message,
@@ -57,6 +58,22 @@ _MODELS: list[ModelInfo] = [
 ]
 
 
+def _build_parts(msg: Message) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    if msg.content:
+        parts.append({"text": msg.content})
+    for attachment in msg.attachments or []:
+        parts.append(
+            {
+                "inlineData": {
+                    "mimeType": attachment.mime_type,
+                    "data": attachment_data_base64(attachment),
+                }
+            }
+        )
+    return parts or [{"text": ""}]
+
+
 def _build_contents(messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
     system: str | None = None
     contents: list[dict[str, Any]] = []
@@ -80,7 +97,7 @@ def _build_contents(messages: list[Message]) -> tuple[str | None, list[dict[str,
                 }
             )
             continue
-        parts: list[dict[str, Any]] = [{"text": msg.content}]
+        parts = _build_parts(msg)
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 parts.append(

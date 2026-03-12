@@ -1,4 +1,4 @@
-"""The 4 built-in tools: read, write, edit, bash."""
+"""Built-in tools for coding plus task board / operator notes helpers."""
 
 from __future__ import annotations
 
@@ -9,6 +9,17 @@ from typing import Any
 
 from worker_ai.models import ToolDef, ToolParam
 
+from worker_core.board import (
+    add_task_to_markdown,
+    append_project_board_file,
+    normalize_task_status,
+    operator_notes_path,
+    read_project_board_file,
+    render_numbered_text,
+    tasks_path,
+    update_task_in_markdown,
+)
+from worker_core.execution import get_current_tool_execution_context
 from worker_core.tools import Tool
 
 _MAX_READ_SIZE = 256 * 1024  # 256 KB
@@ -299,13 +310,227 @@ class BashTool(Tool):
         )
 
 
+class ReadTasksTool(Tool):
+    """Read the shared project task board."""
+
+    name = "read_tasks"
+    description = "Read the shared project task board with numbered lines."
+
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+
+    async def execute(self, **kwargs: Any) -> str:
+        content = await read_project_board_file(tasks_path(self.working_dir))
+        if not content.strip():
+            return "No tasks yet."
+        return render_numbered_text(content)
+
+    def definition(self) -> ToolDef:
+        return ToolDef(name=self.name, description=self.description, parameters=[])
+
+
+class AddTaskTool(Tool):
+    """Add a task to the shared project task board."""
+
+    name = "add_task"
+    description = "Add a task to the shared project task board. Optionally nest it under a parent task."
+
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+
+    async def execute(self, **kwargs: Any) -> str:
+        title = str(kwargs.get("title", "")).strip()
+        parent_task_id = int(kwargs.get("parent_task_id", 0) or 0)
+        status = str(kwargs.get("status", "open") or "open")
+        try:
+            normalized_status = normalize_task_status(status)
+            path = tasks_path(self.working_dir)
+            content = await read_project_board_file(path)
+            updated, task_id = add_task_to_markdown(
+                content,
+                title,
+                parent_task_id=parent_task_id,
+                status=normalized_status,
+            )
+            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(path.write_text, updated, encoding="utf-8")
+            ctx = get_current_tool_execution_context()
+            if ctx is not None:
+                session = ctx.session
+                callback = getattr(session, "board_event_callback", None)
+                if callable(callback):
+                    try:
+                        callback(
+                            "task_added",
+                            {
+                                "task_id": task_id,
+                                "title": title,
+                                "parent_task_id": parent_task_id,
+                                "status": normalized_status,
+                            },
+                        )
+                    except Exception:
+                        pass
+            return f"Added task #{task_id}: {title}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def definition(self) -> ToolDef:
+        return ToolDef(
+            name=self.name,
+            description=self.description,
+            parameters=[
+                ToolParam(name="title", type="string", description="Task title"),
+                ToolParam(
+                    name="parent_task_id",
+                    type="integer",
+                    description="Parent task line number for nesting (optional)",
+                    required=False,
+                ),
+                ToolParam(
+                    name="status",
+                    type="string",
+                    description="Initial task status: open, in_progress, done, or blocked",
+                    required=False,
+                ),
+            ],
+        )
+
+
+class UpdateTaskTool(Tool):
+    """Update task title or status."""
+
+    name = "update_task"
+    description = "Update a task on the shared project task board by task id (line number)."
+
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+
+    async def execute(self, **kwargs: Any) -> str:
+        try:
+            task_id = int(kwargs.get("task_id", 0) or 0)
+            title_value = kwargs.get("title")
+            title = None if title_value is None else str(title_value)
+            status_value = kwargs.get("status")
+            status = None if status_value is None else normalize_task_status(str(status_value))
+            path = tasks_path(self.working_dir)
+            content = await read_project_board_file(path)
+            updated = update_task_in_markdown(content, task_id, title=title, status=status)
+            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(path.write_text, updated, encoding="utf-8")
+            ctx = get_current_tool_execution_context()
+            if ctx is not None:
+                session = ctx.session
+                callback = getattr(session, "board_event_callback", None)
+                if callable(callback):
+                    try:
+                        callback(
+                            "task_updated",
+                            {
+                                "task_id": task_id,
+                                "title": title,
+                                "status": status,
+                            },
+                        )
+                    except Exception:
+                        pass
+            return f"Updated task #{task_id}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    def definition(self) -> ToolDef:
+        return ToolDef(
+            name=self.name,
+            description=self.description,
+            parameters=[
+                ToolParam(name="task_id", type="integer", description="Task id / line number"),
+                ToolParam(
+                    name="title",
+                    type="string",
+                    description="Replacement task title (optional)",
+                    required=False,
+                ),
+                ToolParam(
+                    name="status",
+                    type="string",
+                    description="New task status: open, in_progress, done, or blocked (optional)",
+                    required=False,
+                ),
+            ],
+        )
+
+
+class ReadOperatorNotesTool(Tool):
+    """Read operator notes."""
+
+    name = "read_operator_notes"
+    description = "Read the operator notes scratchpad with numbered lines."
+
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+
+    async def execute(self, **kwargs: Any) -> str:
+        content = await read_project_board_file(operator_notes_path(self.working_dir))
+        if not content.strip():
+            return "Operator notes are empty."
+        return render_numbered_text(content)
+
+    def definition(self) -> ToolDef:
+        return ToolDef(name=self.name, description=self.description, parameters=[])
+
+
+class AppendOperatorNoteTool(Tool):
+    """Append a note to operator notes."""
+
+    name = "append_operator_note"
+    description = "Append a short note to the operator notes scratchpad."
+
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+
+    async def execute(self, **kwargs: Any) -> str:
+        text = str(kwargs.get("text", "")).strip()
+        if not text:
+            return "Error: text must not be empty"
+        await append_project_board_file(operator_notes_path(self.working_dir), text)
+        ctx = get_current_tool_execution_context()
+        if ctx is not None:
+            session = ctx.session
+            callback = getattr(session, "board_event_callback", None)
+            if callable(callback):
+                try:
+                    callback("operator_notes_appended", {"text": text})
+                except Exception:
+                    pass
+        return "Appended operator note."
+
+    def definition(self) -> ToolDef:
+        return ToolDef(
+            name=self.name,
+            description=self.description,
+            parameters=[
+                ToolParam(name="text", type="string", description="Note text to append"),
+            ],
+        )
+
+
 def create_builtin_tools(working_dir: str = ".") -> list[Tool]:
-    """Create the 4 default coding tools (read, write, edit, bash)."""
+    """Create the default Artel tools."""
+    from worker_core.tools.web_fetch import WebFetchTool
+    from worker_core.tools.web_search import WebSearchTool
+
     return [
         ReadTool(working_dir),
         WriteTool(working_dir),
         EditTool(working_dir),
         BashTool(working_dir),
+        WebSearchTool(),
+        WebFetchTool(),
+        ReadTasksTool(working_dir),
+        AddTaskTool(working_dir),
+        UpdateTaskTool(working_dir),
+        ReadOperatorNotesTool(working_dir),
+        AppendOperatorNoteTool(working_dir),
     ]
 
 

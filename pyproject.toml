@@ -1,18 +1,21 @@
 [project]
-name = "worker"
+name = "artel"
 version = "0.1.0"
 description = "Extensible Python coding agent with client-server architecture"
 requires-python = ">=3.12"
 license = "MIT"
 readme = "README.md"
+authors = [{ name = "Artel contributors" }]
 dependencies = [
-    "worker-ai",
-    "worker-core",
-    "worker-server",
-    "worker-tui",
+    "artel-ai",
+    "artel-core",
+    "artel-server",
+    "artel-tui",
+    "artel-web",
 ]
 
 [project.scripts]
+artel = "artel_core.cli:main"
 worker = "worker_core.cli:main"
 
 [tool.uv.workspace]
@@ -21,13 +24,15 @@ members = [
     "packages/worker-core",
     "packages/worker-server",
     "packages/worker-tui",
+    "packages/worker-web",
 ]
 
 [tool.uv.sources]
-worker-ai = { workspace = true }
-worker-core = { workspace = true }
-worker-server = { workspace = true }
-worker-tui = { workspace = true }
+artel-ai = { workspace = true }
+artel-core = { workspace = true }
+artel-server = { workspace = true }
+artel-tui = { workspace = true }
+artel-web = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]
@@ -43,7 +48,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/worker"]
+packages = ["src/artel", "src/worker"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

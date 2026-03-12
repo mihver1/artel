@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────
-#  Worker — installer
+#  Artel — installer
 #  Usage:  curl -fsSL https://raw.githubusercontent.com/mihver1/worker-agent/main/install.sh | bash
 # ─────────────────────────────────────────────────────────
 set -euo pipefail
@@ -8,8 +8,9 @@ set -euo pipefail
 # ── Defaults ──────────────────────────────────────────────
 REPO="https://github.com/mihver1/worker-agent.git"
 BRANCH="main"
-INSTALL_DIR="${WORKER_INSTALL_DIR:-$HOME/.local/share/worker-agent}"
-BIN_DIR="${WORKER_BIN_DIR:-$HOME/.local/bin}"
+INSTALL_DIR="${ARTEL_INSTALL_DIR:-${WORKER_INSTALL_DIR:-$HOME/.local/share/artel-agent}}"
+BIN_DIR="${ARTEL_BIN_DIR:-${WORKER_BIN_DIR:-$HOME/.local/bin}}"
+CONFIG_DIR="${ARTEL_CONFIG_DIR:-${WORKER_CONFIG_DIR:-$HOME/.config/artel}}"
 MIN_PYTHON="3.12"
 
 # ── Colors ────────────────────────────────────────────────
@@ -53,11 +54,11 @@ detect_shell_rc() {
 # ── Banner ────────────────────────────────────────────────
 printf "\n${BOLD}${CYAN}"
 cat <<'EOF'
- __        __         _
- \ \      / /__  _ __| | _____ _ __
-  \ \ /\ / / _ \| '__| |/ / _ \ '__|
-   \ V  V / (_) | |  |   <  __/ |
-    \_/\_/ \___/|_|  |_|\_\___|_|
+    _         _       _
+   / \   _ __| |_ ___| |
+  / _ \ | '__| __/ _ \ |
+ / ___ \| |  | ||  __/ |
+/_/   \_\_|   \__\___|_|
 
 EOF
 printf "${NC}"
@@ -70,7 +71,7 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "$OS" in
     Linux|Darwin) ;;
-    *) die "Unsupported OS: $OS. Worker supports Linux and macOS." ;;
+    *) die "Unsupported OS: $OS. Artel supports Linux and macOS." ;;
 esac
 ok "OS: $OS ($ARCH)"
 
@@ -112,7 +113,7 @@ fi
 # ── Step 5: Materialize repository ───────────────────────
 if [[ -f "$SCRIPT_DIR/pyproject.toml" ]] && [[ -d "$SCRIPT_DIR/packages/worker-core/src/worker_core" ]]; then
     if [[ "$SCRIPT_DIR" == "$INSTALL_DIR" ]]; then
-        die "WORKER_INSTALL_DIR must not point to the current source checkout."
+        die "ARTEL_INSTALL_DIR must not point to the current source checkout."
     fi
     info "Installing from local checkout in $SCRIPT_DIR..."
     rm -rf "$INSTALL_DIR"
@@ -137,7 +138,7 @@ else
         warn "Directory $INSTALL_DIR exists but is not a git repo, removing..."
         rm -rf "$INSTALL_DIR"
     fi
-    info "Cloning worker-agent into $INSTALL_DIR..."
+    info "Cloning Artel repository into $INSTALL_DIR..."
     git clone --depth 1 --branch "$BRANCH" "$REPO" "$INSTALL_DIR" --quiet
     ok "Cloned successfully"
 fi
@@ -148,7 +149,7 @@ info "Installing dependencies with uv..."
 ok "Dependencies installed"
 
 # ── Step 6b: Restore extensions from manifest ────────────
-EXT_MANIFEST="${WORKER_CONFIG_DIR:-$HOME/.config/worker}/extensions.lock"
+EXT_MANIFEST="$CONFIG_DIR/extensions.lock"
 if [[ -f "$EXT_MANIFEST" ]]; then
     # Read sources from the JSON manifest [{"name": "...", "source": "..."}, ...]
     EXT_SOURCES=$(
@@ -179,17 +180,25 @@ except Exception:
     fi
 fi
 
-# ── Step 7: Create wrapper script ────────────────────────
+# ── Step 7: Create wrapper scripts ───────────────────────
 mkdir -p "$BIN_DIR"
-WRAPPER="$BIN_DIR/worker"
+ARTEL_WRAPPER="$BIN_DIR/artel"
+LEGACY_WRAPPER="$BIN_DIR/worker"
 
-cat > "$WRAPPER" <<WRAPPER_EOF
+cat > "$ARTEL_WRAPPER" <<WRAPPER_EOF
 #!/usr/bin/env bash
-# Worker — auto-generated launcher
+# Artel — auto-generated launcher
+exec uv run --project "$INSTALL_DIR" artel "\$@"
+WRAPPER_EOF
+chmod +x "$ARTEL_WRAPPER"
+
+cat > "$LEGACY_WRAPPER" <<WRAPPER_EOF
+#!/usr/bin/env bash
+# Worker — legacy compatibility launcher
 exec uv run --project "$INSTALL_DIR" worker "\$@"
 WRAPPER_EOF
-chmod +x "$WRAPPER"
-ok "Launcher created: $WRAPPER"
+chmod +x "$LEGACY_WRAPPER"
+ok "Launchers created: $ARTEL_WRAPPER (primary) and $LEGACY_WRAPPER (compatibility alias)"
 
 # ── Step 8: Ensure BIN_DIR is in PATH ───────────────────
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
@@ -201,7 +210,7 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     else
         info "Adding $BIN_DIR to PATH in $SHELL_RC..."
         echo "" >> "$SHELL_RC"
-        echo "# Worker agent" >> "$SHELL_RC"
+        echo "# Artel agent" >> "$SHELL_RC"
         echo "$EXPORT_LINE" >> "$SHELL_RC"
         ok "PATH updated in $SHELL_RC"
         warn "Run: source $SHELL_RC  (or open a new terminal)"
@@ -210,7 +219,7 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
 fi
 
 # ── Step 9: Run init if no config exists ─────────────────
-CONFIG_FILE="$HOME/.config/worker/config.toml"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
 if [[ ! -f "$CONFIG_FILE" ]]; then
     info "Creating global config..."
     uv run --project "$INSTALL_DIR" python -c \
@@ -219,7 +228,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     if [[ -f "$CONFIG_FILE" ]]; then
         ok "Config created: $CONFIG_FILE"
     else
-        warn "Global config creation skipped. Run 'worker init' manually to configure."
+        warn "Global config creation skipped. Run 'artel init' manually to configure."
     fi
 else
     ok "Config already exists: $CONFIG_FILE"
@@ -228,13 +237,13 @@ fi
 # ── Done ──────────────────────────────────────────────────
 printf "\n${GREEN}${BOLD}Installation complete!${NC}\n\n"
 echo "  Quick start:"
-echo "    worker -p \"hello\"         # one-shot prompt"
-echo "    worker                    # interactive TUI"
-echo "    worker init               # reconfigure"
+echo "    artel -p \"hello\"         # one-shot prompt"
+echo "    artel                     # interactive TUI"
+echo "    artel init                # reconfigure"
 echo ""
 echo "  Update:"
 echo "    curl -fsSL https://raw.githubusercontent.com/mihver1/worker-agent/main/install.sh | bash"
 echo ""
 echo "  Uninstall:"
-echo "    rm -rf $INSTALL_DIR $WRAPPER"
+echo "    rm -rf $INSTALL_DIR $ARTEL_WRAPPER $LEGACY_WRAPPER"
 echo ""

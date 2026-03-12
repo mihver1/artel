@@ -60,6 +60,20 @@ _SAMPLE_PROVIDER_CATALOG = {
             },
         },
     },
+    "minimax": {
+        "name": "MiniMax",
+        "env": ["MINIMAX_API_KEY"],
+        "models": {
+            "MiniMax-M2.5": {
+                "name": "MiniMax M2.5",
+                "tool_call": True,
+                "reasoning": True,
+                "limit": {"context": 204800, "output": 16384},
+                "cost": {"input": 0.3, "output": 1.2},
+                "modalities": {"input": ["text"], "output": ["text"]},
+            },
+        },
+    },
     "togetherai": {
         "name": "Together AI",
         "env": ["TOGETHER_API_KEY"],
@@ -70,6 +84,20 @@ _SAMPLE_PROVIDER_CATALOG = {
                 "reasoning": False,
                 "limit": {"context": 131072, "output": 8192},
                 "cost": {"input": 0.88, "output": 0.88},
+                "modalities": {"input": ["text"], "output": ["text"]},
+            },
+        },
+    },
+    "zai": {
+        "name": "Z.ai",
+        "env": ["ZHIPU_API_KEY"],
+        "models": {
+            "glm-5": {
+                "name": "GLM-5",
+                "tool_call": True,
+                "reasoning": True,
+                "limit": {"context": 128000, "output": 8192},
+                "cost": {"input": 1.0, "output": 3.2},
                 "modalities": {"input": ["text"], "output": ["text"]},
             },
         },
@@ -135,9 +163,11 @@ class TestEffectiveProviderCatalog:
         assert "google" in providers
         assert "google_vertex" in providers
         assert "vertex_anthropic" in providers
+        assert "minimax" in providers
         assert "openrouter" in providers
         assert "together" in providers
         assert "fireworks" in providers
+        assert "zai" in providers
         assert "perplexity" not in providers
 
     @pytest.mark.asyncio
@@ -588,6 +618,24 @@ class TestEffectiveProviderCatalog:
 
         assert model is not None
         assert model.provider == "github_copilot"
+
+    @pytest.mark.asyncio
+    async def test_effective_model_lookup_accepts_zai_alias(self, monkeypatch):
+        from worker_ai.models_catalog import ModelsCatalog
+
+        async def _fake_fetch(cls):
+            return _SAMPLE_PROVIDER_CATALOG
+
+        monkeypatch.setattr(ModelsCatalog, "_fetch_raw", classmethod(_fake_fetch))
+
+        model = await get_effective_model_info(
+            WorkerConfig(),
+            "z.ai",
+            "glm-5",
+        )
+
+        assert model is not None
+        assert model.provider == "zai"
 
     @pytest.mark.asyncio
     async def test_effective_model_lookup_accepts_ollama_cloud_alias(self, monkeypatch):

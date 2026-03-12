@@ -12,9 +12,271 @@ from pydantic import BaseModel, Field
 
 # ── Config paths ──────────────────────────────────────────────────
 
-CONFIG_DIR = Path(os.environ.get("WORKER_CONFIG_DIR", "~/.config/worker")).expanduser()
+APP_NAME = "artel"
+LEGACY_APP_NAME = "worker"
+PROJECT_DIR_NAME = ".artel"
+LEGACY_PROJECT_DIR_NAME = ".worker"
+CONFIG_DIR_ENV = "ARTEL_CONFIG_DIR"
+LEGACY_CONFIG_DIR_ENV = "WORKER_CONFIG_DIR"
+
+
+def _resolve_config_dir(*, env_names: tuple[str, ...], default_name: str) -> Path:
+    for env_name in env_names:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return Path(value).expanduser()
+    return Path(f"~/.config/{default_name}").expanduser()
+
+
+CONFIG_DIR = _resolve_config_dir(
+    env_names=(CONFIG_DIR_ENV, LEGACY_CONFIG_DIR_ENV),
+    default_name=APP_NAME,
+)
+LEGACY_CONFIG_DIR = _resolve_config_dir(
+    env_names=(LEGACY_CONFIG_DIR_ENV,),
+    default_name=LEGACY_APP_NAME,
+)
 GLOBAL_CONFIG = CONFIG_DIR / "config.toml"
+LEGACY_GLOBAL_CONFIG = LEGACY_CONFIG_DIR / "config.toml"
 AUTH_FILE = CONFIG_DIR / "auth.json"
+LEGACY_AUTH_FILE = LEGACY_CONFIG_DIR / "auth.json"
+SESSIONS_DB = CONFIG_DIR / "sessions.db"
+LEGACY_SESSIONS_DB = LEGACY_CONFIG_DIR / "sessions.db"
+GLOBAL_AGENTS_FILE = CONFIG_DIR / "AGENTS.md"
+LEGACY_GLOBAL_AGENTS_FILE = LEGACY_CONFIG_DIR / "AGENTS.md"
+GLOBAL_SYSTEM_OVERRIDE = CONFIG_DIR / "SYSTEM.md"
+LEGACY_GLOBAL_SYSTEM_OVERRIDE = LEGACY_CONFIG_DIR / "SYSTEM.md"
+GLOBAL_APPEND_SYSTEM = CONFIG_DIR / "APPEND_SYSTEM.md"
+LEGACY_GLOBAL_APPEND_SYSTEM = LEGACY_CONFIG_DIR / "APPEND_SYSTEM.md"
+PROMPTS_DIR = CONFIG_DIR / "prompts"
+LEGACY_PROMPTS_DIR = LEGACY_CONFIG_DIR / "prompts"
+SKILLS_DIR = CONFIG_DIR / "skills"
+LEGACY_SKILLS_DIR = LEGACY_CONFIG_DIR / "skills"
+EXTENSIONS_MANIFEST = CONFIG_DIR / "extensions.lock"
+LEGACY_EXTENSIONS_MANIFEST = LEGACY_CONFIG_DIR / "extensions.lock"
+REGISTRY_CACHE_DIR = CONFIG_DIR / "registry_cache"
+LEGACY_REGISTRY_CACHE_DIR = LEGACY_CONFIG_DIR / "registry_cache"
+SERVER_PROVIDER_OVERLAY_PATH = CONFIG_DIR / "server-provider-overlay.json"
+LEGACY_SERVER_PROVIDER_OVERLAY_PATH = (
+    LEGACY_CONFIG_DIR / "server-provider-overlay.json"
+)
+GLOBAL_STATE_FILE = CONFIG_DIR / "state.json"
+LEGACY_GLOBAL_STATE_FILE = LEGACY_CONFIG_DIR / "state.json"
+
+
+def _first_existing_path(*paths: Path) -> Path | None:
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.exists():
+            return path
+    return None
+
+
+def _dedupe_paths(*paths: Path) -> list[Path]:
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
+
+
+def project_state_dir(project_dir: str) -> Path:
+    return Path(project_dir) / PROJECT_DIR_NAME
+
+
+def legacy_project_state_dir(project_dir: str) -> Path:
+    return Path(project_dir) / LEGACY_PROJECT_DIR_NAME
+
+
+def project_config_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "config.toml"
+
+
+def legacy_project_config_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "config.toml"
+
+
+def project_agents_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "AGENTS.md"
+
+
+def legacy_project_agents_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "AGENTS.md"
+
+
+def project_system_override_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "SYSTEM.md"
+
+
+def legacy_project_system_override_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "SYSTEM.md"
+
+
+def project_append_system_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "APPEND_SYSTEM.md"
+
+
+def legacy_project_append_system_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "APPEND_SYSTEM.md"
+
+
+def project_prompts_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "prompts"
+
+
+def legacy_project_prompts_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "prompts"
+
+
+def project_skills_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "skills"
+
+
+def legacy_project_skills_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "skills"
+
+
+def project_server_registry_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "server.json"
+
+
+def legacy_project_server_registry_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "server.json"
+
+def project_mcp_path(project_dir: str) -> Path:
+    return project_state_dir(project_dir) / "mcp.json"
+
+
+def legacy_project_mcp_path(project_dir: str) -> Path:
+    return legacy_project_state_dir(project_dir) / "mcp.json"
+
+
+def effective_global_config_path() -> Path:
+    return _first_existing_path(GLOBAL_CONFIG, LEGACY_GLOBAL_CONFIG) or GLOBAL_CONFIG
+
+def effective_auth_path() -> Path:
+    return _first_existing_path(AUTH_FILE, LEGACY_AUTH_FILE) or AUTH_FILE
+
+
+def effective_global_agents_path() -> Path:
+    return (
+        _first_existing_path(GLOBAL_AGENTS_FILE, LEGACY_GLOBAL_AGENTS_FILE)
+        or GLOBAL_AGENTS_FILE
+    )
+
+
+def effective_global_system_override_path() -> Path:
+    return (
+        _first_existing_path(GLOBAL_SYSTEM_OVERRIDE, LEGACY_GLOBAL_SYSTEM_OVERRIDE)
+        or GLOBAL_SYSTEM_OVERRIDE
+    )
+
+
+def effective_global_append_system_path() -> Path:
+    return (
+        _first_existing_path(GLOBAL_APPEND_SYSTEM, LEGACY_GLOBAL_APPEND_SYSTEM)
+        or GLOBAL_APPEND_SYSTEM
+    )
+
+
+def effective_project_config_path(project_dir: str) -> Path:
+    return (
+        _first_existing_path(
+            project_config_path(project_dir),
+            legacy_project_config_path(project_dir),
+        )
+        or project_config_path(project_dir)
+    )
+
+
+def effective_project_agents_path(project_dir: str) -> Path:
+    return (
+        _first_existing_path(
+            project_agents_path(project_dir),
+            legacy_project_agents_path(project_dir),
+        )
+        or project_agents_path(project_dir)
+    )
+
+
+def effective_project_system_override_path(project_dir: str) -> Path:
+    return (
+        _first_existing_path(
+            project_system_override_path(project_dir),
+            legacy_project_system_override_path(project_dir),
+        )
+        or project_system_override_path(project_dir)
+    )
+
+
+def effective_project_append_system_path(project_dir: str) -> Path:
+    return (
+        _first_existing_path(
+            project_append_system_path(project_dir),
+            legacy_project_append_system_path(project_dir),
+        )
+        or project_append_system_path(project_dir)
+    )
+
+
+def effective_project_server_registry_path(project_dir: str) -> Path:
+    return (
+        _first_existing_path(
+            project_server_registry_path(project_dir),
+            legacy_project_server_registry_path(project_dir),
+        )
+        or project_server_registry_path(project_dir)
+    )
+
+
+def effective_project_mcp_path(project_dir: str) -> Path:
+    return (
+        _first_existing_path(
+            project_mcp_path(project_dir),
+            legacy_project_mcp_path(project_dir),
+        )
+        or project_mcp_path(project_dir)
+    )
+
+
+def effective_server_provider_overlay_path() -> Path:
+    return (
+        _first_existing_path(
+            SERVER_PROVIDER_OVERLAY_PATH,
+            LEGACY_SERVER_PROVIDER_OVERLAY_PATH,
+        )
+        or SERVER_PROVIDER_OVERLAY_PATH
+    )
+
+
+def prompt_dirs(project_dir: str = "") -> list[Path]:
+    paths = [LEGACY_PROMPTS_DIR, PROMPTS_DIR]
+    if project_dir:
+        paths.extend(
+            [
+                legacy_project_prompts_path(project_dir),
+                project_prompts_path(project_dir),
+            ]
+        )
+    return _dedupe_paths(*paths)
+
+
+def skill_dirs(project_dir: str = "") -> list[Path]:
+    paths = [LEGACY_SKILLS_DIR, SKILLS_DIR]
+    if project_dir:
+        paths.extend(
+            [
+                legacy_project_skills_path(project_dir),
+                project_skills_path(project_dir),
+            ]
+        )
+    return _dedupe_paths(*paths)
 
 
 # ── Pydantic models ──────────────────────────────────────────────
@@ -102,7 +364,7 @@ class ExtensionsConfig(BaseModel):
 
 
 class SessionsConfig(BaseModel):
-    db_path: str = str(CONFIG_DIR / "sessions.db")
+    db_path: str = str(SESSIONS_DB)
     auto_compact: bool = True
     compact_threshold: float = 0.8
 
@@ -131,6 +393,10 @@ class WorkerConfig(BaseModel):
     keybindings: KeybindingsConfig = Field(default_factory=KeybindingsConfig)
 
 
+# Artel-first public alias kept alongside the legacy compatibility name.
+ArtelConfig = WorkerConfig
+
+
 # ── Load config ───────────────────────────────────────────────────
 
 
@@ -139,16 +405,17 @@ def load_config(project_dir: str | None = None) -> WorkerConfig:
     config = WorkerConfig()
 
     # Global config
-    if GLOBAL_CONFIG.exists():
-        with open(GLOBAL_CONFIG, "rb") as f:
+    global_config = effective_global_config_path()
+    if global_config.exists():
+        with open(global_config, "rb") as f:
             data = tomllib.load(f)
         config = WorkerConfig.model_validate(data)
 
     # Project config overlay
     if project_dir:
-        project_config = Path(project_dir) / ".worker" / "config.toml"
-        if project_config.exists():
-            with open(project_config, "rb") as f:
+        project_source = effective_project_config_path(project_dir)
+        if project_source.exists():
+            with open(project_source, "rb") as f:
                 project_data = tomllib.load(f)
             # Merge: project overrides global
             merged = config.model_dump()
@@ -161,20 +428,21 @@ def load_config(project_dir: str | None = None) -> WorkerConfig:
 def persist_server_auth_token(token: str, project_dir: str | None = None) -> Path:
     """Persist server auth token to the config file that owns the effective setting."""
     target = GLOBAL_CONFIG
+    source = effective_global_config_path()
     data: dict[str, Any] = {}
 
-    if GLOBAL_CONFIG.exists():
-        with open(GLOBAL_CONFIG, "rb") as f:
+    if source.exists():
+        with open(source, "rb") as f:
             data = tomllib.load(f)
 
     if project_dir:
-        project_config = Path(project_dir) / ".worker" / "config.toml"
+        project_config = effective_project_config_path(project_dir)
         if project_config.exists():
             with open(project_config, "rb") as f:
                 project_data = tomllib.load(f)
             project_server = project_data.get("server")
             if isinstance(project_server, dict) and "auth_token" in project_server:
-                target = project_config
+                target = project_config_path(project_dir)
                 data = project_data
 
     server_data = data.get("server")
@@ -212,8 +480,8 @@ def resolve_model(config: WorkerConfig) -> tuple[str, str]:
 
 _GLOBAL_TEMPLATE = """\
 # ═══════════════════════════════════════════════════════════════
-# Worker — global configuration
-# Documentation: https://mihver1.github.io/worker-agent/
+# Artel — global configuration
+# Documentation: see the bundled docs site or project README
 # ═══════════════════════════════════════════════════════════════
 
 # ── Agent ─────────────────────────────────────────────────────
@@ -225,11 +493,13 @@ _GLOBAL_TEMPLATE = """\
 #   "azure_openai/gpt-4.1"
 #   "bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0"
 #   "kimi/kimi-k2.5"
+#   "minimax/MiniMax-M2.5"
 #   "google/gemini-2.5-pro"
 #   "google_vertex/gemini-2.5-pro"
 #   "vertex_anthropic/claude-sonnet-4@20250514"
 #   "github_copilot/gpt-4.1"
 #   "ollama/qwen3:32b"
+#   "zai/glm-5"
 model = "anthropic/claude-sonnet-4-20250514"
 
 # Generation temperature (0.0 = deterministic, 1.0 = creative)
@@ -239,7 +509,7 @@ model = "anthropic/claude-sonnet-4-20250514"
 # max_turns = 50
 
 # System prompt (appended to the built-in prompt)
-# You can also use .worker/AGENTS.md in the project
+# You can also use .artel/AGENTS.md in the project
 # system_prompt = "You are a senior Python developer."
 
 # Small model for utility tasks (compaction, auto-titles)
@@ -261,9 +531,10 @@ model = "anthropic/claude-sonnet-4-20250514"
 #       | bedrock | azure_openai | github_copilot | ollama | lmstudio | huggingface
 #
 # Authentication usually uses api_key;
-# OAuth is available only for some providers (`worker login <provider>`)
+# OAuth is available only for some providers (`artel login <provider>`)
 # Environment variables also work:
 #   ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, MOONSHOT_API_KEY,
+#   MINIMAX_API_KEY, ZHIPU_API_KEY,
 #   AZURE_OPENAI_API_KEY, GH_TOKEN, GITHUB_TOKEN,
 #   GROQ_API_KEY, MISTRAL_API_KEY, XAI_API_KEY,
 #   TOGETHER_API_KEY, CEREBRAS_API_KEY, DEEPSEEK_API_KEY,
@@ -290,6 +561,12 @@ model = "anthropic/claude-sonnet-4-20250514"
 # api_key = "sk-..."             # or MOONSHOT_API_KEY env
 # # base_url = "https://api.kimi.com/coding/v1"
 # # Kimi For Coding uses an Anthropic-compatible messages endpoint
+
+# [providers.minimax]
+# type = "anthropic"
+# api_key = "..."                # or MINIMAX_API_KEY env
+# base_url = "https://api.minimax.io/anthropic/v1"
+# # MiniMax uses an Anthropic-compatible messages endpoint
 
 # [providers.google]
 # type = "google"
@@ -326,6 +603,12 @@ model = "anthropic/claude-sonnet-4-20250514"
 # api_key = "xai-..."
 # base_url = "https://api.x.ai/v1"
 
+# [providers.zai]
+# type = "openai_compat"
+# api_key = "..."                # or ZHIPU_API_KEY env
+# base_url = "https://api.z.ai/api/paas/v4"
+# # Use GLM models such as zai/glm-5 or z.ai/glm-5
+
 # [providers.openrouter]
 # type = "openai_compat"
 # api_key = "sk-or-..."
@@ -333,7 +616,7 @@ model = "anthropic/claude-sonnet-4-20250514"
 # # timeout = 300000               # milliseconds; false = no timeout
 # # [providers.openrouter.headers]
 # # "HTTP-Referer" = "https://example.com"
-# # "X-Title" = "worker"
+# # "X-Title" = "artel"
 
 # [providers.together]
 # type = "openai_compat"
@@ -406,14 +689,14 @@ model = "anthropic/claude-sonnet-4-20250514"
 
 # [providers.github_copilot]
 # type = "github_copilot"
-# # api_key = "github_pat_..."    # or `worker login github_copilot`
+# # api_key = "github_pat_..."    # or `artel login github_copilot`
 # #                              # or COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN
 # # interactive login requires `gh` (`brew install gh` on macOS/Homebrew)
 # # base_url = "https://api.githubcopilot.com"
 
 # [providers.github_copilot_enterprise]
 # type = "github_copilot"
-# # api_key = "github_pat_..."    # or `worker login github_copilot_enterprise`
+# # api_key = "github_pat_..."    # or `artel login github_copilot_enterprise`
 # # interactive login requires `gh` (`brew install gh` on macOS/Homebrew)
 # # base_url = "https://api.githubcopilot.com"
 # # [providers.github_copilot_enterprise.options]
@@ -443,13 +726,13 @@ bash = "ask"
 
 # ── Server ────────────────────────────────────────────────────
 [server]
-# Host and port for `worker serve`
+# Host and port for `artel serve`
 # host = "0.0.0.0"
 # port = 7432
 
 # Bearer token for client authentication
-# Generated automatically on the first `worker serve`
-# auth_token = "wkr_..."
+# Generated automatically on the first `artel serve`
+# auth_token = "artel_..."
 
 # TLS (optional, reverse proxy recommended)
 # tls_cert = "/path/to/cert.pem"
@@ -461,25 +744,25 @@ bash = "ask"
 # ── Extensions ────────────────────────────────────────────────
 [extensions]
 # Directory for installed extensions
-# dir = "~/.config/worker/extensions"
+# dir = "~/.config/artel/extensions"
 
 # Enabled extensions (by name)
-# enabled = ["worker-ext-websearch", "worker-ext-git"]
+# enabled = ["artel-ext-websearch", "artel-ext-git"]
 
 # Disabled extensions
 # disabled = []
 
 # Extension registries (official is enabled by default)
 # Add a company or community registry:
-#   worker ext registry add mycompany https://example.com/extensions.toml
+#   artel ext registry add mycompany https://example.com/extensions.toml
 # [[extensions.registries]]
 # name = "official"
-# url = "https://raw.githubusercontent.com/mihver1/worker-agent/main/registry/extensions.toml"
+# url = "https://example.com/extensions.toml"
 
 # ── Sessions ──────────────────────────────────────────────────
 [sessions]
 # Path to the sessions database
-# db_path = "~/.config/worker/sessions.db"
+# db_path = "~/.config/artel/sessions.db"
 
 # Auto-compaction near the context limit
 # auto_compact = true
@@ -504,7 +787,7 @@ bash = "ask"
 
 _PROJECT_TEMPLATE = """\
 # ═══════════════════════════════════════════════════════════════
-# Worker — project configuration (overrides global settings)
+# Artel — project configuration (overrides global settings)
 # ═══════════════════════════════════════════════════════════════
 
 # [agent]
@@ -524,7 +807,7 @@ _PROJECT_TEMPLATE = """\
 _AGENTS_MD_TEMPLATE = """\
 # Project Instructions
 
-<!-- Worker loads this file as additional system prompt context. -->
+<!-- Artel loads this file as additional system prompt context. -->
 <!-- Add project-specific instructions, conventions, common commands here. -->
 
 ## Project Overview
@@ -542,21 +825,20 @@ _AGENTS_MD_TEMPLATE = """\
 
 
 def generate_global_config() -> None:
-    """Create ~/.config/worker/config.toml with the fully-commented template."""
+    """Create ~/.config/artel/config.toml with the fully-commented template."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not GLOBAL_CONFIG.exists():
         GLOBAL_CONFIG.write_text(_GLOBAL_TEMPLATE, encoding="utf-8")
 
 
 def generate_project_config(project_dir: str) -> None:
-    """Create .worker/config.toml and .worker/AGENTS.md in the project."""
-    worker_dir = Path(project_dir) / ".worker"
-    worker_dir.mkdir(parents=True, exist_ok=True)
+    """Create .artel/config.toml and .artel/AGENTS.md in the project."""
+    artel_dir = project_state_dir(project_dir)
+    artel_dir.mkdir(parents=True, exist_ok=True)
 
-    config_path = worker_dir / "config.toml"
+    config_path = artel_dir / "config.toml"
     if not config_path.exists():
         config_path.write_text(_PROJECT_TEMPLATE, encoding="utf-8")
-
-    agents_path = worker_dir / "AGENTS.md"
+    agents_path = artel_dir / "AGENTS.md"
     if not agents_path.exists():
         agents_path.write_text(_AGENTS_MD_TEMPLATE, encoding="utf-8")

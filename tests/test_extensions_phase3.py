@@ -314,7 +314,7 @@ async def test_load_extensions_async_calls_on_load(monkeypatch):
     monkeypatch.setattr(
         extensions_mod,
         "discover_extensions",
-        lambda group="worker.extensions": {"lifecycle": LifecycleExtension},
+        lambda group="artel.extensions": {"lifecycle": LifecycleExtension},
     )
 
     instances, dispatcher = await load_extensions_async()
@@ -350,7 +350,7 @@ async def test_reload_extensions_async_unloads_old_instances_and_activates_new(m
     monkeypatch.setattr(
         extensions_mod,
         "discover_extensions",
-        lambda group="worker.extensions": {"replacement": NewExtension},
+        lambda group="artel.extensions": {"replacement": NewExtension},
     )
 
     new_instances, new_dispatcher = await reload_extensions_async([old])
@@ -369,3 +369,38 @@ def test_load_extensions_returns_tuple():
     instances, dispatcher = load_extensions()
     assert isinstance(instances, list)
     assert isinstance(dispatcher, HookDispatcher)
+
+
+def test_discover_extensions_prefers_artel_group_and_falls_back_to_worker(monkeypatch):
+    class ArtelExtension(Extension):
+        name = "shared"
+
+    class LegacyExtension(Extension):
+        name = "shared"
+
+    class LegacyOnlyExtension(Extension):
+        name = "legacy-only"
+
+    class FakeEntryPoint:
+        def __init__(self, name, cls):
+            self.name = name
+            self._cls = cls
+
+        def load(self):
+            return self._cls
+
+    def fake_entry_points(*, group):
+        return {
+            "artel.extensions": [FakeEntryPoint("shared", ArtelExtension)],
+            "worker.extensions": [
+                FakeEntryPoint("shared", LegacyExtension),
+                FakeEntryPoint("legacy-only", LegacyOnlyExtension),
+            ],
+        }.get(group, [])
+
+    monkeypatch.setattr(extensions_mod.importlib.metadata, "entry_points", fake_entry_points)
+
+    discovered = extensions_mod.discover_extensions()
+
+    assert discovered["shared"] is ArtelExtension
+    assert discovered["legacy-only"] is LegacyOnlyExtension

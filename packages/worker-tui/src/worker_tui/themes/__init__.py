@@ -1,8 +1,9 @@
 """Theme system — built-in + user-defined Textual CSS themes.
 
 Built-in themes live in this package as ``.tcss`` files.
-User themes are loaded from ``~/.config/worker/themes/`` and
-``.worker/themes/`` (project override).
+User themes are loaded from ``~/.config/artel/themes/`` and
+``.artel/themes/`` (project override), with legacy Worker paths still
+read as fallback during migration.
 
 Each theme is a Textual CSS string applied via ``App.stylesheet``.
 """
@@ -11,7 +12,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from worker_core.config import CONFIG_DIR
+from worker_core.config import (
+    CONFIG_DIR,
+    LEGACY_CONFIG_DIR,
+    legacy_project_state_dir,
+    project_state_dir,
+)
 
 _THEMES_DIR = Path(__file__).parent
 
@@ -177,10 +183,15 @@ BUILTIN_THEMES: dict[str, str] = {
 
 
 def _user_themes_dirs(project_dir: str = "") -> list[Path]:
-    dirs = [CONFIG_DIR / "themes"]
+    dirs = [LEGACY_CONFIG_DIR / "themes", CONFIG_DIR / "themes"]
     if project_dir:
-        dirs.append(Path(project_dir) / ".worker" / "themes")
-    return dirs
+        dirs.extend(
+            [
+                legacy_project_state_dir(project_dir) / "themes",
+                project_state_dir(project_dir) / "themes",
+            ]
+        )
+    return list(dict.fromkeys(dirs))
 
 
 def load_themes(project_dir: str = "") -> dict[str, str]:

@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from typing import Any
 
+from worker_ai.attachments import attachment_data_base64
 from worker_ai.models import (
     Done,
     Message,
@@ -102,6 +103,15 @@ def _build_messages(messages: list[Message]) -> tuple[list[dict[str, str]], list
         content: list[dict[str, Any]] = []
         if msg.content:
             content.append({"text": msg.content})
+        for attachment in msg.attachments or []:
+            content.append(
+                {
+                    "image": {
+                        "format": attachment.mime_type.split("/", 1)[-1],
+                        "source": {"bytes": attachment_data_base64(attachment)},
+                    }
+                }
+            )
         if msg.role == Role.ASSISTANT and msg.tool_calls:
             for tool_call in msg.tool_calls:
                 content.append(

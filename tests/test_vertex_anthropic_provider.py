@@ -6,7 +6,7 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from worker_ai.models import Done, Message, Role, ToolCallDelta, ToolDef, ToolParam
+from worker_ai.models import Done, ImageAttachment, Message, Role, ToolCallDelta, ToolDef, ToolParam
 from worker_ai.providers import create_default_registry
 from worker_ai.providers.anthropic import AnthropicProvider
 from worker_ai.providers.anthropic_vertex import AnthropicVertexProvider
@@ -151,6 +151,49 @@ class TestAnthropicVertexProviderRuntime:
                 }
             ],
         }
+
+        await provider.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_body_includes_image_blocks(self, tmp_path):
+        provider = AnthropicVertexProvider(project="demo-project", location="us-east5")
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        with (
+            patch.object(
+                provider,
+                "_resolve_access_token",
+                return_value=("vertex-token", "demo-project"),
+            ),
+            patch.object(provider._client, "stream", return_value=AsyncMock()) as mock_stream,
+        ):
+            mock_cm = AsyncMock()
+            mock_response = AsyncMock()
+            mock_response.status_code = 500
+            mock_response.aread = AsyncMock(return_value=b"boom")
+            mock_cm.__aenter__ = AsyncMock(return_value=mock_response)
+            mock_cm.__aexit__ = AsyncMock(return_value=False)
+            mock_stream.return_value = mock_cm
+            with pytest.raises(RuntimeError):
+                async for _ in provider.stream_chat(
+                    "claude-sonnet-4@20250514",
+                    [
+                        Message(
+                            role=Role.USER,
+                            content="Look",
+                            attachments=[
+                                ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+                            ],
+                        )
+                    ],
+                ):
+                    pass
+
+        body = mock_stream.call_args.kwargs["json"]
+        assert body["messages"][0]["content"][0] == {"type": "text", "text": "Look"}
+        assert body["messages"][0]["content"][1]["type"] == "image"
+        assert body["messages"][0]["content"][1]["source"]["media_type"] == "image/png"
 
         await provider.close()
 

@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
-
-from worker_ai.models import Done, TextDelta, ToolCallDelta, Usage
-from worker_core.agent import AgentEventType, AgentSession, ThinkingLevel
-
 from conftest import MockProvider
-
+from worker_ai.models import Done, TextDelta, ToolCallDelta, Usage
+from worker_core.agent import AgentEventType, AgentSession
 
 # ── Steering ──────────────────────────────────────────────────────
 
@@ -138,11 +133,11 @@ async def test_context_files_walk_up(tmp_path):
     parent.mkdir()
     (parent / "AGENTS.md").write_text("Parent context instructions")
 
-    # Create parent/child/.worker/AGENTS.md
+    # Create parent/child/.artel/AGENTS.md
     child = parent / "child"
-    worker_dir = child / ".worker"
-    worker_dir.mkdir(parents=True)
-    (worker_dir / "AGENTS.md").write_text("Child project instructions")
+    artel_dir = child / ".artel"
+    artel_dir.mkdir(parents=True)
+    (artel_dir / "AGENTS.md").write_text("Child project instructions")
 
     provider = MockProvider()
     session = AgentSession(
@@ -156,9 +151,9 @@ async def test_context_files_walk_up(tmp_path):
 @pytest.mark.asyncio
 async def test_system_md_override(tmp_path):
     """SYSTEM.md should replace default system prompt."""
-    worker_dir = tmp_path / ".worker"
-    worker_dir.mkdir()
-    (worker_dir / "SYSTEM.md").write_text("You are a custom agent.")
+    artel_dir = tmp_path / ".artel"
+    artel_dir.mkdir()
+    (artel_dir / "SYSTEM.md").write_text("You are a custom agent.")
 
     provider = MockProvider()
     session = AgentSession(
@@ -166,7 +161,7 @@ async def test_system_md_override(tmp_path):
     )
 
     assert "You are a custom agent." in session.system_prompt
-    assert "Worker" not in session.system_prompt  # Default replaced
+    assert "Artel" not in session.system_prompt  # Default replaced
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,7 @@ class ExtensionContext:
 
 
 class BaseExtension:
-    """Shared lifecycle and context for Worker extension groups."""
+    """Shared lifecycle and context for Artel extension groups."""
 
     name: str = ""
     version: str = "0.0.0"
@@ -50,7 +50,7 @@ class BaseExtension:
 
 
 class Extension(BaseExtension):
-    """Base class for worker extensions.
+    """Base class for Artel extensions.
 
     Subclass this and declare tools, hooks, and commands.
     """
@@ -127,22 +127,49 @@ def hook(event: str) -> Callable[..., Any]:
 
 # ── Discovery ─────────────────────────────────────────────────────
 
+ARTEL_EXTENSION_GROUP = "artel.extensions"
+LEGACY_EXTENSION_GROUP = "worker.extensions"
+ARTEL_TUI_EXTENSION_GROUP = "artel.tui"
+LEGACY_TUI_EXTENSION_GROUP = "worker.tui"
+ARTEL_SERVER_EXTENSION_GROUP = "artel.server"
+LEGACY_SERVER_EXTENSION_GROUP = "worker.server"
+ARTEL_AI_EXTENSION_GROUP = "artel.ai"
+LEGACY_AI_EXTENSION_GROUP = "worker.ai"
+ARTEL_WEB_EXTENSION_GROUP = "artel.web"
+LEGACY_WEB_EXTENSION_GROUP = "worker.web"
 
-def discover_extensions(group: str = "worker.extensions") -> dict[str, type[Any]]:
-    """Discover installed extensions via entry_points."""
-    extensions: dict[str, type[Any]] = {}
+COMPATIBLE_EXTENSION_GROUPS: dict[str, tuple[str, ...]] = {
+    ARTEL_EXTENSION_GROUP: (ARTEL_EXTENSION_GROUP, LEGACY_EXTENSION_GROUP),
+    ARTEL_TUI_EXTENSION_GROUP: (ARTEL_TUI_EXTENSION_GROUP, LEGACY_TUI_EXTENSION_GROUP),
+    ARTEL_SERVER_EXTENSION_GROUP: (
+        ARTEL_SERVER_EXTENSION_GROUP,
+        LEGACY_SERVER_EXTENSION_GROUP,
+    ),
+    ARTEL_AI_EXTENSION_GROUP: (ARTEL_AI_EXTENSION_GROUP, LEGACY_AI_EXTENSION_GROUP),
+    ARTEL_WEB_EXTENSION_GROUP: (ARTEL_WEB_EXTENSION_GROUP, LEGACY_WEB_EXTENSION_GROUP),
+}
+
+
+def _entry_points_for_group(group: str) -> Any:
     try:
-        eps = importlib.metadata.entry_points(group=group)
+        return importlib.metadata.entry_points(group=group)
     except TypeError:
         # Python 3.11 compat
-        eps = importlib.metadata.entry_points().get(group, [])
+        return importlib.metadata.entry_points().get(group, [])
 
-    for ep in eps:
-        try:
-            cls = ep.load()
-            extensions[ep.name] = cls
-        except Exception:
-            continue
+
+def discover_extensions(group: str = ARTEL_EXTENSION_GROUP) -> dict[str, type[Any]]:
+    """Discover installed extensions via entry_points."""
+    extensions: dict[str, type[Any]] = {}
+    for entry_point_group in COMPATIBLE_EXTENSION_GROUPS.get(group, (group,)):
+        for ep in _entry_points_for_group(entry_point_group):
+            if ep.name in extensions:
+                continue
+            try:
+                cls = ep.load()
+                extensions[ep.name] = cls
+            except Exception:
+                continue
     return extensions
 
 
@@ -275,7 +302,7 @@ async def load_extensions_async(
     context: ExtensionContext | None = None,
 ) -> tuple[list[Extension], HookDispatcher]:
     """Discover, instantiate, activate, and return extensions + hook dispatcher."""
-    instances = await _load_extension_group_async(group="worker.extensions", context=context)
+    instances = await _load_extension_group_async(group=ARTEL_EXTENSION_GROUP, context=context)
     return instances, HookDispatcher(instances)
 
 
@@ -286,36 +313,38 @@ async def reload_extensions_async(
 ) -> tuple[list[Extension], HookDispatcher]:
     """Hot-reload core extensions, invalidate caches, and re-discover."""
     instances = await _reload_extension_group_async(
-        group="worker.extensions", current_instances=current_instances, context=context
+        group=ARTEL_EXTENSION_GROUP, current_instances=current_instances, context=context
     )
     return instances, HookDispatcher(instances)
 
 
 def discover_tui_extensions() -> dict[str, type[TuiExtension]]:
     """Discover installed TUI extensions."""
-    return discover_extensions(group="worker.tui")  # type: ignore[return-value]
+    return discover_extensions(group=ARTEL_TUI_EXTENSION_GROUP)  # type: ignore[return-value]
 
 
 def discover_server_extensions() -> dict[str, type[ServerExtension]]:
     """Discover installed server extensions."""
-    return discover_extensions(group="worker.server")  # type: ignore[return-value]
+    return discover_extensions(group=ARTEL_SERVER_EXTENSION_GROUP)  # type: ignore[return-value]
 
 
 def discover_ai_extensions() -> dict[str, type[AIExtension]]:
     """Discover installed AI extensions."""
-    return discover_extensions(group="worker.ai")  # type: ignore[return-value]
+    return discover_extensions(group=ARTEL_AI_EXTENSION_GROUP)  # type: ignore[return-value]
 
 
 def discover_web_extensions() -> dict[str, type[WebExtension]]:
     """Discover installed Web UI extensions."""
-    return discover_extensions(group="worker.web")  # type: ignore[return-value]
+    return discover_extensions(group=ARTEL_WEB_EXTENSION_GROUP)  # type: ignore[return-value]
 
 
 async def load_tui_extensions_async(
     context: ExtensionContext | None = None,
 ) -> list[TuiExtension]:
     """Load and activate TUI extensions."""
-    return await _load_extension_group_async(group="worker.tui", context=context)  # type: ignore[return-value]
+    return await _load_extension_group_async(  # type: ignore[return-value]
+        group=ARTEL_TUI_EXTENSION_GROUP, context=context
+    )
 
 
 async def reload_tui_extensions_async(
@@ -325,7 +354,7 @@ async def reload_tui_extensions_async(
 ) -> list[TuiExtension]:
     """Hot-reload TUI extensions."""
     return await _reload_extension_group_async(  # type: ignore[return-value]
-        group="worker.tui", current_instances=current_instances, context=context
+        group=ARTEL_TUI_EXTENSION_GROUP, current_instances=current_instances, context=context
     )
 
 
@@ -333,18 +362,24 @@ async def load_server_extensions_async(
     context: ExtensionContext | None = None,
 ) -> list[ServerExtension]:
     """Load and activate server extensions."""
-    return await _load_extension_group_async(group="worker.server", context=context)  # type: ignore[return-value]
+    return await _load_extension_group_async(  # type: ignore[return-value]
+        group=ARTEL_SERVER_EXTENSION_GROUP, context=context
+    )
 
 
 async def load_ai_extensions_async(
     context: ExtensionContext | None = None,
 ) -> list[AIExtension]:
     """Load and activate AI extensions."""
-    return await _load_extension_group_async(group="worker.ai", context=context)  # type: ignore[return-value]
+    return await _load_extension_group_async(  # type: ignore[return-value]
+        group=ARTEL_AI_EXTENSION_GROUP, context=context
+    )
 
 
 async def load_web_extensions_async(
     context: ExtensionContext | None = None,
 ) -> list[WebExtension]:
     """Load and activate Web extensions."""
-    return await _load_extension_group_async(group="worker.web", context=context)  # type: ignore[return-value]
+    return await _load_extension_group_async(  # type: ignore[return-value]
+        group=ARTEL_WEB_EXTENSION_GROUP, context=context
+    )

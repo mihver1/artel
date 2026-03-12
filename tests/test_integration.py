@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+import worker_server.server as server_mod
 from conftest import MockProvider
 from worker_ai.models import Done, TextDelta, Usage
 from worker_ai.oauth import OAuthToken, RemoteOAuthChallenge, TokenStore
@@ -431,21 +433,41 @@ class TestCliConnect:
 
 
 class TestCliDefaultMode:
-    def test_worker_default_uses_managed_local_server(self, monkeypatch):
-        import worker_core.migrations as migrations_mod
+    def test_worker_default_requires_cmux_ready_runtime(self, monkeypatch):
         import worker_tui.app as tui_app
         import worker_tui.local_server as local_server_mod
         from click.testing import CliRunner
         from worker_core import cli as cli_mod
+        from worker_core.artel_bootstrap import ArtelBootstrapResult
+        from worker_core.cmux import ArtelWorkspaceBootstrap, CmuxPreflightResult, CmuxSurfaceRecord, CmuxWorkspaceRecord
 
-        monkeypatch.setattr(migrations_mod, "check_and_migrate", lambda: None)
+        expected_project_dir = str(Path("/tmp/project").resolve())
+
         monkeypatch.setattr(cli_mod.os, "getcwd", lambda: "/tmp/project")
+        monkeypatch.setattr(
+            "worker_core.artel_bootstrap.bootstrap_artel",
+            lambda project_dir=None, command_name=None, prompt=None: ArtelBootstrapResult(
+                project_dir=expected_project_dir,
+                cmux_required=True,
+                cmux_preflight=CmuxPreflightResult(ok=True, summary="cmux preflight passed."),
+            ),
+        )
+
+        seen_bootstrap: list[str] = []
+
+        async def fake_bootstrap_artel_workspace(*, cwd: str = "", **kwargs):
+            seen_bootstrap.append(cwd)
+            return ArtelWorkspaceBootstrap(
+                workspace=CmuxWorkspaceRecord(id="ws-123", name="artel-main"),
+                dashboard=CmuxSurfaceRecord(id="sf-dashboard", title="dashboard", workspace="ws-123"),
+                orchestrator=CmuxSurfaceRecord(id="sf-orchestrator", title="orchestrator", workspace="ws-123"),
+            )
 
         async def fake_ensure_managed_local_server(project_dir: str):
-            assert project_dir == "/tmp/project"
+            assert project_dir == expected_project_dir
             return local_server_mod.LocalServerHandle(
                 remote_url="ws://127.0.0.1:9011",
-                auth_token="wkr_local_token",
+                auth_token="artel_local_token",
                 project_dir=project_dir,
                 pid=4321,
             )
@@ -462,6 +484,7 @@ class TestCliDefaultMode:
             finally:
                 loop.close()
 
+        monkeypatch.setattr(cli_mod, "bootstrap_artel_workspace", fake_bootstrap_artel_workspace)
         monkeypatch.setattr(
             local_server_mod,
             "ensure_managed_local_server",
@@ -477,12 +500,81 @@ class TestCliDefaultMode:
         )
 
         assert result.exit_code == 0
+        assert seen_bootstrap == [expected_project_dir]
+        assert "Artel dashboard surface ready: dashboard" in result.output
+        assert "Artel orchestrator surface ready: orchestrator" in result.output
         assert captured == {
             "remote_url": "ws://127.0.0.1:9011",
-            "auth_token": "wkr_local_token",
+            "auth_token": "artel_local_token",
             "continue_session": True,
             "resume_id": "sess-123",
         }
+
+    def test_worker_default_fails_fast_outside_cmux(self, monkeypatch):
+        from click.testing import CliRunner
+        from worker_core import cli as cli_mod
+        from worker_core.artel_bootstrap import ArtelBootstrapResult
+        from worker_core.cmux import CmuxPreflightResult
+
+        monkeypatch.setattr(cli_mod.os, "getcwd", lambda: "/tmp/project")
+        monkeypatch.setattr(
+            "worker_core.artel_bootstrap.bootstrap_artel",
+            lambda project_dir=None, command_name=None, prompt=None: ArtelBootstrapResult(
+                project_dir=str(Path("/tmp/project").resolve()),
+                cmux_required=True,
+                cmux_preflight=CmuxPreflightResult(
+                    ok=False,
+                    code="unsupported_environment",
+                    summary="Artel interactive mode must be launched inside a cmux workspace.",
+                    guidance=["Start or attach to a cmux workspace, then launch `artel` from that terminal."],
+                ),
+            ),
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(cli_mod.cli, [])
+
+        assert result.exit_code != 0
+        assert "must be launched inside a cmux workspace" in result.output
+        assert "Start or attach to a cmux workspace" in result.output
+
+    def test_worker_prompt_mode_skips_cmux_preflight(self, monkeypatch):
+        from click.testing import CliRunner
+        from worker_core import cli as cli_mod
+        from worker_core.artel_bootstrap import ArtelBootstrapResult
+
+        captured: dict[str, object] = {}
+
+        async def fake_print_mode(prompt: str, **kwargs):
+            captured["prompt"] = prompt
+            captured.update(kwargs)
+
+        def run_coro(coro):
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        monkeypatch.setattr(cli_mod.os, "getcwd", lambda: "/tmp/project")
+        monkeypatch.setattr(
+            "worker_core.artel_bootstrap.bootstrap_artel",
+            lambda project_dir=None, command_name=None, prompt=None: ArtelBootstrapResult(
+                project_dir=str(Path("/tmp/project").resolve()),
+                cmux_required=False,
+                cmux_preflight=None,
+            ),
+        )
+        monkeypatch.setattr(cli_mod, "_print_mode", fake_print_mode)
+        monkeypatch.setattr(cli_mod.asyncio, "run", run_coro)
+
+        runner = CliRunner()
+        result = runner.invoke(cli_mod.cli, ["-p", "hello world"])
+
+        assert result.exit_code == 0
+        assert captured["prompt"] == "hello world"
+        assert captured["continue_session"] is False
+        assert captured["resume_id"] == ""
 
 class TestCliServe:
     def test_worker_serve_passes_stdout_announcer(self, monkeypatch):
@@ -496,8 +588,8 @@ class TestCliServe:
             captured.update(kwargs)
             announce = kwargs["announce"]
             assert callable(announce)
-            announce("Worker server starting")
-            announce("  Auth token: wkr_test_token")
+            announce("Artel server starting")
+            announce("  Auth token: artel_test_token")
 
         def run_coro(coro):
             loop = asyncio.new_event_loop()
@@ -515,8 +607,8 @@ class TestCliServe:
         assert result.exit_code == 0
         assert captured["host"] == "0.0.0.0"
         assert captured["port"] == 9000
-        assert "Worker server starting" in result.output
-        assert "Auth token: wkr_test_token" in result.output
+        assert "Artel server starting" in result.output
+        assert "Auth token: artel_test_token" in result.output
 
     def test_worker_serve_passes_hidden_auth_token(self, monkeypatch):
         import worker_server.server as server_mod
@@ -638,6 +730,7 @@ class TestCliExtensions:
     def test_ext_update_uses_no_sources(self, monkeypatch):
         from click.testing import CliRunner
         from worker_core import cli as cli_mod
+        from worker_core import ext_manifest
 
         calls: list[list[str]] = []
 
@@ -646,6 +739,7 @@ class TestCliExtensions:
             return Mock(returncode=0)
 
         monkeypatch.setattr("subprocess.run", fake_run)
+        monkeypatch.setattr(ext_manifest, "list_entries", lambda: [])
 
         runner = CliRunner()
         result = runner.invoke(cli_mod.cli, ["ext", "update", "worker-ext-mcp"])
@@ -818,6 +912,107 @@ class TestRESTAPI:
 
         assert data["project_dir"] == str(tmp_path)
         assert data["default_model"] == state.config.agent.model
+        assert data["runtime_mode"] == "server"
+        assert data["auth_enabled"] is True
+        assert "loaded_extensions" in data
+
+    @pytest.mark.asyncio
+    async def test_config_paths_and_effective_config_endpoints(self, tmp_path):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        artel_dir = project_dir / ".artel"
+        artel_dir.mkdir()
+        (artel_dir / "config.toml").write_text(
+            '[providers.openai]\napi_key = "super-secret"\nbase_url = "https://api.openai.com/v1"\n',
+            encoding="utf-8",
+        )
+
+        state = ServerState(
+            config=WorkerConfig(
+                providers={
+                    "openai": ProviderConfig(api_key="secret-key", base_url="https://api.openai.com/v1")
+                }
+            ),
+            default_project_dir=str(project_dir),
+        )
+        app = _create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            paths_resp = await client.get(
+                "/api/config/paths",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert paths_resp.status == 200
+            paths = await paths_resp.json()
+
+            effective_resp = await client.get(
+                "/api/config/effective",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert effective_resp.status == 200
+            effective = await effective_resp.json()
+
+            diagnostics_resp = await client.get(
+                "/api/server/diagnostics",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert diagnostics_resp.status == 200
+            diagnostics = await diagnostics_resp.json()
+
+            raw_project_resp = await client.get(
+                "/api/config/raw?scope=project",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert raw_project_resp.status == 200
+            raw_project = await raw_project_resp.json()
+
+            raw_global_resp = await client.get(
+                "/api/config/raw?scope=global",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert raw_global_resp.status == 200
+            raw_global = await raw_global_resp.json()
+
+        assert paths["global_config"].endswith("config.toml")
+        assert paths["project_config"].endswith(".artel/config.toml")
+        assert paths["provider_overlay"].endswith("server-provider-overlay.json")
+        assert effective["config"]["providers"]["openai"]["api_key"] == "***REDACTED***"
+        assert effective["config"]["providers"]["openai"]["base_url"] == "https://api.openai.com/v1"
+        assert diagnostics["project_config_exists"] is True
+        assert "***REDACTED***" in raw_project["content"]
+        assert raw_project["scope"] == "project"
+        assert raw_global["scope"] == "global"
+
+    @pytest.mark.asyncio
+    async def test_config_init_endpoint_creates_config_files(self, tmp_path, monkeypatch):
+        import worker_core.config as cfg_mod
+        from aiohttp.test_utils import TestClient, TestServer
+
+        global_dir = tmp_path / "global"
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        monkeypatch.setattr(cfg_mod, "CONFIG_DIR", global_dir)
+        monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", global_dir / "config.toml")
+        monkeypatch.setattr(server_mod, "CONFIG_DIR", global_dir)
+        monkeypatch.setattr(server_mod, "GLOBAL_CONFIG", global_dir / "config.toml")
+
+        state = ServerState(config=WorkerConfig(), default_project_dir=str(project_dir))
+        app = _create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/config/init",
+                headers={"Authorization": "Bearer test_token"},
+                json={},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["ok"] is True
+        assert (global_dir / "config.toml").exists()
+        assert (project_dir / ".artel" / "config.toml").exists()
+        assert (project_dir / ".artel" / "AGENTS.md").exists()
 
     @pytest.mark.asyncio
     async def test_remote_bash_endpoint_executes_command(self, state):
@@ -875,6 +1070,50 @@ class TestRESTAPI:
             assert data["command"] == "echo"
             assert data["output"] == "remote:hello"
             assert data["session"]["id"] == "remote-session"
+
+    @pytest.mark.asyncio
+    async def test_prompts_and_skills_endpoints(self, state, tmp_path, monkeypatch):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        project_dir = tmp_path / "project"
+        (project_dir / ".artel" / "prompts").mkdir(parents=True)
+        (project_dir / ".artel" / "skills").mkdir(parents=True)
+        (project_dir / ".artel" / "prompts" / "review.md").write_text(
+            "Review {{input}} please",
+            encoding="utf-8",
+        )
+        (project_dir / ".artel" / "skills" / "python.md").write_text(
+            "---\nname: python\ndescription: Python help\n---\nUse pytest.",
+            encoding="utf-8",
+        )
+        state.default_project_dir = str(project_dir)
+
+        app = server_mod._create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get(
+                "/api/prompts",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["prompts"][0]["name"] == "review"
+
+            resp = await client.post(
+                "/api/prompts/review/render",
+                headers={"Authorization": "Bearer test_token"},
+                json={"arg": "src"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["content"] == "Review src please"
+
+            resp = await client.get(
+                "/api/skills",
+                headers={"Authorization": "Bearer test_token"},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["skills"][0]["name"] == "python"
 
     @pytest.mark.asyncio
     async def test_session_project_endpoint_and_cd_persist_remote_cwd(self, tmp_path):
@@ -1113,7 +1352,6 @@ class TestRESTAPI:
         monkeypatch,
     ):
         import worker_ai.oauth as oauth_mod
-        import worker_server.server as server_mod
         from aiohttp.test_utils import TestClient, TestServer
 
         monkeypatch.setattr(oauth_mod, "_DEFAULT_AUTH_PATH", tmp_path / "auth.json")
@@ -1123,8 +1361,9 @@ class TestRESTAPI:
             "save_provider_overlay",
             lambda overlay: saved_overlays.append(dict(overlay)),
         )
+        monkeypatch.setattr(server_mod, "load_config", lambda project_dir=None: WorkerConfig())
 
-        app = _create_rest_app(state, "test_token")
+        app = server_mod._create_rest_app(state, "test_token")
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
                 "/api/credentials/import",
@@ -1134,7 +1373,10 @@ class TestRESTAPI:
                         {
                             "provider": "openai",
                             "settings": {"base_url": "https://api.openai.com/v1"},
-                            "auth": {"kind": "api_key", "api_key": "sk-remote"},
+                            "auth": {
+                                "kind": "api_key",
+                                "api_key": "forwarded_openai_key_123",
+                            },
                         },
                         {
                             "provider": "anthropic",
@@ -1158,16 +1400,135 @@ class TestRESTAPI:
             {"provider": "openai", "auth_kind": "api_key"},
             {"provider": "anthropic", "auth_kind": "oauth_token"},
         ]
-        assert state.provider_overlay["openai"].api_key == "sk-remote"
+        assert state.provider_overlay["openai"].api_key == "forwarded_openai_key_123"
         assert saved_overlays
         saved_token = TokenStore(path=tmp_path / "auth.json").load("anthropic")
         assert saved_token is not None
         assert saved_token.access_token == "oauth_remote"
 
     @pytest.mark.asyncio
-    async def test_oauth_broker_start_and_complete(self, state, tmp_path, monkeypatch):
+    async def test_credentials_import_rejects_placeholder_api_key_and_cleans_runtime_state(
+        self,
+        state,
+        tmp_path,
+        monkeypatch,
+    ):
         import worker_ai.oauth as oauth_mod
         import worker_server.server as server_mod
+        from aiohttp.test_utils import TestClient, TestServer
+
+        monkeypatch.setattr(oauth_mod, "_DEFAULT_AUTH_PATH", tmp_path / "auth.json")
+        saved_overlays: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            server_mod,
+            "save_provider_overlay",
+            lambda overlay: saved_overlays.append(dict(overlay)),
+        )
+        monkeypatch.setattr(server_mod, "load_config", lambda project_dir=None: WorkerConfig())
+
+        state.provider_overlay["openai"] = ProviderConfig(
+            api_key="sk-remote",
+            base_url="https://api.openai.com/v1",
+        )
+        state.config.providers["openai"] = ProviderConfig(
+            api_key="sk-remote",
+            base_url="https://api.openai.com/v1",
+        )
+
+        app = server_mod._create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/credentials/import",
+                headers={"Authorization": "Bearer test_token"},
+                json={
+                    "providers": [
+                        {
+                            "provider": "openai",
+                            "settings": {"base_url": "https://api.openai.com/v1"},
+                            "auth": {"kind": "api_key", "api_key": "sk-remote"},
+                        }
+                    ]
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["imported"] == []
+        assert data["skipped"] == [
+            {"provider": "openai", "reason": "Rejected placeholder API key."}
+        ]
+        assert state.provider_overlay["openai"].api_key == ""
+        assert state.config.providers["openai"].api_key == ""
+        assert saved_overlays
+        assert saved_overlays[-1]["openai"].api_key == ""
+
+    @pytest.mark.asyncio
+    async def test_credentials_import_oauth_clears_stale_overlay_api_key_for_provider(
+        self,
+        state,
+        tmp_path,
+        monkeypatch,
+    ):
+        import worker_ai.oauth as oauth_mod
+        import worker_server.server as server_mod
+        from aiohttp.test_utils import TestClient, TestServer
+
+        monkeypatch.setattr(oauth_mod, "_DEFAULT_AUTH_PATH", tmp_path / "auth.json")
+        saved_overlays: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            server_mod,
+            "save_provider_overlay",
+            lambda overlay: saved_overlays.append(dict(overlay)),
+        )
+        monkeypatch.setattr(server_mod, "load_config", lambda project_dir=None: WorkerConfig())
+
+        state.provider_overlay["openai"] = ProviderConfig(
+            api_key="forwarded_openai_key_123",
+            base_url="https://api.openai.com/v1",
+        )
+        state.config.providers["openai"] = ProviderConfig(
+            api_key="forwarded_openai_key_123",
+            base_url="https://api.openai.com/v1",
+        )
+
+        app = server_mod._create_rest_app(state, "test_token")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/credentials/import",
+                headers={"Authorization": "Bearer test_token"},
+                json={
+                    "providers": [
+                        {
+                            "provider": "openai",
+                            "settings": {"base_url": "https://api.openai.com/v1"},
+                            "auth": {
+                                "kind": "oauth_token",
+                                "token": {
+                                    "access_token": "oauth_from_remote",
+                                    "provider": "openai",
+                                    "expires_at": 9999999999.0,
+                                },
+                            },
+                        }
+                    ]
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+
+        assert data["imported"] == [{"provider": "openai", "auth_kind": "oauth_token"}]
+        assert data["skipped"] == []
+        assert state.provider_overlay["openai"].api_key == ""
+        assert state.config.providers["openai"].api_key == ""
+        assert saved_overlays
+        assert saved_overlays[-1]["openai"].api_key == ""
+        saved_token = TokenStore(path=tmp_path / "auth.json").load("openai")
+        assert saved_token is not None
+        assert saved_token.access_token == "oauth_from_remote"
+
+    @pytest.mark.asyncio
+    async def test_oauth_broker_start_and_complete(self, state, tmp_path, monkeypatch):
+        import worker_ai.oauth as oauth_mod
         from aiohttp.test_utils import TestClient, TestServer
 
         monkeypatch.setattr(oauth_mod, "_DEFAULT_AUTH_PATH", tmp_path / "auth.json")
@@ -1182,6 +1543,15 @@ class TestRESTAPI:
             expires_at=9999999999.0,
         )
 
+        async def _fake_complete(challenge, payload):
+            assert challenge == fake_challenge
+            assert payload == {"code": "code_123", "state": "state_123"}
+            return OAuthToken(
+                access_token="oauth_from_broker",
+                provider=challenge.provider,
+                expires_at=9999999999.0,
+            )
+
         monkeypatch.setattr(
             server_mod,
             "start_remote_oauth_challenge",
@@ -1195,19 +1565,9 @@ class TestRESTAPI:
                 },
             ),
         )
-
-        async def _fake_complete(challenge, payload):
-            assert challenge == fake_challenge
-            assert payload == {"code": "code_123", "state": "state_123"}
-            return OAuthToken(
-                access_token="oauth_from_broker",
-                provider=challenge.provider,
-                expires_at=9999999999.0,
-            )
-
         monkeypatch.setattr(server_mod, "complete_remote_oauth_challenge", _fake_complete)
 
-        app = _create_rest_app(state, "test_token")
+        app = server_mod._create_rest_app(state, "test_token")
         async with TestClient(TestServer(app)) as client:
             start = await client.post(
                 "/api/oauth/start",
@@ -1238,10 +1598,6 @@ class TestRESTAPI:
         saved = TokenStore(path=tmp_path / "auth.json").load("openai")
         assert saved is not None
         assert saved.access_token == "oauth_from_broker"
-
-
-# ── WebSocket Protocol ────────────────────────────────────────────
-
 
 class FakeWebSocket:
     """Mock WebSocket connection for testing the protocol handler."""
@@ -1470,6 +1826,62 @@ class TestWebSocketProtocol:
         assert state.session_thinking_levels["persisted-remote"] == "high"
 
     @pytest.mark.asyncio
+    async def test_websocket_steer_queues_message_without_breaking_run(self):
+        from worker_core.agent import AgentSession
+
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        steered: list[str] = []
+
+        class _SteerableSession(AgentSession):
+            def steer(self, message: str) -> None:
+                steered.append(message)
+                super().steer(message)
+
+            async def run(self, content: str):
+                from worker_core.agent import AgentEvent, AgentEventType
+
+                assert content == "hi"
+                started.set()
+                await finish.wait()
+                yield AgentEvent(type=AgentEventType.TEXT_DELTA, content="done")
+                yield AgentEvent(
+                    type=AgentEventType.DONE,
+                    usage=Usage(input_tokens=1, output_tokens=1),
+                )
+
+        state = ServerState(config=WorkerConfig())
+        state.sessions["test_session"] = _SteerableSession(
+            provider=MockProvider(),
+            model="test",
+            tools=[],
+        )
+
+        ws = FakeWebSocket()
+        client_task = asyncio.create_task(handle_client(ws, state))  # type: ignore[arg-type]
+        try:
+            ws.inject(json.dumps({"type": "message", "session_id": "test_session", "content": "hi"}))
+            await asyncio.wait_for(started.wait(), timeout=1.0)
+            ws.inject(json.dumps({"type": "steer", "session_id": "test_session", "content": "change course"}))
+            finish.set()
+
+            async def _wait_for_done() -> None:
+                while True:
+                    messages = [json.loads(message) for message in ws.sent]
+                    if any(message.get("type") == "done" for message in messages):
+                        return
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(_wait_for_done(), timeout=1.0)
+        finally:
+            ws.close_input()
+            await asyncio.wait_for(client_task, timeout=1.0)
+
+        assert steered == ["change course"]
+        messages = [json.loads(m) for m in ws.sent]
+        assert any(m.get("type") == "status" and m.get("state") == "thinking" for m in messages)
+        assert any(m.get("type") == "status" and m.get("state") == "steer queued" for m in messages)
+
     async def test_background_session_run_survives_client_disconnect(self):
         from worker_core.agent import AgentSession
 

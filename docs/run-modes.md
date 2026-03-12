@@ -1,18 +1,18 @@
 # Run modes
 
-Worker supports four main ways to run the agent, depending on how much UI, isolation, and network separation you need. For embedding and editor integrations, it also exposes RPC and ACP over stdio.
+Artel supports four main ways to run the agent, depending on how much UI, isolation, and network separation you need. For embedding and editor integrations, it also exposes RPC and ACP over stdio.
 
 ## Print mode
 
 Use print mode for scripting, shell pipelines, and quick one-off prompts.
 
 ```bash
-worker -p "generate a changelog entry for the latest commit"
+artel -p "generate a changelog entry for the latest commit"
 ```
 
 Useful when:
 
-- integrating Worker into scripts
+- integrating Artel into scripts
 - piping file content into a prompt
 - getting a single response without opening the TUI
 
@@ -21,23 +21,23 @@ Useful when:
 Run the interactive TUI and the agent in the same process:
 
 ```bash
-worker
+artel
 ```
 
 This is the default mode when no subcommand or prompt flag is provided.
 
 ## Server mode
 
-Run a headless Worker daemon that accepts remote connections:
+Run a headless Artel daemon that accepts remote connections:
 
 ```bash
-worker serve
+artel serve
 ```
 
 You can override the bind address and port:
 
 ```bash
-worker serve --host 0.0.0.0 --port 7432
+artel serve --host 0.0.0.0 --port 7432
 ```
 
 Use server mode when:
@@ -48,18 +48,18 @@ Use server mode when:
 
 ## Remote TUI mode
 
-Connect the local TUI to a remote Worker server:
+Connect the local TUI to a remote Artel server:
 
 ```bash
-worker connect ws://host:7432
+artel connect ws://host:7432
 ```
 
 Useful flags:
 
 ```bash
-worker connect ws://host:7432 --token <bearer-token>
-worker connect ws://host:7432 --forward-credentials all
-worker connect ws://host:7432 --forward-credentials anthropic,openai
+artel connect ws://host:7432 --token <bearer-token>
+artel connect ws://host:7432 --forward-credentials all
+artel connect ws://host:7432 --forward-credentials anthropic,openai
 ```
 
 Remote mode is useful when you want a lightweight local UI while the agent executes elsewhere.
@@ -69,31 +69,31 @@ Remote mode is useful when you want a lightweight local UI while the agent execu
 Continue the most recent session:
 
 ```bash
-worker --continue
+artel --continue
 ```
 
 Resume a specific session:
 
 ```bash
-worker --resume <session-id>
+artel --resume <session-id>
 ```
 
 These flags apply to both print mode and the default TUI mode.
 
 ## RPC mode
 
-If you need to embed Worker in another process, you can run a JSON-RPC server over stdin and stdout:
+If you need to embed Artel in another process, you can run a JSON-RPC server over stdin and stdout:
 
 ```bash
-worker rpc
+artel rpc
 ```
 
 ## ACP mode
 
-If you need an ACP-compatible client to drive Worker over stdin and stdout, run:
+If you need an ACP-compatible client to drive Artel over stdin and stdout, run:
 
 ```bash
-worker acp
+artel acp
 ```
 
 This mode is intended for editors, IDEs, and other frontends that speak the Agent Client Protocol.

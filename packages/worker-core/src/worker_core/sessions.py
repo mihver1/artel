@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
-from worker_ai.models import Message, Role, ToolCall, ToolResult
+from worker_ai.models import ImageAttachment, Message, Role, ToolCall, ToolResult
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS sessions (
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls  TEXT,          -- JSON
     tool_result TEXT,          -- JSON
     reasoning   TEXT,
+    attachments TEXT,          -- JSON
     created_at  TEXT NOT NULL
 );
 
@@ -73,6 +74,13 @@ class SessionStore:
         try:
             await self._db.execute(
                 "ALTER TABLE sessions ADD COLUMN thinking_level TEXT NOT NULL DEFAULT ''"
+            )
+            await self._db.commit()
+        except Exception:  # column already exists
+            pass
+        try:
+            await self._db.execute(
+                "ALTER TABLE messages ADD COLUMN attachments TEXT"
             )
             await self._db.commit()
         except Exception:  # column already exists
@@ -176,12 +184,26 @@ class SessionStore:
             if message.tool_result
             else None
         )
+        attachments_json = (
+            json.dumps(
+                [
+                    {
+                        "path": attachment.path,
+                        "mime_type": attachment.mime_type,
+                        "name": attachment.name,
+                    }
+                    for attachment in message.attachments
+                ]
+            )
+            if message.attachments
+            else None
+        )
 
         cursor = await self.db.execute(
             (
                 "INSERT INTO messages (session_id, parent_id, role, content, "
-                "tool_calls, tool_result, reasoning, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                "tool_calls, tool_result, reasoning, attachments, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             ),
             (
                 session_id,
@@ -191,6 +213,7 @@ class SessionStore:
                 tool_calls_json,
                 tool_result_json,
                 message.reasoning,
+                attachments_json,
                 _now(),
             ),
         )
@@ -213,7 +236,7 @@ class SessionStore:
         """Load linear message history for a session (follows parent chain from latest)."""
         cursor = await self.db.execute(
             (
-                "SELECT role, content, tool_calls, tool_result, reasoning "
+                "SELECT role, content, tool_calls, tool_result, reasoning, attachments "
                 "FROM messages WHERE session_id = ? ORDER BY id ASC"
             ),
             (session_id,),
@@ -239,6 +262,18 @@ class SessionStore:
                     is_error=raw.get("is_error", False),
                 )
 
+            attachments = None
+            if row_dict.get("attachments"):
+                raw = json.loads(row_dict["attachments"])
+                attachments = [
+                    ImageAttachment(
+                        path=item["path"],
+                        mime_type=item.get("mime_type", "image/png"),
+                        name=item.get("name", ""),
+                    )
+                    for item in raw
+                ]
+
             messages.append(
                 Message(
                     role=Role(row_dict["role"]),
@@ -246,6 +281,7 @@ class SessionStore:
                     tool_calls=tcs,
                     tool_result=tr,
                     reasoning=row_dict["reasoning"],
+                    attachments=attachments,
                 )
             )
         return messages

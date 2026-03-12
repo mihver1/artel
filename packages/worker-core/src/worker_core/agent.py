@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 
 from worker_ai.models import (
     Done,
+    ImageAttachment,
     Message,
     ReasoningDelta,
     Role,
@@ -27,9 +29,24 @@ from worker_ai.models import (
 )
 from worker_ai.provider import Provider
 
+from worker_core.config import (
+    LEGACY_PROJECT_DIR_NAME,
+    PROJECT_DIR_NAME,
+    effective_global_agents_path,
+    effective_global_append_system_path,
+    effective_global_system_override_path,
+    effective_project_append_system_path,
+    effective_project_system_override_path,
+)
 from worker_core.execution import ToolExecutionContext, bind_tool_execution_context
 from worker_core.extensions import HookDispatcher
 from worker_core.permissions import PermissionPolicy
+from worker_core.rules import (
+    SessionRuleOverrides,
+    evaluate_rule_violation,
+    format_rules_for_system_prompt,
+)
+from worker_core.skills import build_skills_header, load_skills
 from worker_core.tools import Tool
 
 # ── Thinking levels ───────────────────────────────────────────────
@@ -65,9 +82,12 @@ class AgentEvent:
 # ── Agent session ─────────────────────────────────────────────────
 
 _DEFAULT_SYSTEM_PROMPT = (
-    "You are Worker, a helpful coding assistant. "
-    "You have access to tools for reading, writing, editing files and running shell commands. "
-    "Use them to help the user with their coding tasks. Be concise and direct."
+    "You are Artel, a helpful coding assistant. "
+    "You have access to tools for reading, writing, editing files, running shell commands, searching the web, fetching public web pages, and managing a shared task board plus operator notes. "
+    "Use the task board to track multi-step work, add subtasks, mark tasks complete, and capture follow-up work that should not be forgotten. "
+    "Do not treat the task board or operator notes as automatic instructions unless the user explicitly asks you to consult or update them. "
+    "Treat operator notes as operator-owned scratch space: read them only when asked, and do not rewrite them wholesale unless explicitly requested. "
+    "Be concise and direct."
 )
 
 _CONTEXT_FILE_NAMES = ("AGENTS.md", "CLAUDE.md")
@@ -101,6 +121,7 @@ class AgentSession:
         context_window: int = 0,
         small_provider: Any | None = None,
         small_model: str = "",
+        rule_overrides: SessionRuleOverrides | None = None,
     ):
         self.provider = provider
         self.model = model
@@ -118,9 +139,14 @@ class AgentSession:
         self.hooks = hooks or HookDispatcher()
         self.small_provider = small_provider
         self.small_model = small_model
+        self.rule_overrides = rule_overrides or SessionRuleOverrides.empty()
 
         # Build system prompt: default + config + context files
-        self.system_prompt = self._build_system_prompt(system_prompt, project_dir)
+        self.system_prompt = self._build_system_prompt(
+            system_prompt,
+            project_dir,
+            rule_overrides=self.rule_overrides,
+        )
 
         self.messages: list[Message] = [
             Message(role=Role.SYSTEM, content=self.system_prompt),
@@ -286,24 +312,32 @@ class AgentSession:
     # ── System prompt construction ────────────────────────────────
 
     @staticmethod
-    def _build_system_prompt(custom: str, project_dir: str) -> str:
-        from pathlib import Path
-
-        from worker_core.skills import build_skills_header, load_skills
+    def _build_system_prompt(
+        custom: str,
+        project_dir: str,
+        *,
+        rule_overrides: SessionRuleOverrides | None = None,
+    ) -> str:
 
         parts: list[str] = []
+
+        def _read_optional(path: Path) -> str | None:
+            if not path.exists():
+                return None
+            with suppress(OSError):
+                content = path.read_text(encoding="utf-8").strip()
+                if content:
+                    return content
+            return None
 
         # Check for SYSTEM.md override (project then global)
         system_override = None
         if project_dir:
-            system_md = Path(project_dir) / ".worker" / "SYSTEM.md"
-            if system_md.exists():
-                with suppress(OSError):
-                    system_override = system_md.read_text(encoding="utf-8").strip()
-        global_system_md = Path("~/.config/worker/SYSTEM.md").expanduser()
-        if system_override is None and global_system_md.exists():
-            with suppress(OSError):
-                system_override = global_system_md.read_text(encoding="utf-8").strip()
+            system_override = _read_optional(
+                effective_project_system_override_path(project_dir)
+            )
+        if system_override is None:
+            system_override = _read_optional(effective_global_system_override_path())
 
         if system_override:
             parts.append(system_override)
@@ -311,17 +345,13 @@ class AgentSession:
             parts.append(_DEFAULT_SYSTEM_PROMPT)
 
         # APPEND_SYSTEM.md
-        for loc in (
-            Path("~/.config/worker/APPEND_SYSTEM.md").expanduser(),
-            Path(project_dir) / ".worker" / "APPEND_SYSTEM.md" if project_dir else None,
-        ):
-            if loc and loc.exists():
-                try:
-                    content = loc.read_text(encoding="utf-8").strip()
-                    if content:
-                        parts.append(content)
-                except OSError:
-                    pass
+        append_paths = [effective_global_append_system_path()]
+        if project_dir:
+            append_paths.append(effective_project_append_system_path(project_dir))
+        for loc in append_paths:
+            content = _read_optional(loc)
+            if content:
+                parts.append(content)
 
         # Custom (from config)
         if custom:
@@ -331,14 +361,10 @@ class AgentSession:
         context_parts: list[str] = []
 
         # Global context file
-        global_agents = Path("~/.config/worker/AGENTS.md").expanduser()
-        if global_agents.exists():
-            try:
-                content = global_agents.read_text(encoding="utf-8").strip()
-                if content:
-                    context_parts.append(content)
-            except OSError:
-                pass
+        global_agents = effective_global_agents_path()
+        content = _read_optional(global_agents)
+        if content:
+            context_parts.append(content)
 
         # Walk up from project_dir to root
         if project_dir:
@@ -347,24 +373,21 @@ class AgentSession:
             home = Path.home()
             while True:
                 for fname in _CONTEXT_FILE_NAMES:
-                    # Check .worker/AGENTS.md
-                    candidate = current / ".worker" / fname
-                    if candidate.exists():
-                        try:
-                            content = candidate.read_text(encoding="utf-8").strip()
-                            if content:
-                                found_files.append((candidate, content))
-                        except OSError:
-                            pass
+                    hidden_candidate = None
+                    for hidden_dir_name in (PROJECT_DIR_NAME, LEGACY_PROJECT_DIR_NAME):
+                        candidate = current / hidden_dir_name / fname
+                        if candidate.exists():
+                            hidden_candidate = candidate
+                            break
+                    if hidden_candidate is not None:
+                        content = _read_optional(hidden_candidate)
+                        if content:
+                            found_files.append((hidden_candidate, content))
                     # Check AGENTS.md directly
                     candidate = current / fname
-                    if candidate.exists():
-                        try:
-                            content = candidate.read_text(encoding="utf-8").strip()
-                            if content:
-                                found_files.append((candidate, content))
-                        except OSError:
-                            pass
+                    content = _read_optional(candidate)
+                    if content:
+                        found_files.append((candidate, content))
                 parent = current.parent
                 if parent == current or current == home.parent:
                     break
@@ -382,19 +405,39 @@ class AgentSession:
         if header:
             parts.append(header)
 
+        rules_header = format_rules_for_system_prompt(project_dir, rule_overrides)
+        if rules_header:
+            parts.append(rules_header)
+
         return "\n\n".join(parts)
+
+    def refresh_system_prompt(self) -> None:
+        self.system_prompt = self._build_system_prompt(
+            "",
+            self.project_dir,
+            rule_overrides=self.rule_overrides,
+        )
+        if self.messages:
+            self.messages[0].content = self.system_prompt
 
     def _tool_defs(self) -> list[ToolDef]:
         return [t.definition() for t in self.tools.values()]
 
-    async def run(self, user_message: str) -> AsyncIterator[AgentEvent]:
+    async def run(
+        self,
+        user_message: str,
+        *,
+        attachments: list[ImageAttachment] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
         """Process a user message through the agent loop.
 
         Yields AgentEvents for text, tool calls, tool results, and completion.
         Supports mid-run steering via steer() and post-run follow-ups via follow_up().
         """
         self._abort_event.clear()
-        await self._append_message(Message(role=Role.USER, content=user_message))
+        await self._append_message(
+            Message(role=Role.USER, content=user_message, attachments=attachments)
+        )
 
         # Fire session-level hook
         await self.hooks.fire("on_session_start", session=self)
@@ -526,7 +569,19 @@ class AgentSession:
                     result = f"Error: Unknown tool '{tc.name}'"
                     is_error = True
                 else:
-                    if self.permission_policy is not None:
+                    violation = evaluate_rule_violation(
+                        tc.name,
+                        dict(exec_args),
+                        self.project_dir,
+                        self.rule_overrides,
+                    )
+                    if violation is not None:
+                        result = (
+                            "Refused: action conflicts with an active rule. "
+                            f"{violation.reason} Rule {violation.rule.id}: {violation.rule.text}"
+                        )
+                        is_error = True
+                    elif self.permission_policy is not None:
                         permission = await self.permission_policy.check(tc.name, exec_args)
                         if not permission.allowed:
                             result = f"Error: {permission.reason}"

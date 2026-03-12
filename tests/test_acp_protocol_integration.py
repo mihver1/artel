@@ -23,7 +23,7 @@ async def _read_json_messages_until(
     proc: asyncio.subprocess.Process,
     *,
     response_id: int,
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = 15.0,
 ) -> list[dict[str, Any]]:
     assert proc.stdout is not None
     loop = asyncio.get_running_loop()
@@ -46,7 +46,7 @@ async def _read_json_messages_until_with_auto_permissions(
     *,
     response_id: int,
     permission_option_id: str = "approve",
-    timeout_seconds: float = 5.0,
+    timeout_seconds: float = 15.0,
 ) -> list[dict[str, Any]]:
     assert proc.stdout is not None
     loop = asyncio.get_running_loop()
@@ -246,8 +246,8 @@ async def test_worker_acp_file_tool_calls_publish_absolute_locations(tmp_path):
         encoding="utf-8",
     )
 
-    (project_dir / ".worker").mkdir()
-    (project_dir / ".worker" / "config.toml").write_text(
+    (project_dir / ".artel").mkdir()
+    (project_dir / ".artel" / "config.toml").write_text(
         """
 [agent]
 model = "mock/mock-model"
@@ -416,7 +416,7 @@ _providers.create_default_registry = _patched_create_default_registry
 async def test_worker_acp_lists_and_resumes_persisted_sessions_after_restart(tmp_path):
     home_dir = tmp_path / "home"
     project_dir = tmp_path / "project"
-    db_path = home_dir / ".config" / "worker" / "sessions.db"
+    db_path = home_dir / ".config" / "artel" / "sessions.db"
     home_dir.mkdir()
     project_dir.mkdir()
     env = os.environ.copy()

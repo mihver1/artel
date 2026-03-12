@@ -1,17 +1,17 @@
 # Quick start
 
-This guide gets you from a fresh install to a usable local Worker session.
+This guide gets you from a fresh install to a usable local Artel session.
 
 ## 1. Initialize configuration
 
 ```bash
-worker init
+artel init
 ```
 
-Worker uses two config layers:
+Artel uses two config layers:
 
-- global config in `~/.config/worker/config.toml`
-- project overrides in `.worker/config.toml`
+- global config in `~/.config/artel/config.toml`
+- project overrides in `.artel/config.toml`
 
 ## 2. Configure a model provider
 
@@ -36,13 +36,13 @@ You can also keep secrets out of the config file and rely on provider-specific e
 Use print mode when you want a single answer in a shell pipeline or script:
 
 ```bash
-worker -p "summarize the architecture of this project"
+artel -p "summarize the architecture of this project"
 ```
 
 Piped stdin is appended to the prompt automatically:
 
 ```bash
-cat pyproject.toml | worker -p "explain the dependency layout"
+cat pyproject.toml | artel -p "explain the dependency layout"
 ```
 
 ## 4. Start the interactive TUI
@@ -50,7 +50,7 @@ cat pyproject.toml | worker -p "explain the dependency layout"
 Launch local interactive mode with:
 
 ```bash
-worker
+artel
 ```
 
 This runs the TUI and the agent in the same process, which is the simplest mode for normal local development.
@@ -60,13 +60,13 @@ This runs the TUI and the agent in the same process, which is the simplest mode 
 Resume the last session:
 
 ```bash
-worker --continue
+artel --continue
 ```
 
 Resume a specific session by ID:
 
 ```bash
-worker --resume <session-id>
+artel --resume <session-id>
 ```
 
 Both flags also work with print mode.
@@ -76,13 +76,13 @@ Both flags also work with print mode.
 Check which config files exist:
 
 ```bash
-worker config
+artel config
 ```
 
 Print the merged configuration:
 
 ```bash
-worker config print
+artel config print
 ```
 
 Next steps:

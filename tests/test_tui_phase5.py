@@ -15,6 +15,13 @@ import pytest
 class TestCmuxDetection:
     """Tests for cmux environment detection."""
 
+    def test_can_manage_cmux_true_with_binary_outside_cmux(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/usr/local/bin/cmux")
+        assert cmux_mod.can_manage_cmux() is True
+
     def test_is_cmux_false_without_env(self, monkeypatch):
         """is_cmux() returns False when CMUX_WORKSPACE_ID is not set."""
         import worker_core.cmux as cmux_mod
@@ -120,6 +127,166 @@ class TestCmuxNoOps:
         assert result == ""
 
 
+class TestCmuxPreflight:
+    """Tests for cmux interactive preflight."""
+
+    def test_preflight_fails_when_binary_missing(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "")
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+
+        result = cmux_mod.preflight_cmux()
+
+        assert result.ok is False
+        assert result.code == "binary_missing"
+        assert "requires cmux" in result.summary.lower()
+        assert "Install cmux" in result.format_message()
+
+    def test_preflight_fails_outside_cmux_workspace(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+
+        result = cmux_mod.preflight_cmux()
+
+        assert result.ok is False
+        assert result.code == "unsupported_environment"
+        assert "launched inside a cmux workspace" in result.summary
+
+    def test_preflight_fails_when_socket_missing(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws-test")
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.setattr(cmux_mod.os.path, "exists", lambda path: False)
+
+        result = cmux_mod.preflight_cmux()
+
+        assert result.ok is False
+        assert result.code == "socket_unavailable"
+        assert result.workspace == "ws-test"
+
+    def test_preflight_fails_when_capabilities_missing(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws-test")
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.setattr(cmux_mod.os.path, "exists", lambda path: True)
+        monkeypatch.setattr(cmux_mod, "is_cmux_socket_reachable", lambda path: True)
+        monkeypatch.setattr(cmux_mod, "probe_cmux_capabilities", lambda help_text=None: {"browser"})
+
+        result = cmux_mod.preflight_cmux()
+
+        assert result.ok is False
+        assert result.code == "capabilities_missing"
+        assert "workspace" in result.missing_capabilities
+        assert "surface" in result.missing_capabilities
+
+    def test_preflight_fails_when_socket_is_unreachable(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws-test")
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.setattr(cmux_mod.os.path, "exists", lambda path: True)
+        monkeypatch.setattr(cmux_mod, "is_cmux_socket_reachable", lambda path: False)
+
+        result = cmux_mod.preflight_cmux()
+
+        assert result.ok is False
+        assert result.code == "socket_unreachable"
+        assert result.workspace == "ws-test"
+        assert result.socket_path == cmux_mod.DEFAULT_CMUX_SOCKET_PATH
+
+    def test_preflight_passes_when_runtime_is_ready(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws-test")
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.setattr(cmux_mod.os.path, "exists", lambda path: True)
+        monkeypatch.setattr(cmux_mod, "is_cmux_socket_reachable", lambda path: True)
+        monkeypatch.setattr(
+            cmux_mod,
+            "probe_cmux_capabilities",
+            lambda help_text=None: set(cmux_mod.EXPECTED_CMUX_CAPABILITIES),
+        )
+
+        result = cmux_mod.preflight_cmux()
+
+        assert result.ok is True
+        assert result.workspace == "ws-test"
+        assert result.binary_path == "/mock/cmux"
+
+    def test_management_preflight_passes_without_cmux_workspace_env(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.setattr(cmux_mod.os.path, "exists", lambda path: True)
+        monkeypatch.setattr(cmux_mod, "is_cmux_socket_reachable", lambda path: True)
+        monkeypatch.setattr(
+            cmux_mod,
+            "probe_cmux_capabilities",
+            lambda help_text=None: {"workspace", "surface", "browser"},
+        )
+
+        result = cmux_mod.preflight_cmux_management()
+
+        assert result.ok is True
+        assert result.binary_path == "/mock/cmux"
+        assert result.workspace == ""
+
+    def test_management_preflight_reports_socket_failure_without_cmux_workspace_env(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+        monkeypatch.setattr(cmux_mod.os.path, "exists", lambda path: False)
+
+        result = cmux_mod.preflight_cmux_management()
+
+        assert result.ok is False
+        assert result.code == "socket_unavailable"
+        assert "CMUX_WORKSPACE_ID is not required" in result.format_message()
+
+
+class TestCmuxParsing:
+    """Tests for typed cmux workspace/surface parsing helpers."""
+
+    def test_parse_workspace_list_handles_kv_and_marked_current(self):
+        import worker_core.cmux as cmux_mod
+
+        records = cmux_mod.parse_workspace_list(
+            "* id=ws-1 name=artel-main\nid=ws-2 name=scratch"
+        )
+
+        assert len(records) == 2
+        assert records[0].id == "ws-1"
+        assert records[0].name == "artel-main"
+        assert records[0].current is True
+        assert records[1].id == "ws-2"
+        assert records[1].name == "scratch"
+        assert records[1].current is False
+
+    def test_parse_surface_list_handles_kv_and_workspace(self):
+        import worker_core.cmux as cmux_mod
+
+        records = cmux_mod.parse_surface_list(
+            "* id=sf-1 title=dashboard workspace=ws-1\nid=sf-2 title=orchestrator workspace=ws-1"
+        )
+
+        assert len(records) == 2
+        assert records[0].id == "sf-1"
+        assert records[0].title == "dashboard"
+        assert records[0].workspace == "ws-1"
+        assert records[0].current is True
+        assert records[1].id == "sf-2"
+        assert records[1].title == "orchestrator"
+        assert records[1].workspace == "ws-1"
+        assert records[1].current is False
+
+
 class TestCmuxCommandBuilding:
     """Test that cmux functions build correct command args when in cmux."""
 
@@ -161,10 +328,10 @@ class TestCmuxCommandBuilding:
 
         monkeypatch.setattr(cmux_mod, "_run", fake_run)
 
-        await cmux_mod.notify("Worker", subtitle="Done", body="Task finished")
+        await cmux_mod.notify("Artel", subtitle="Done", body="Task finished")
 
         assert captured_args == [
-            "notify", "--title", "Worker",
+            "notify", "--title", "Artel",
             "--subtitle", "Done", "--body", "Task finished",
         ]
 
@@ -204,10 +371,380 @@ class TestCmuxCommandBuilding:
 
         monkeypatch.setattr(cmux_mod, "_run", fake_run)
 
-        await cmux_mod.log("test error", level="error", source="worker")
+        await cmux_mod.log("test error", level="error", source="artel")
 
         assert captured_args == [
-            "log", "--level", "error", "--source", "worker", "--", "test error",
+            "log", "--level", "error", "--source", "artel", "--", "test error",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_workspace_create_builds_expected_args(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        calls = []
+
+        async def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:1] == ["new-workspace"]:
+                return "OK workspace:123"
+            return "OK workspace:123"
+
+        monkeypatch.setattr(cmux_mod, "_run", fake_run)
+
+        result = await cmux_mod.workspace_create("artel-main")
+
+        assert result == "workspace:123"
+        assert calls == [
+            ["new-workspace"],
+            ["rename-workspace", "--workspace", "workspace:123", "artel-main"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_surface_create_builds_expected_args(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        calls = []
+
+        async def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:1] == ["new-surface"]:
+                return "OK surface:123 pane:1 workspace:artel-main"
+            return "OK"
+
+        monkeypatch.setattr(cmux_mod, "_run", fake_run)
+
+        result = await cmux_mod.surface_create(
+            title="dashboard",
+            command="artel",
+            cwd="/srv/project",
+            workspace="artel-main",
+        )
+
+        assert result == "surface:123"
+        assert calls == [
+            ["new-surface", "--workspace", "artel-main"],
+            ["rename-tab", "--surface", "surface:123", "--workspace", "artel-main", "--title", "dashboard"],
+            ["send", "--surface", "surface:123", "--workspace", "artel-main", "cd '/srv/project' && artel\n"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_surface_focus_builds_expected_args(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setenv("CMUX_WORKSPACE_ID", "ws-test")
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        calls = []
+
+        async def fake_run(args, **kwargs):
+            calls.append(list(args))
+            if args[:1] == ["identify"]:
+                return '{"caller":{"pane_ref":"pane:9"}}'
+            return "OK"
+
+        monkeypatch.setattr(cmux_mod, "_run", fake_run)
+
+        await cmux_mod.surface_focus("surface-123")
+
+        assert calls == [
+            ["identify", "--surface", "surface-123"],
+            ["focus-pane", "--pane", "pane:9"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_workspace_list_records_parses_cli_output(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        async def fake_run(args, **kwargs):
+            assert args == ["list-workspaces"]
+            return "* workspace:1  artel-main\nworkspace:2  scratch"
+
+        monkeypatch.setattr(cmux_mod, "_run", fake_run)
+
+        records = await cmux_mod.workspace_list_records()
+
+        assert [record.id for record in records] == ["workspace:1", "workspace:2"]
+        assert records[0].current is True
+        assert records[0].name == "artel-main"
+
+    @pytest.mark.asyncio
+    async def test_surface_list_records_parses_cli_output(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        async def fake_run(args, **kwargs):
+            assert args == ["list-pane-surfaces", "--workspace", "artel-main"]
+            return "* surface:1  dashboard  [selected]"
+
+        monkeypatch.setattr(cmux_mod, "_run", fake_run)
+
+        records = await cmux_mod.surface_list_records(workspace="artel-main")
+
+        assert len(records) == 1
+        assert records[0].id == "surface:1"
+        assert records[0].title == "dashboard"
+        assert records[0].workspace == ""
+
+    @pytest.mark.asyncio
+    async def test_ensure_workspace_returns_existing_record(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        async def fake_list_records():
+            return [cmux_mod.CmuxWorkspaceRecord(id="ws-1", name="artel-main", current=True)]
+
+        async def fake_workspace_create(name: str = ""):
+            raise AssertionError("workspace_create should not be called when workspace exists")
+
+        monkeypatch.setattr(cmux_mod, "workspace_list_records", fake_list_records)
+        monkeypatch.setattr(cmux_mod, "workspace_create", fake_workspace_create)
+
+        record = await cmux_mod.ensure_workspace("artel-main")
+
+        assert record is not None
+        assert record.id == "ws-1"
+        assert record.name == "artel-main"
+
+    @pytest.mark.asyncio
+    async def test_ensure_workspace_creates_when_missing(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        async def fake_list_records():
+            return []
+
+        async def fake_workspace_create(name: str = ""):
+            assert name == "artel-main"
+            return "ws-123"
+
+        monkeypatch.setattr(cmux_mod, "workspace_list_records", fake_list_records)
+        monkeypatch.setattr(cmux_mod, "workspace_create", fake_workspace_create)
+
+        record = await cmux_mod.ensure_workspace("artel-main")
+
+        assert record is not None
+        assert record.id == "ws-123"
+        assert record.name == "artel-main"
+
+    @pytest.mark.asyncio
+    async def test_ensure_surface_returns_existing_record(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        async def fake_surface_list_records(*, workspace: str = ""):
+            assert workspace == "artel-main"
+            return [cmux_mod.CmuxSurfaceRecord(id="sf-1", title="dashboard", workspace=workspace)]
+
+        async def fake_surface_create(**kwargs):
+            raise AssertionError("surface_create should not be called when surface exists")
+
+        monkeypatch.setattr(cmux_mod, "surface_list_records", fake_surface_list_records)
+        monkeypatch.setattr(cmux_mod, "surface_create", fake_surface_create)
+
+        record = await cmux_mod.ensure_surface(title="dashboard", workspace="artel-main")
+
+        assert record is not None
+        assert record.id == "sf-1"
+        assert record.title == "dashboard"
+
+    @pytest.mark.asyncio
+    async def test_ensure_surface_creates_when_missing(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "/mock/cmux")
+
+        async def fake_surface_list_records(*, workspace: str = ""):
+            assert workspace == "artel-main"
+            return []
+
+        async def fake_surface_create(**kwargs):
+            assert kwargs == {
+                "title": "dashboard",
+                "command": "artel dashboard",
+                "cwd": "/srv/project",
+                "workspace": "artel-main",
+            }
+            return "sf-123"
+
+        monkeypatch.setattr(cmux_mod, "surface_list_records", fake_surface_list_records)
+        monkeypatch.setattr(cmux_mod, "surface_create", fake_surface_create)
+
+        record = await cmux_mod.ensure_surface(
+            title="dashboard",
+            command="artel dashboard",
+            cwd="/srv/project",
+            workspace="artel-main",
+        )
+
+        assert record is not None
+        assert record.id == "sf-123"
+        assert record.title == "dashboard"
+        assert record.workspace == "artel-main"
+
+    @pytest.mark.asyncio
+    async def test_ensure_artel_workspace_uses_default_name(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        async def fake_ensure_workspace(name: str):
+            assert name == cmux_mod.DEFAULT_ARTEL_WORKSPACE_NAME
+            return cmux_mod.CmuxWorkspaceRecord(id="ws-123", name=name)
+
+        monkeypatch.setattr(cmux_mod, "ensure_workspace", fake_ensure_workspace)
+
+        record = await cmux_mod.ensure_artel_workspace()
+
+        assert record is not None
+        assert record.id == "ws-123"
+        assert record.name == cmux_mod.DEFAULT_ARTEL_WORKSPACE_NAME
+
+    @pytest.mark.asyncio
+    async def test_ensure_artel_dashboard_surface_uses_expected_defaults(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        async def fake_ensure_surface(**kwargs):
+            assert kwargs == {
+                "title": cmux_mod.DEFAULT_ARTEL_DASHBOARD_SURFACE_TITLE,
+                "command": "artel web",
+                "cwd": "/srv/project",
+                "workspace": "ws-123",
+            }
+            return cmux_mod.CmuxSurfaceRecord(id="sf-dashboard", title=kwargs["title"], workspace="ws-123")
+
+        monkeypatch.setattr(cmux_mod, "ensure_surface", fake_ensure_surface)
+
+        record = await cmux_mod.ensure_artel_dashboard_surface(workspace="ws-123", cwd="/srv/project")
+
+        assert record is not None
+        assert record.id == "sf-dashboard"
+        assert record.title == cmux_mod.DEFAULT_ARTEL_DASHBOARD_SURFACE_TITLE
+
+    @pytest.mark.asyncio
+    async def test_ensure_artel_orchestrator_surface_uses_expected_defaults(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        async def fake_ensure_surface(**kwargs):
+            assert kwargs == {
+                "title": cmux_mod.DEFAULT_ARTEL_ORCHESTRATOR_SURFACE_TITLE,
+                "command": "artel",
+                "cwd": "/srv/project",
+                "workspace": "ws-123",
+            }
+            return cmux_mod.CmuxSurfaceRecord(id="sf-orchestrator", title=kwargs["title"], workspace="ws-123")
+
+        monkeypatch.setattr(cmux_mod, "ensure_surface", fake_ensure_surface)
+
+        record = await cmux_mod.ensure_artel_orchestrator_surface(workspace="ws-123", cwd="/srv/project")
+
+        assert record is not None
+        assert record.id == "sf-orchestrator"
+        assert record.title == cmux_mod.DEFAULT_ARTEL_ORCHESTRATOR_SURFACE_TITLE
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_artel_workspace_ensures_workspace_and_core_surfaces(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        calls: list[tuple[str, str]] = []
+
+        async def fake_ensure_artel_workspace(*, workspace_name: str = cmux_mod.DEFAULT_ARTEL_WORKSPACE_NAME):
+            calls.append(("workspace", workspace_name))
+            return cmux_mod.CmuxWorkspaceRecord(id="ws-123", name=workspace_name)
+
+        async def fake_ensure_artel_dashboard_surface(**kwargs):
+            calls.append(("dashboard", kwargs["workspace"]))
+            assert kwargs["title"] == "dashboard"
+            assert kwargs["command"] == "artel web"
+            assert kwargs["cwd"] == "/srv/project"
+            return cmux_mod.CmuxSurfaceRecord(id="sf-dashboard", title="dashboard", workspace=kwargs["workspace"])
+
+        async def fake_reuse_current_surface(**kwargs):
+            calls.append(("reuse", kwargs["workspace"]))
+            assert kwargs == {
+                "title": "orchestrator",
+                "workspace": "ws-123",
+            }
+            return cmux_mod.CmuxSurfaceRecord(id="sf-current", title="orchestrator", workspace="ws-123", current=True)
+
+        async def fake_ensure_artel_orchestrator_surface(**kwargs):
+            raise AssertionError("orchestrator surface should not be created when current surface is reused")
+
+        monkeypatch.setattr(cmux_mod, "ensure_artel_workspace", fake_ensure_artel_workspace)
+        monkeypatch.setattr(cmux_mod, "ensure_artel_dashboard_surface", fake_ensure_artel_dashboard_surface)
+        monkeypatch.setattr(cmux_mod, "reuse_current_surface", fake_reuse_current_surface)
+        monkeypatch.setattr(cmux_mod, "ensure_artel_orchestrator_surface", fake_ensure_artel_orchestrator_surface)
+        monkeypatch.setattr(cmux_mod, "workspace_id", lambda: "ws-123")
+
+        result = await cmux_mod.bootstrap_artel_workspace(cwd="/srv/project")
+
+        assert result.workspace is not None
+        assert result.workspace.id == "ws-123"
+        assert result.dashboard is not None
+        assert result.dashboard.id == "sf-dashboard"
+        assert result.orchestrator is not None
+        assert result.orchestrator.id == "sf-current"
+        assert calls == [
+            ("workspace", cmux_mod.DEFAULT_ARTEL_WORKSPACE_NAME),
+            ("dashboard", "ws-123"),
+            ("reuse", "ws-123"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_artel_workspace_falls_back_to_creating_orchestrator_surface(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        calls: list[tuple[str, str]] = []
+
+        async def fake_ensure_artel_workspace(*, workspace_name: str = cmux_mod.DEFAULT_ARTEL_WORKSPACE_NAME):
+            return cmux_mod.CmuxWorkspaceRecord(id="ws-123", name=workspace_name)
+
+        async def fake_ensure_artel_dashboard_surface(**kwargs):
+            calls.append(("dashboard", kwargs["workspace"]))
+            return cmux_mod.CmuxSurfaceRecord(id="sf-dashboard", title="dashboard", workspace=kwargs["workspace"])
+
+        async def fake_reuse_current_surface(**kwargs):
+            calls.append(("reuse", kwargs["workspace"]))
+            return None
+
+        async def fake_ensure_artel_orchestrator_surface(**kwargs):
+            calls.append(("orchestrator", kwargs["workspace"]))
+            assert kwargs["title"] == "orchestrator"
+            assert kwargs["command"] == "artel"
+            assert kwargs["cwd"] == "/srv/project"
+            return cmux_mod.CmuxSurfaceRecord(id="sf-orchestrator", title="orchestrator", workspace=kwargs["workspace"])
+
+        monkeypatch.setattr(cmux_mod, "ensure_artel_workspace", fake_ensure_artel_workspace)
+        monkeypatch.setattr(cmux_mod, "ensure_artel_dashboard_surface", fake_ensure_artel_dashboard_surface)
+        monkeypatch.setattr(cmux_mod, "reuse_current_surface", fake_reuse_current_surface)
+        monkeypatch.setattr(cmux_mod, "ensure_artel_orchestrator_surface", fake_ensure_artel_orchestrator_surface)
+        monkeypatch.setattr(cmux_mod, "workspace_id", lambda: "ws-123")
+
+        result = await cmux_mod.bootstrap_artel_workspace(cwd="/srv/project")
+
+        assert result.dashboard is not None
+        assert result.dashboard.id == "sf-dashboard"
+        assert result.orchestrator is not None
+        assert result.orchestrator.id == "sf-orchestrator"
+        assert calls == [
+            ("dashboard", "ws-123"),
+            ("reuse", "ws-123"),
+            ("orchestrator", "ws-123"),
         ]
 
 
@@ -303,6 +840,20 @@ class TestStatusFooter:
         footer.set_model("anthropic/claude-sonnet")
         text = str(footer.render())
         assert "anthropic/claude-sonnet" in text
+
+    def test_set_thinking_level_shows_next_to_model(self, monkeypatch):
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "")
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+
+        from worker_tui.app import StatusFooter
+
+        footer = StatusFooter()
+        footer.set_model("anthropic/claude-sonnet")
+        footer.set_thinking_level("high")
+        text = str(footer.render())
+        assert "anthropic/claude-sonnet [high]" in text
     def test_set_cwd_overrides_rendered_working_directory(self, monkeypatch):
         """set_cwd lets the footer render a remote/project-specific path."""
         import worker_core.cmux as cmux_mod
@@ -343,8 +894,58 @@ class TestStatusFooter:
         text = str(footer.render())
         assert "cmux" not in text
 
+    def test_set_activity_marks_footer_busy(self, monkeypatch):
+        """Footer renders an explicit busy/idle activity indicator."""
+        import worker_core.cmux as cmux_mod
+
+        monkeypatch.setattr(cmux_mod, "_CMUX_BIN", "")
+        monkeypatch.delenv("CMUX_WORKSPACE_ID", raising=False)
+
+        from worker_tui.app import StatusFooter
+
+        footer = StatusFooter()
+        footer.set_activity("thinking", busy=True)
+        assert "● thinking" in str(footer.render())
+
+        footer.set_activity("idle", busy=False)
+        rendered = str(footer.render())
+        assert "idle" in rendered
+        assert "● thinking" not in rendered
+
 
 # ── Bash !/!! tests ───────────────────────────────────────────────
+
+
+class TestCopyAssistantMessage:
+    def test_copy_last_assistant_message_uses_clipboard(self):
+        from worker_tui.app import MessageWidget, WorkerApp
+
+        app = WorkerApp()
+        app._assistant_message_history = [
+            MessageWidget("first", role="assistant"),
+            MessageWidget("final answer", role="assistant"),
+        ]
+
+        copied: list[str] = []
+        seen_messages: list[tuple[str, str]] = []
+        app.copy_to_clipboard = lambda text: copied.append(text)  # type: ignore[method-assign]
+        app._add_message = lambda content, role="assistant": seen_messages.append((content, role))  # type: ignore[method-assign]
+
+        app.action_copy_last_assistant_message()
+
+        assert copied == ["final answer"]
+        assert ("Copied last assistant message to clipboard.", "tool") in seen_messages
+
+    def test_copy_last_assistant_message_reports_empty_state(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+        app._add_message = lambda content, role="assistant": seen_messages.append((content, role))  # type: ignore[method-assign]
+
+        app.action_copy_last_assistant_message()
+
+        assert seen_messages == [("No assistant message available to copy.", "tool")]
 
 
 class TestBashPrefixParsing:
@@ -399,6 +1000,24 @@ class TestCollapsibleTracking:
         assert len(collapsibles) == 0
 
 
+class TestNewSessionCommand:
+    @pytest.mark.asyncio
+    async def test_new_alias_routes_to_clear(self, monkeypatch):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp()
+        called: list[str] = []
+
+        async def _fake_clear() -> None:
+            called.append("clear")
+
+        monkeypatch.setattr(app, "action_clear", _fake_clear)
+
+        await app._handle_command("/new")
+
+        assert called == ["clear"]
+
+
 def _tui_test_config():
     return SimpleNamespace(
         ui=SimpleNamespace(theme="dark"),
@@ -437,12 +1056,138 @@ class TestSlashCommandSuggestions:
 
         assert [match.value for match in matches] == ["/skill:debug"]
 
-    def test_matching_command_suggestions_hide_after_command_arguments(self):
+    def test_matching_command_suggestions_hide_for_unknown_argument_context(self):
         from worker_tui.app import WorkerApp
 
         app = WorkerApp(remote_url="ws://localhost:7432")
 
-        assert app._matching_command_suggestions("/model anthropic/claude") == []
+        assert app._matching_command_suggestions("/unknown something") == []
+
+    def test_matching_command_suggestions_include_thinking_levels(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+
+        matches = app._matching_command_suggestions("/thinking h")
+
+        assert [match.value for match in matches] == ["high"]
+        assert [match.completion for match in matches] == ["/thinking high"]
+
+    def test_matching_command_suggestions_include_model_providers(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+
+        matches = app._matching_command_suggestions("/model an")
+
+        assert [match.value for match in matches] == ["anthropic/", "vertex_anthropic/"]
+        assert [match.completion for match in matches] == ["/model anthropic/", "/model vertex_anthropic/"]
+
+    def test_matching_command_suggestions_include_loaded_models(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._model_autocomplete_refs = [
+            "anthropic/claude-sonnet-4-20250514",
+            "openai/gpt-4.1",
+        ]
+        app._model_autocomplete_descriptions = {
+            "anthropic/claude-sonnet-4-20250514": "Anthropic — Claude Sonnet 4, 200k ctx",
+            "openai/gpt-4.1": "OpenAI — GPT-4.1, 128k ctx",
+        }
+        app._model_autocomplete_loaded = True
+
+        matches = app._matching_command_suggestions("/model anthropic/cl")
+
+        assert [match.value for match in matches] == ["anthropic/claude-sonnet-4-20250514"]
+        assert [match.completion for match in matches] == ["/model anthropic/claude-sonnet-4-20250514"]
+
+    def test_matching_command_suggestions_model_prefers_current_provider_and_substring(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._provider_model = "openai/gpt-4.1"
+        app._model_autocomplete_refs = [
+            "anthropic/gpt-helper",
+            "openai/gpt-4.1",
+            "openai/gpt-4.1-mini",
+        ]
+        app._model_autocomplete_descriptions = {
+            "anthropic/gpt-helper": "Anthropic — GPT Helper",
+            "openai/gpt-4.1": "OpenAI — GPT-4.1",
+            "openai/gpt-4.1-mini": "OpenAI — GPT-4.1 Mini",
+        }
+        app._model_autocomplete_loaded = True
+
+        provider_matches = app._matching_command_suggestions("/model gpt")
+        model_matches = app._matching_command_suggestions("/model openai/gpt")
+
+        assert [match.value for match in provider_matches] == [
+            "openai/",
+            "anthropic/",
+        ]
+        assert [match.value for match in model_matches] == [
+            "openai/gpt-4.1",
+            "openai/gpt-4.1-mini",
+        ]
+
+    def test_matching_command_suggestions_include_resume_entries(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._resume_autocomplete_suggestions = [
+            SimpleNamespace(value="1", completion="/resume 1", search_text="1 remote-1 remote issue openai/gpt-4.1 /srv/project"),
+            SimpleNamespace(value="remote-1", completion="/resume remote-1", search_text="remote-1 1 remote issue openai/gpt-4.1 /srv/project"),
+        ]
+        app._resume_autocomplete_loaded = True
+
+        matches = app._matching_command_suggestions("/resume r")
+
+        assert [match.value for match in matches] == ["1", "remote-1"]
+
+    def test_matching_command_suggestions_resume_searches_by_title(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._resume_autocomplete_suggestions = [
+            SimpleNamespace(value="1", completion="/resume 1", search_text="1 remote-1 billing issue openai/gpt-4.1 /srv/project"),
+            SimpleNamespace(value="remote-1", completion="/resume remote-1", search_text="remote-1 1 billing issue openai/gpt-4.1 /srv/project"),
+        ]
+        app._resume_autocomplete_loaded = True
+
+        matches = app._matching_command_suggestions("/resume bill")
+
+        assert [match.value for match in matches] == ["1", "remote-1"]
+
+    def test_matching_command_suggestions_include_image_remove_indexes(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._pending_attachments = [
+            SimpleNamespace(path="/tmp/a.png", name="a.png"),
+            SimpleNamespace(path="/tmp/b.png", name="b.png"),
+        ]
+
+        matches = app._matching_command_suggestions("/image-remove 2")
+
+        assert [match.value for match in matches] == ["2"]
+        assert [match.completion for match in matches] == ["/image-remove 2"]
+
+    def test_matching_command_suggestions_include_real_fork_indexes(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._fork_autocomplete_suggestions = [
+            SimpleNamespace(value="0", completion="/fork 0", search_text="0 user hello world"),
+            SimpleNamespace(value="7", completion="/fork 7", search_text="7 assistant fix bug in parser"),
+            SimpleNamespace(value="12", completion="/fork 12", search_text="12 user add tests"),
+        ]
+        app._fork_autocomplete_loaded = True
+
+        matches = app._matching_command_suggestions("/fork pars")
+
+        assert [match.value for match in matches] == ["7"]
+        assert [match.completion for match in matches] == ["/fork 7"]
 
     def test_matching_command_suggestions_include_providers_command(self):
         from worker_tui.app import WorkerApp
@@ -452,6 +1197,28 @@ class TestSlashCommandSuggestions:
         matches = app._matching_command_suggestions("/prov")
 
         assert [match.value for match in matches] == ["/providers"]
+
+    def test_matching_command_suggestions_mark_current_model_theme_and_thinking(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._provider_model = "openai/gpt-4.1"
+        app._active_theme = "dracula"
+        app._model_autocomplete_refs = ["openai/gpt-4.1", "openai/gpt-4.1-mini"]
+        app._model_autocomplete_descriptions = {
+            "openai/gpt-4.1": "OpenAI — GPT-4.1",
+            "openai/gpt-4.1-mini": "OpenAI — GPT-4.1 Mini",
+        }
+        app._model_autocomplete_loaded = True
+        app._session = SimpleNamespace(thinking_level="high")
+
+        model_matches = app._matching_command_suggestions("/model openai/gpt")
+        theme_matches = app._matching_command_suggestions("/theme dr")
+        thinking_matches = app._matching_command_suggestions("/thinking h")
+
+        assert [match.current for match in model_matches] == [True, False]
+        assert [match.current for match in theme_matches] == [True]
+        assert [match.current for match in thinking_matches] == [True]
 
 
 class TestProviderSetupFormatting:
@@ -476,9 +1243,13 @@ class TestProviderSetupFormatting:
         assert by_id["anthropic"].hint == "run /connect anthropic or set ANTHROPIC_API_KEY"
         assert by_id["kimi"].name == "Kimi For Coding"
         assert by_id["kimi"].hint == "set MOONSHOT_API_KEY or [providers.kimi].api_key"
+        assert by_id["minimax"].name == "MiniMax"
+        assert by_id["minimax"].hint == "set MINIMAX_API_KEY or [providers.minimax].api_key"
         assert by_id["ollama"].status == "keyless"
         assert "start the service" in by_id["ollama"].hint
         assert by_id["lmstudio"].status == "keyless"
+        assert by_id["zai"].name == "Z.ai"
+        assert by_id["zai"].hint == "set ZHIPU_API_KEY or [providers.zai].api_key"
 
     def test_format_provider_setup_entries_renders_supported_provider_list(self):
         from worker_tui.app import ProviderSetupEntry, format_provider_setup_entries
@@ -519,6 +1290,10 @@ class TestProviderCommandDispatch:
         app._list_providers.assert_awaited_once()
 
 class TestPermissionRequests:
+    def test_worker_app_title_is_artel(self):
+        from worker_tui.app import WorkerApp
+
+        assert WorkerApp.TITLE == "Artel"
     @pytest.mark.asyncio
     async def test_permission_requests_are_queued_until_resolved(self, monkeypatch):
         from worker_tui.app import WorkerApp
@@ -564,11 +1339,196 @@ class TestPermissionRequests:
 
         assert await second == "deny"
 
+    @pytest.mark.asyncio
+    async def test_ask_permission_notifies_cmux_with_artel_branding(self, monkeypatch):
+        import worker_tui.app as tui_app
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        set_status_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        notify_calls: list[tuple[str, str, str | None]] = []
+
+        async def fake_set_status(*args, **kwargs):
+            set_status_calls.append((args, kwargs))
+
+        async def fake_notify(title: str, subtitle: str = "", body: str | None = None):
+            notify_calls.append((title, subtitle, body))
+
+        monkeypatch.setattr(tui_app.cmux, "set_status", fake_set_status)
+        monkeypatch.setattr(tui_app.cmux, "notify", fake_notify)
+        monkeypatch.setattr(app, "_request_permission_decision", AsyncMock(return_value="once"))
+
+        allowed = await app._ask_permission("bash", {"command": "pwd"})
+
+        assert allowed is True
+        assert set_status_calls == [
+            (
+                ("state", "permission: bash"),
+                {"icon": "lock", "color": "#fab387"},
+            )
+        ]
+        assert notify_calls == [("Artel", "Permission required: bash", None)]
+
+
+class TestPromptAndSkillHints:
+    def test_empty_prompts_hint_prefers_artel_paths(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp()
+        app._prompts = {}
+        seen_messages: list[tuple[str, str]] = []
+        app._add_message = (  # type: ignore[method-assign]
+            lambda content, role="assistant": seen_messages.append((content, role))
+        )
+
+        app._cmd_prompts()
+
+        assert seen_messages == [
+            (
+                "No prompt templates found.\n"
+                "Place .md files in ~/.config/artel/prompts/ or .artel/prompts/.\n"
+                "Legacy Worker prompt paths are still supported.",
+                "tool",
+            )
+        ]
+
+    def test_empty_skills_hint_prefers_artel_paths(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp()
+        app._skills = {}
+        seen_messages: list[tuple[str, str]] = []
+        app._add_message = (  # type: ignore[method-assign]
+            lambda content, role="assistant": seen_messages.append((content, role))
+        )
+
+        app._cmd_skills_list()
+
+        assert seen_messages == [
+            (
+                "No skills found.\n"
+                "Place .md files in ~/.config/artel/skills/ or .artel/skills/.\n"
+                "Legacy Worker skill paths are still supported.",
+                "tool",
+            )
+        ]
+
+
+class TestBoardSidebar:
+    @pytest.mark.asyncio
+    async def test_sidebar_toggle_and_board_commands(self, monkeypatch, tmp_path):
+        from worker_tui.app import BoardSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        (tmp_path / ".artel" / "tasks.md").write_text("- [ ] Existing task\n", encoding="utf-8")
+        (tmp_path / ".artel" / "operator-notes.md").write_text("remember this\n", encoding="utf-8")
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+
+        app = WorkerApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            sidebar = app.query_one("#board-sidebar", BoardSidebar)
+            assert not sidebar.has_class("visible")
+
+            app.action_toggle_sidebar()
+            await pilot.pause()
+            assert sidebar.has_class("visible")
+
+            await app._handle_command("/tasks")
+            await app._handle_command("/notes")
+            await app._handle_command("/task-add New task")
+            await app._handle_command("/task-done 1")
+            await pilot.pause()
+
+            assert "New task" in sidebar.tasks_text()
+            assert "remember this" in sidebar.notes_text()
+            rendered = (tmp_path / ".artel" / "tasks.md").read_text(encoding="utf-8")
+            assert "- [x] Existing task" in rendered
+            assert "- [ ] New task" in rendered
+
+    @pytest.mark.asyncio
+    async def test_notes_open_focuses_notes_editor(self, monkeypatch, tmp_path):
+        from textual.widgets import TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+
+        app = WorkerApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await app._handle_command("/notes-open")
+            await pilot.pause()
+            notes_editor = app.query_one("#notes-editor", TextArea)
+            assert app._sidebar_visible is True
+
+    @pytest.mark.asyncio
+    async def test_notes_editor_debounced_save_creates_file_readable_by_tool(self, monkeypatch, tmp_path):
+        from textual.widgets import Static, TextArea
+        from worker_core.tools.builtins import ReadOperatorNotesTool
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+
+        app = WorkerApp()
+        app._board_save_delay = 0.05
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.action_focus_notes()
+            await pilot.pause()
+            notes_editor = app.query_one("#notes-editor", TextArea)
+            notes_editor.load_text("remember to revisit task UX")
+            await pilot.pause()
+            await asyncio.sleep(0.08)
+            await pilot.pause()
+            status = app.query_one("#board-status", Static)
+            assert str(status.render()) == "Operator notes saved"
+
+        notes_path = tmp_path / ".artel" / "operator-notes.md"
+        assert notes_path.exists()
+        assert notes_path.read_text(encoding="utf-8").strip() == "remember to revisit task UX"
+
+        tool = ReadOperatorNotesTool(str(tmp_path))
+        rendered = await tool.execute()
+        assert "1|remember to revisit task UX" in rendered
+
+    @pytest.mark.asyncio
+    async def test_poll_board_state_refreshes_sidebar_after_external_task_change(self, monkeypatch, tmp_path):
+        from worker_tui.app import BoardSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        (tmp_path / ".artel" / "tasks.md").write_text("- [ ] Initial\n", encoding="utf-8")
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+
+        app = WorkerApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            sidebar = app.query_one("#board-sidebar", BoardSidebar)
+            app.action_toggle_sidebar()
+            await pilot.pause()
+            assert "Initial" in sidebar.tasks_text()
+
+            (tmp_path / ".artel" / "tasks.md").write_text("- [ ] Initial\n- [ ] External update\n", encoding="utf-8")
+            await app._poll_board_state_once()
+            await pilot.pause()
+
+            assert "External update" in sidebar.tasks_text()
+
 
 class TestTuiAutocompleteIntegration:
     @pytest.mark.asyncio
     async def test_input_is_focused_on_mount(self, monkeypatch):
-        from textual.widgets import Input
+        from textual.widgets import TextArea
         from worker_tui.app import WorkerApp
 
         _patch_tui_test_context(monkeypatch)
@@ -577,12 +1537,12 @@ class TestTuiAutocompleteIntegration:
         async with app.run_test() as pilot:
             await pilot.pause()
 
-            input_bar = app.query_one("#input-bar", Input)
+            input_bar = app.query_one("#input-bar", TextArea)
             assert input_bar.has_focus
 
     @pytest.mark.asyncio
     async def test_slash_command_suggestions_filter_and_tab_complete(self, monkeypatch):
-        from textual.widgets import Input, OptionList
+        from textual.widgets import OptionList, TextArea
         from worker_tui.app import WorkerApp
 
         _patch_tui_test_context(
@@ -599,8 +1559,8 @@ class TestTuiAutocompleteIntegration:
         async with app.run_test() as pilot:
             await pilot.pause()
 
-            input_bar = app.query_one("#input-bar", Input)
-            input_bar.value = "/m"
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/m")
             await pilot.pause()
 
             suggestions = app.query_one("#command-suggestions", OptionList)
@@ -617,12 +1577,378 @@ class TestTuiAutocompleteIntegration:
             await pilot.press("tab")
             await pilot.pause()
 
-            assert input_bar.value == "/model"
+            assert input_bar.text == "/model"
             assert not suggestions.has_class("visible")
 
     @pytest.mark.asyncio
+    async def test_thinking_argument_suggestions_tab_complete(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/thinking h")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == ["/thinking high"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == "/thinking high"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_model_argument_suggestions_tab_complete(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._model_autocomplete_refs = ["anthropic/claude-sonnet-4-20250514"]
+        app._model_autocomplete_descriptions = {
+            "anthropic/claude-sonnet-4-20250514": "Anthropic — Claude Sonnet 4, 200k ctx"
+        }
+        app._model_autocomplete_loaded = True
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/model anthropic/cl")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == ["/model anthropic/claude-sonnet-4-20250514"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == "/model anthropic/claude-sonnet-4-20250514"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_cd_argument_suggestions_tab_complete(self, monkeypatch, tmp_path):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "scripts").mkdir()
+        monkeypatch.chdir(tmp_path)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/cd s")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == [
+                f"/cd {tmp_path / 'scripts'}",
+                f"/cd {tmp_path / 'src'}",
+            ]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == f"/cd {tmp_path / 'scripts'}"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_cd_argument_suggestions_quote_paths_with_spaces(self, monkeypatch, tmp_path):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        spaced = tmp_path / "my project"
+        spaced.mkdir()
+        monkeypatch.chdir(tmp_path)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/cd my")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == [f"/cd '{spaced}'"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == f"/cd '{spaced}'"
+
+    @pytest.mark.asyncio
+    async def test_resume_argument_suggestions_tab_complete(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._resume_autocomplete_suggestions = [
+            SimpleNamespace(
+                value="1",
+                description="Remote issue",
+                completion="/resume 1",
+                search_text="1 remote-1 remote issue openai/gpt-4.1 /srv/project",
+            ),
+            SimpleNamespace(
+                value="remote-1",
+                description="Remote issue",
+                completion="/resume remote-1",
+                search_text="remote-1 1 remote issue openai/gpt-4.1 /srv/project",
+            ),
+        ]
+        app._resume_autocomplete_loaded = True
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/resume r")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == ["/resume 1", "/resume remote-1"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == "/resume 1"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_image_argument_suggestions_tab_complete(self, monkeypatch, tmp_path):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png")
+        (tmp_path / "notes.txt").write_text("hello", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/image s")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == [f"/image {image_path}"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == f"/image {image_path}"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_image_argument_suggestions_quote_paths_with_spaces(self, monkeypatch, tmp_path):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        image_path = tmp_path / "screen shot.png"
+        image_path.write_bytes(b"png")
+        monkeypatch.chdir(tmp_path)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/image scr")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == [f"/image '{image_path}'"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == f"/image '{image_path}'"
+
+    @pytest.mark.asyncio
+    async def test_image_remove_argument_suggestions_tab_complete(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._pending_attachments = [
+            SimpleNamespace(path="/tmp/a.png", mime_type="image/png", name="a.png"),
+            SimpleNamespace(path="/tmp/b.png", mime_type="image/png", name="b.png"),
+        ]
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/image-remove 2")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == ["/image-remove 2"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == "/image-remove 2"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_browser_argument_suggestions_tab_complete(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/browser ht")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == ["/browser https://", "/browser http://"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == "/browser https://"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_fork_argument_suggestions_tab_complete(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._fork_autocomplete_suggestions = [
+            SimpleNamespace(
+                value="0",
+                description="[user] hello world",
+                completion="/fork 0",
+                search_text="0 user hello world",
+            ),
+            SimpleNamespace(
+                value="7",
+                description="[assistant] fix bug in parser",
+                completion="/fork 7",
+                search_text="7 assistant fix bug in parser",
+            ),
+        ]
+        app._fork_autocomplete_loaded = True
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/fork pars")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            assert suggestions.has_class("visible")
+            suggestion_ids = [
+                suggestions.get_option_at_index(i).id
+                for i in range(suggestions.option_count)
+            ]
+            assert suggestion_ids == ["/fork 7"]
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert input_bar.text == "/fork 7"
+            assert not suggestions.has_class("visible")
+
+    @pytest.mark.asyncio
+    async def test_current_value_is_marked_in_option_labels(self, monkeypatch):
+        from textual.widgets import OptionList, TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._active_theme = "dracula"
+
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/theme dr")
+            await pilot.pause()
+
+            suggestions = app.query_one("#command-suggestions", OptionList)
+            prompt = suggestions.get_option_at_index(0).prompt
+            assert str(prompt).startswith("✓ dracula —")
+
+    @pytest.mark.asyncio
     async def test_slash_command_suggestions_navigate_past_first_five_items(self, monkeypatch):
-        from textual.widgets import Input, OptionList
+        from textual.widgets import OptionList, TextArea
         from worker_tui.app import WorkerApp
 
         _patch_tui_test_context(monkeypatch)
@@ -631,8 +1957,8 @@ class TestTuiAutocompleteIntegration:
         async with app.run_test(size=(80, 18)) as pilot:
             await pilot.pause()
 
-            input_bar = app.query_one("#input-bar", Input)
-            input_bar.value = "/"
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.load_text("/")
             await pilot.pause()
 
             suggestions = app.query_one("#command-suggestions", OptionList)
@@ -650,12 +1976,117 @@ class TestTuiAutocompleteIntegration:
             await pilot.press("tab")
             await pilot.pause()
 
-            assert input_bar.value == visible_commands[5]
+            assert input_bar.text == visible_commands[5]
+
+    @pytest.mark.asyncio
+    async def test_multiline_composer_submits_full_text_and_clears_input(self, monkeypatch):
+        from textual.widgets import TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        sent: list[str] = []
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": None)
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_run_remote", lambda text: sent.append(text))
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.focus()
+            input_bar.load_text("line 1\nline 2")
+
+            await app.action_submit_composer()
+            await pilot.pause()
+
+            assert sent == ["line 1\nline 2"]
+            assert input_bar.text == ""
+
+    @pytest.mark.asyncio
+    async def test_enter_submits_composer(self, monkeypatch):
+        from textual.widgets import TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        sent: list[str] = []
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": None)
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_run_remote", lambda text: sent.append(text))
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.focus()
+            input_bar.load_text("hello")
+            input_bar.move_cursor((0, len("hello")))
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert sent == ["hello"]
+            assert input_bar.text == ""
+
+    @pytest.mark.asyncio
+    async def test_shift_enter_inserts_newline_without_submit(self, monkeypatch):
+        from textual.widgets import TextArea
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        sent: list[str] = []
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": None)
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_run_remote", lambda text: sent.append(text))
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            input_bar = app.query_one("#input-bar", TextArea)
+            input_bar.focus()
+            input_bar.load_text("hello")
+            input_bar.move_cursor((0, len("hello")))
+
+            await pilot.press("shift+enter")
+            await pilot.pause()
+
+            assert sent == []
+            assert input_bar.text == "hello\n"
+
+    @pytest.mark.asyncio
+    async def test_pending_attachments_bar_becomes_visible(self, monkeypatch, tmp_path):
+        from worker_ai.models import ImageAttachment
+        from worker_tui.app import PendingAttachmentsBar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": None)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bar = app.query_one("#pending-attachments", PendingAttachmentsBar)
+            assert not bar.has_class("visible")
+
+            app._queue_attachment(
+                ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+            )
+            await pilot.pause()
+
+            assert bar.has_class("visible")
+            rendered = str(bar.render())
+            assert "shot.png" in rendered
+            assert "image/png" in rendered
 
     @pytest.mark.asyncio
     async def test_permission_panel_is_inline_and_restores_input_focus(self, monkeypatch):
         from textual.containers import Vertical
-        from textual.widgets import Input
+        from textual.widgets import TextArea
         from worker_tui.app import PermissionPanel, WorkerApp
 
         _patch_tui_test_context(monkeypatch)
@@ -671,7 +2102,7 @@ class TestTuiAutocompleteIntegration:
 
             panel = app.query_one("#permission-panel", PermissionPanel)
             main = app.query_one("#main-content", Vertical)
-            input_bar = app.query_one("#input-bar", Input)
+            input_bar = app.query_one("#input-bar", TextArea)
 
             assert list(main.children)[0] is panel
             assert panel.has_class("visible")
@@ -731,6 +2162,24 @@ class TestRemoteTransportHelpers:
         assert isinstance(payload["session_id"], str)
         assert payload["session_id"]
 
+    def test_remote_payload_includes_attachments(self, tmp_path):
+        from worker_ai.models import ImageAttachment
+        from worker_tui.app import WorkerApp
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp(remote_url="ws://localhost:7432", auth_token="tok_123")
+        payload = app._remote_message_payload(
+            "hello",
+            attachments=[
+                ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+            ],
+        )
+        assert payload["attachments"] == [
+            {"path": str(image_path), "mime_type": "image/png", "name": "shot.png"}
+        ]
+
 
 class TestManagedLocalServer:
     @pytest.mark.asyncio
@@ -739,7 +2188,7 @@ class TestManagedLocalServer:
 
         handle = local_server_mod.LocalServerHandle(
             remote_url="ws://127.0.0.1:9011",
-            auth_token="wkr_existing",
+            auth_token="artel_existing",
             project_dir=str(tmp_path),
             pid=777,
         )
@@ -775,7 +2224,7 @@ class TestManagedLocalServer:
         import worker_tui.local_server as local_server_mod
 
         config = SimpleNamespace(
-            server=SimpleNamespace(auth_token="wkr_configured", port=7432),
+            server=SimpleNamespace(auth_token="artel_configured", port=7432),
         )
         started: dict[str, object] = {}
 
@@ -807,19 +2256,108 @@ class TestManagedLocalServer:
         handle = await local_server_mod.ensure_managed_local_server(str(tmp_path))
 
         assert handle.remote_url == "ws://127.0.0.1:9011"
-        assert handle.auth_token == "wkr_configured"
+        assert handle.auth_token == "artel_configured"
         assert handle.project_dir == str(tmp_path)
         assert handle.pid == 4321
-        assert started["command"] == local_server_mod._server_command(9011, "wkr_configured")
+        assert started["command"] == local_server_mod._server_command(9011, "artel_configured")
         assert started["kwargs"]["cwd"] == str(tmp_path)
         assert started["kwargs"]["start_new_session"] is True
-        registry = json.loads((tmp_path / ".worker" / "server.json").read_text())
+        registry = json.loads((tmp_path / ".artel" / "server.json").read_text())
         assert registry["remote_url"] == handle.remote_url
         assert registry["auth_token"] == handle.auth_token
         assert registry["pid"] == handle.pid
 
+    @pytest.mark.asyncio
+    async def test_restart_managed_local_server_kills_existing_pid_and_restarts(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import worker_tui.local_server as local_server_mod
+
+        existing = local_server_mod.LocalServerHandle(
+            remote_url="ws://127.0.0.1:9011",
+            auth_token="artel_existing",
+            project_dir=str(tmp_path),
+            pid=777,
+        )
+        local_server_mod._save_registry(existing)
+        killed: list[tuple[int, int]] = []
+        restarted = local_server_mod.LocalServerHandle(
+            remote_url="ws://127.0.0.1:9012",
+            auth_token="artel_new",
+            project_dir=str(tmp_path),
+            pid=888,
+        )
+
+        def fake_kill(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+
+        async def fake_ensure(project_dir: str | None = None, ensure_tray: bool = True):
+            assert project_dir == str(tmp_path)
+            return restarted
+
+        monkeypatch.setattr(local_server_mod.os, "kill", fake_kill)
+        monkeypatch.setattr(local_server_mod, "ensure_managed_local_server", fake_ensure)
+        monkeypatch.setattr(local_server_mod, "_managed_server_processes", lambda project_dir: [])
+
+        handle = await local_server_mod.restart_managed_local_server(str(tmp_path))
+
+        assert handle == restarted
+        assert killed == [(777, local_server_mod.signal.SIGTERM)]
+        assert not (tmp_path / ".artel" / "server.json").exists()
+
 
 class TestRemoteModeCommandRouting:
+    @pytest.mark.asyncio
+    async def test_server_restart_command_restarts_local_managed_server(self, monkeypatch):
+        import worker_tui.app as tui_app
+        from worker_tui.app import WorkerApp
+
+        restarted = SimpleNamespace(remote_url="ws://127.0.0.1:9999", auth_token="artel_new")
+        calls: list[str] = []
+
+        async def fake_restart(project_dir: str, ensure_tray: bool = True):
+            calls.append(project_dir)
+            return restarted
+
+        async def fake_sync(self):
+            calls.append("sync")
+
+        monkeypatch.setattr(tui_app, "restart_managed_local_server", fake_restart)
+        monkeypatch.setattr(WorkerApp, "_sync_remote_session_state", fake_sync)
+
+        app = WorkerApp(remote_url="ws://127.0.0.1:7432", auth_token="old")
+        messages: list[tuple[str, str]] = []
+        app._add_message = lambda content, role="assistant": messages.append((content, role))  # type: ignore[method-assign]
+
+        await app._cmd_server_restart()
+
+        assert calls[0]
+        assert calls[1] == "sync"
+        assert app.remote_url == "ws://127.0.0.1:9999"
+        assert app.auth_token == "artel_new"
+        assert app._remote_control_client is None
+        assert messages[-1] == (
+            "Managed local Artel server restarted: ws://127.0.0.1:9999",
+            "tool",
+        )
+
+    @pytest.mark.asyncio
+    async def test_server_restart_command_rejects_non_local_remote(self):
+        from worker_tui.app import WorkerApp
+
+        app = WorkerApp(remote_url="ws://example.com:7432", auth_token="tok")
+        messages: list[tuple[str, str]] = []
+        app._add_message = lambda content, role="assistant": messages.append((content, role))  # type: ignore[method-assign]
+
+        await app._cmd_server_restart()
+
+        assert messages[-1] == (
+            "Server restart is only supported for local managed Artel servers.",
+            "error",
+        )
+
     @pytest.mark.asyncio
     async def test_sync_remote_session_state_updates_footer_with_remote_project(self):
         from worker_tui.app import WorkerApp
@@ -1488,7 +3026,11 @@ class TestRemoteModeCommandRouting:
             run=lambda text: _events(
                 [
                     AgentEvent(type=AgentEventType.REASONING_DELTA, content="pre-tool "),
-                    AgentEvent(type=AgentEventType.TOOL_CALL, tool_name="read", tool_args={"path": "x"}),
+                    AgentEvent(
+                        type=AgentEventType.TOOL_CALL,
+                        tool_name="read",
+                        tool_args={"path": "x"},
+                    ),
                     AgentEvent(type=AgentEventType.TOOL_RESULT, content="ok"),
                     AgentEvent(type=AgentEventType.REASONING_DELTA, content="post-tool"),
                     AgentEvent(type=AgentEventType.TEXT_DELTA, content="done"),
@@ -1504,6 +3046,8 @@ class TestRemoteModeCommandRouting:
         reasoning_blocks: list[str] = []
         assistant_messages: list[str] = []
         tool_messages: list[str] = []
+        log_calls: list[tuple[str, str, str]] = []
+        notify_calls: list[tuple[str, str, str | None]] = []
 
         class _StreamingWidget:
             def __init__(self, sink: list[str]):
@@ -1542,17 +3086,29 @@ class TestRemoteModeCommandRouting:
         async def _noop(*args, **kwargs):
             return None
 
+        async def _log(message: str, level: str = "info", source: str = "") -> None:
+            log_calls.append((message, level, source))
+
+        async def _notify(
+            title: str,
+            subtitle: str = "",
+            body: str | None = None,
+        ) -> None:
+            notify_calls.append((title, subtitle, body))
+
         import worker_tui.app as tui_app
 
         monkeypatch.setattr(tui_app.cmux, "set_status", _noop)
-        monkeypatch.setattr(tui_app.cmux, "notify", _noop)
+        monkeypatch.setattr(tui_app.cmux, "notify", _notify)
         monkeypatch.setattr(tui_app.cmux, "set_progress", _noop)
-        monkeypatch.setattr(tui_app.cmux, "log", _noop)
+        monkeypatch.setattr(tui_app.cmux, "log", _log)
 
         await app._run_local.__wrapped__(app, "hello")
 
         assert reasoning_blocks == ["pre-tool ", "post-tool"]
         assert assistant_messages == ["done"]
+        assert ("tool: read", "info", "artel") in log_calls
+        assert notify_calls == [("Artel", "Task complete", None)]
 
     @pytest.mark.asyncio
     async def test_run_remote_creates_new_reasoning_block_after_tool_call(self, monkeypatch):
@@ -1627,6 +3183,47 @@ class TestRemoteModeCommandRouting:
         assert assistant_messages == ["done"]
 
     @pytest.mark.asyncio
+    async def test_run_remote_refreshes_board_on_board_event(self, monkeypatch):
+        from worker_tui.app import WorkerApp
+
+        class _WebSocket:
+            def __init__(self, messages: list[dict[str, object]]):
+                self._messages = [json.dumps(message) for message in messages]
+
+            async def send(self, raw: str) -> None:
+                pass
+
+            def __aiter__(self):
+                self._iter = iter(self._messages)
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self._iter)
+                except StopIteration as exc:
+                    raise StopAsyncIteration from exc
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._ws = _WebSocket(
+            [
+                {"type": "board_event", "event": "task_added", "payload": {"task_id": 4, "title": "refresh board"}},
+                {"type": "done"},
+            ]
+        )
+
+        loaded: list[str] = []
+        app._load_board_state = AsyncMock(side_effect=lambda: loaded.append("loaded"))  # type: ignore[method-assign]
+        app._add_message = lambda content, role="assistant": None  # type: ignore[method-assign]
+        app._add_tool_message = lambda content: None  # type: ignore[method-assign]
+        app.query_one = lambda selector, _cls=None: SimpleNamespace(update_usage=lambda *args, **kwargs: None)  # type: ignore[method-assign]
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_scroll_to_bottom", lambda: None)
+
+        await app._run_remote.__wrapped__(app, "hello")
+
+        assert loaded == ["loaded"]
+
+    @pytest.mark.asyncio
     async def test_handle_remote_permission_request_sends_selected_decision(self):
         import json
 
@@ -1665,6 +3262,244 @@ class TestRemoteModeCommandRouting:
         ]
 
     @pytest.mark.asyncio
+    async def test_busy_local_input_is_queued_as_steering(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp()
+        steer_calls: list[str] = []
+        user_messages: list[tuple[str, str]] = []
+        app._session = SimpleNamespace(steer=lambda text: steer_calls.append(text))
+        app._run_busy = True
+        monkeypatch.setattr(app, "_command_menu_visible", lambda: False)
+        monkeypatch.setattr(app, "_hide_command_menu", lambda: None)
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": user_messages.append((content, role)))
+
+        event = SimpleNamespace(value="please change approach", input=SimpleNamespace(value="please change approach"))
+        await app.on_input_submitted(event)
+
+        assert steer_calls == ["please change approach"]
+        assert ("please change approach", "user") in user_messages
+        assert ("Steering queued.", "tool") in user_messages
+
+    @pytest.mark.asyncio
+    async def test_busy_remote_input_is_sent_as_steering(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp(remote_url="ws://localhost:7432")
+        app._run_busy = True
+        sent: list[dict[str, object]] = []
+        user_messages: list[tuple[str, str]] = []
+        monkeypatch.setattr(app, "_command_menu_visible", lambda: False)
+        monkeypatch.setattr(app, "_hide_command_menu", lambda: None)
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": user_messages.append((content, role)))
+
+        async def _fake_send_remote_event(payload: dict[str, object]) -> None:
+            sent.append(payload)
+
+        monkeypatch.setattr(app, "_send_remote_event", _fake_send_remote_event)
+
+        event = SimpleNamespace(value="please change approach", input=SimpleNamespace(value="please change approach"))
+        await app.on_input_submitted(event)
+
+        assert sent == [{"type": "steer", "content": "please change approach", "session_id": app._remote_session_id}]
+        assert ("Steering queued.", "tool") in user_messages
+
+    @pytest.mark.asyncio
+    async def test_image_command_adds_pending_attachment(self, monkeypatch, tmp_path):
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+
+        async def _supports_vision() -> bool:
+            return True
+
+        monkeypatch.setattr(app, "_model_supports_vision", _supports_vision)
+
+        await app._cmd_image(str(image_path))
+
+        assert len(app._pending_attachments) == 1
+        assert app._pending_attachments[0].path == str(image_path.resolve())
+        assert ("Attached image: shot.png", "tool") in seen_messages
+
+    @pytest.mark.asyncio
+    async def test_submit_with_attachment_passes_it_to_local_run(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+        captured: list[tuple[str, int]] = []
+        app._store = None
+        app._session = SimpleNamespace(session_id="s1")
+        app._pending_attachments = [SimpleNamespace(path=str(image_path), mime_type="image/png", name="shot.png")]
+
+        async def _supports_vision() -> bool:
+            return True
+
+        monkeypatch.setattr(app, "_model_supports_vision", _supports_vision)
+        monkeypatch.setattr(app, "_command_menu_visible", lambda: False)
+        monkeypatch.setattr(app, "_hide_command_menu", lambda: None)
+        monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
+        monkeypatch.setattr(app, "_clear_composer", lambda: None)
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+        monkeypatch.setattr(app, "_run_local", lambda text, attachments=None: captured.append((text, len(attachments or []))))
+
+        event = SimpleNamespace(value="see image", input=SimpleNamespace(value="see image"))
+        await app.on_input_submitted(event)
+
+        assert captured == [("see image", 1)]
+        assert app._pending_attachments == []
+        assert any(role == "user" and "shot.png" in content and "see image" in content for content, role in seen_messages)
+
+    @pytest.mark.asyncio
+    async def test_image_clear_removes_pending_attachments(self, monkeypatch, tmp_path):
+        from worker_ai.models import ImageAttachment
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+        app._pending_attachments = [
+            ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+        ]
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+
+        app._cmd_image_clear()
+
+        assert app._pending_attachments == []
+        assert ("Cleared 1 pending image attachment(s).", "tool") in seen_messages
+
+    @pytest.mark.asyncio
+    async def test_image_remove_deletes_selected_attachment(self, monkeypatch, tmp_path):
+        from worker_ai.models import ImageAttachment
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_a = tmp_path / "a.png"
+        image_b = tmp_path / "b.png"
+        image_a.write_bytes(b"a")
+        image_b.write_bytes(b"b")
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+        app._pending_attachments = [
+            ImageAttachment(path=str(image_a), mime_type="image/png", name="a.png"),
+            ImageAttachment(path=str(image_b), mime_type="image/png", name="b.png"),
+        ]
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+
+        app._cmd_image_remove("1")
+
+        assert [a.name for a in app._pending_attachments] == ["b.png"]
+        assert ("Removed pending image: a.png", "tool") in seen_messages
+
+    @pytest.mark.asyncio
+    async def test_image_paste_queues_clipboard_attachment(self, monkeypatch, tmp_path):
+        from worker_ai.models import ImageAttachment
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_path = tmp_path / "clipboard.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+
+        async def _supports_vision() -> bool:
+            return True
+
+        monkeypatch.setattr(app, "_model_supports_vision", _supports_vision)
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+        monkeypatch.setattr(
+            app,
+            "_paste_image_from_clipboard",
+            lambda: ImageAttachment(path=str(image_path), mime_type="image/png", name="clipboard.png"),
+        )
+
+        await app._cmd_image_paste()
+
+        assert len(app._pending_attachments) == 1
+        assert app._pending_attachments[0].name == "clipboard.png"
+        assert ("Attached image from clipboard: clipboard.png", "tool") in seen_messages
+
+    @pytest.mark.asyncio
+    async def test_image_paste_reports_clipboard_error(self, monkeypatch):
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+
+        async def _supports_vision() -> bool:
+            return True
+
+        monkeypatch.setattr(app, "_model_supports_vision", _supports_vision)
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+
+        def _raise() -> object:
+            raise RuntimeError("Clipboard image paste is unavailable")
+
+        monkeypatch.setattr(app, "_paste_image_from_clipboard", _raise)
+
+        await app._cmd_image_paste()
+
+        assert ("Clipboard image paste is unavailable", "error") in seen_messages
+
+    @pytest.mark.asyncio
+    async def test_pasted_image_path_is_queued_as_attachment(self, monkeypatch, tmp_path):
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        image_path = tmp_path / "drop.png"
+        image_path.write_bytes(b"png-data")
+
+        app = WorkerApp()
+        seen_messages: list[tuple[str, str]] = []
+
+        async def _supports_vision() -> bool:
+            return True
+
+        monkeypatch.setattr(app, "_model_supports_vision", _supports_vision)
+        monkeypatch.setattr(app, "_add_message", lambda content, role="assistant": seen_messages.append((content, role)))
+
+        handled = await app._maybe_handle_pasted_image_reference(str(image_path))
+
+        assert handled is True
+        assert len(app._pending_attachments) == 1
+        assert app._pending_attachments[0].name == "drop.png"
+        assert ("Attached pasted image reference(s): drop.png", "tool") in seen_messages
+
     async def test_double_bang_routes_to_remote_shell(self, monkeypatch):
         from types import SimpleNamespace
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -17,10 +18,14 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger("worker.models_catalog")
+logger = logging.getLogger("artel.models_catalog")
 
 _MODELS_URL = "https://models.dev/api.json"
-_CACHE_DIR = Path("~/.config/worker/cache").expanduser()
+_CACHE_DIR = Path(
+    os.environ.get("ARTEL_CONFIG_DIR")
+    or os.environ.get("WORKER_CONFIG_DIR")
+    or "~/.config/artel"
+).expanduser() / "cache"
 _CACHE_PATH = _CACHE_DIR / "models.json"
 _CACHE_TTL = 3600  # 1 hour
 

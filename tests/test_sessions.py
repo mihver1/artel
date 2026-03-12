@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from worker_ai.models import Message, Role, ToolCall, ToolResult
+from worker_ai.models import ImageAttachment, Message, Role, ToolCall, ToolResult
 from worker_core.sessions import SessionStore
 
 
@@ -96,6 +96,30 @@ async def test_message_with_tool_result(store):
     assert messages[0].tool_result.tool_call_id == "tc_1"
     assert messages[0].tool_result.content == "file contents here"
     assert messages[0].tool_result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_message_with_image_attachments_round_trip(store, tmp_path):
+    await store.create_session("s1", "test-model")
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"png-data")
+
+    msg = Message(
+        role=Role.USER,
+        content="See attached",
+        attachments=[
+            ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+        ],
+    )
+    await store.add_message("s1", msg)
+
+    messages = await store.get_messages("s1")
+    assert len(messages) == 1
+    assert messages[0].attachments is not None
+    assert len(messages[0].attachments) == 1
+    assert messages[0].attachments[0].path == str(image_path)
+    assert messages[0].attachments[0].mime_type == "image/png"
+    assert messages[0].attachments[0].name == "shot.png"
 
 
 @pytest.mark.asyncio

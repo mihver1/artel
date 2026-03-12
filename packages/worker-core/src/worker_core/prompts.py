@@ -1,8 +1,9 @@
 """Prompt template system — load .md files, {{variable}} substitution.
 
 Templates are loaded from:
-  1. ~/.config/worker/prompts/  (global)
-  2. .worker/prompts/           (project — overrides global)
+  1. ~/.config/artel/prompts/   (global)
+  2. .artel/prompts/            (project — overrides global)
+  3. Legacy Worker paths are still read as fallback during migration
 
 Each `.md` file becomes a `/filename` command in the TUI.
 Use `{{variable}}` placeholders for dynamic substitution.
@@ -13,15 +14,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from worker_core.config import CONFIG_DIR
+from worker_core.config import prompt_dirs
 
 
 def _prompts_dirs(project_dir: str = "") -> list[Path]:
     """Return prompt directories in priority order (global, then project)."""
-    dirs = [CONFIG_DIR / "prompts"]
-    if project_dir:
-        dirs.append(Path(project_dir) / ".worker" / "prompts")
-    return dirs
+    return prompt_dirs(project_dir)
 
 
 def load_prompts(project_dir: str = "") -> dict[str, str]:

@@ -1,4 +1,4 @@
-"""WebSocket server for remote Worker access."""
+"""WebSocket server for remote Artel access."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Any
 
 import websockets
 from websockets.asyncio.server import ServerConnection
-from worker_ai.models import Message
+from worker_ai.models import ImageAttachment, Message
 from worker_ai.oauth import (
     OAuthToken,
     RemoteOAuthChallenge,
@@ -26,34 +26,77 @@ from worker_ai.oauth import (
     start_remote_oauth_challenge,
 )
 from worker_core.agent import AgentEventType, AgentSession
+from worker_core.board import (
+    operator_notes_path,
+    read_project_board_file,
+    tasks_path,
+    write_project_board_file,
+)
 from worker_core.bootstrap import (
     bootstrap_runtime,
     create_agent_session_from_bootstrap,
     provider_requires_api_key,
 )
 from worker_core.config import (
+    CONFIG_DIR,
+    GLOBAL_CONFIG,
     ProviderConfig,
     WorkerConfig,
+    effective_global_config_path,
+    effective_project_config_path,
+    effective_server_provider_overlay_path,
+    generate_global_config,
+    generate_project_config,
     load_config,
     persist_server_auth_token,
+    project_agents_path,
+    project_config_path,
     resolve_model,
 )
 from worker_core.extensions import ExtensionContext, load_server_extensions_async
+from worker_core.extensions_admin import (
+    add_registry,
+    install_extension,
+    list_installed_extensions,
+    list_registry_entries,
+    remove_extension,
+    remove_registry,
+    search_extensions,
+    update_all_extensions,
+    update_extension,
+)
+from worker_core.orchestration import OrchestratorRuntime
+from worker_core.prompts import load_prompts, render_prompt
+from worker_core.rules import (
+    SessionRuleOverrides,
+    add_rule,
+    clear_session_rule_overrides,
+    delete_rule,
+    deserialize_session_rule_overrides,
+    list_rules,
+    reset_rule_for_session,
+    serialize_session_rule_overrides,
+    set_rule_enabled_for_session,
+    move_rule,
+    update_rule,
+)
 from worker_core.provider_resolver import (
     get_effective_model_info,
     get_effective_provider_catalog,
 )
 from worker_core.provider_setup import collect_provider_setup_entries
 from worker_core.sessions import SessionInfo, SessionStore
+from worker_core.skills import load_skills
 
 from worker_server.provider_overlay import (
+    is_rejected_placeholder_api_key,
     load_provider_overlay,
     merge_provider_overlay,
     save_provider_overlay,
     upsert_provider_overlay,
 )
 
-logger = logging.getLogger("worker.server")
+logger = logging.getLogger("artel.server")
 
 
 @dataclass
@@ -63,6 +106,7 @@ class ServerState:
     session_provider_models: dict[str, str] = field(default_factory=dict)
     session_projects: dict[str, str] = field(default_factory=dict)
     session_thinking_levels: dict[str, str] = field(default_factory=dict)
+    session_rule_overrides: dict[str, SessionRuleOverrides] = field(default_factory=dict)
     provider_overlay: dict[str, ProviderConfig] = field(default_factory=dict)
     pending_oauth: dict[str, RemoteOAuthChallenge] = field(default_factory=dict)
     permission_callbacks: dict[
@@ -231,12 +275,16 @@ class SessionController:
         with suppress(Exception):
             task.result()
 
-    async def start(self, content: str) -> None:
+    async def start(
+        self,
+        content: str,
+        attachments: list[ImageAttachment] | None = None,
+    ) -> None:
         async with self._start_lock:
             if self.running:
                 raise RuntimeError("Session is busy")
             self._run_task = asyncio.create_task(
-                self._run(content),
+                self._run(content, attachments=attachments),
                 name=f"worker-session-{self.session_id}",
             )
 
@@ -249,17 +297,29 @@ class SessionController:
             with suppress(asyncio.CancelledError, Exception):
                 await asyncio.shield(task)
 
-    async def _run(self, content: str) -> None:
+    async def _run(
+        self,
+        content: str,
+        attachments: list[ImageAttachment] | None = None,
+    ) -> None:
         try:
             session = self.state.sessions.get(self.session_id)
             if session is None:
                 session = await _create_server_session(self.state, self.session_id)
+            await self.publish({"type": "status", "state": "thinking", "busy": True})
             asyncio.create_task(self._maybe_generate_title(session, content))
-            async for event in session.run(content):
+            run_iter = (
+                session.run(content, attachments=attachments)
+                if attachments
+                else session.run(content)
+            )
+            async for event in run_iter:
                 await self.publish(_agent_event_payload(event, cwd=session.project_dir))
         except Exception as exc:
             logger.exception("Background session run failed for %s", self.session_id)
             await self.publish({"type": "error", "error": str(exc)})
+        finally:
+            await self.publish({"type": "status", "state": "idle", "busy": False})
 
     async def _maybe_generate_title(self, session: AgentSession, content: str) -> None:
         if self.state.store is None:
@@ -342,6 +402,31 @@ def _session_thinking_level(
     return state.config.agent.thinking
 
 
+def _request_project_dir(state: ServerState, requested: str = "") -> str:
+    candidate = requested.strip()
+    if candidate:
+        return str(Path(candidate).expanduser().resolve(strict=False))
+    if state.default_project_dir:
+        return str(Path(state.default_project_dir).expanduser().resolve(strict=False))
+    return os.getcwd()
+
+
+def _serialize_rule(rule: Any) -> dict[str, Any]:
+    return {
+        "id": str(rule.id),
+        "scope": str(rule.scope),
+        "text": str(rule.text),
+        "enabled": bool(rule.enabled),
+        "order": int(getattr(rule, "order", 0) or 0),
+        "created_at": str(getattr(rule, "created_at", "")),
+        "updated_at": str(getattr(rule, "updated_at", "")),
+    }
+
+
+def _session_rule_overrides(state: ServerState, session_id: str) -> SessionRuleOverrides:
+    return state.session_rule_overrides.setdefault(session_id, SessionRuleOverrides.empty())
+
+
 async def _stored_session_context(
     state: ServerState,
     session_id: str,
@@ -379,6 +464,16 @@ async def _persist_session_record(
         await state.store.update_session_project(session_id, project_dir)
     if session_info.thinking_level != thinking_level:
         await state.store.update_session_thinking(session_id, thinking_level)
+
+
+def _refresh_provider_config_from_sources(state: ServerState, provider_id: str) -> None:
+    refreshed_config = load_config(state.default_project_dir or os.getcwd())
+    merge_provider_overlay(refreshed_config, state.provider_overlay)
+    refreshed_provider = refreshed_config.providers.get(provider_id)
+    if refreshed_provider is None:
+        state.config.providers.pop(provider_id, None)
+        return
+    state.config.providers[provider_id] = refreshed_provider
 
 
 async def _initialize_session_state(
@@ -433,6 +528,7 @@ async def _serialize_session(
         "model": _session_model_label(state, session_id, session, session_info),
         "project_dir": _session_project_dir(state, session_id, session, session_info),
         "thinking_level": _session_thinking_level(state, session_id, session, session_info),
+        "rule_overrides": serialize_session_rule_overrides(_session_rule_overrides(state, session_id)),
         "messages": message_count,
         "created_at": session_info.created_at if session_info is not None else "",
         "updated_at": session_info.updated_at if session_info is not None else "",
@@ -462,6 +558,15 @@ def _serialize_message(message: Message) -> dict[str, Any]:
             "content": message.tool_result.content,
             "is_error": message.tool_result.is_error,
         }
+    if message.attachments:
+        payload["attachments"] = [
+            {
+                "path": attachment.path,
+                "mime_type": attachment.mime_type,
+                "name": attachment.name,
+            }
+            for attachment in message.attachments
+        ]
     return payload
 
 
@@ -623,6 +728,14 @@ async def _create_server_session(
         store=state.store,
         session_id=session_id,
         permission_callback=permission_callback,
+    )
+    session.rule_overrides = _session_rule_overrides(state, session_id)
+    session.refresh_system_prompt()
+    controller = _get_session_controller(state, session_id)
+    session.board_event_callback = (  # type: ignore[attr-defined]
+        lambda kind, payload: asyncio.create_task(
+            controller.publish({"type": "board_event", "event": kind, "payload": payload})
+        )
     )
     session.thinking_level = _session_thinking_level(
         state,
@@ -958,6 +1071,8 @@ async def handle_client(ws: ServerConnection, state: ServerState) -> None:
                 session = state.sessions.get(session_id)
                 if session is not None:
                     session.abort()
+            elif msg_type == "steer":
+                await _handle_steer(ws, msg, state)
             elif msg_type == "approve_tool":
                 await _handle_tool_approval(ws, msg, state)
             else:
@@ -980,12 +1095,45 @@ async def handle_client(ws: ServerConnection, state: ServerState) -> None:
                 future.set_result((False, False))
 
 
+def _parse_attachments(payload: Any) -> list[ImageAttachment] | None:
+    if not isinstance(payload, list):
+        return None
+    attachments: list[ImageAttachment] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "")).strip()
+        if not path:
+            continue
+        attachments.append(
+            ImageAttachment(
+                path=path,
+                mime_type=str(item.get("mime_type", "image/png") or "image/png"),
+                name=str(item.get("name", "") or ""),
+            )
+        )
+    return attachments or None
+
+
 async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: ServerState) -> None:
     """Start a user message run and stream it to this websocket subscriber."""
     session_id = str(msg.get("session_id", "default")).strip() or "default"
     content = str(msg.get("content", ""))
 
-    if not content:
+    attachments = _parse_attachments(msg.get("attachments"))
+
+    if os.environ.get("ARTEL_DEBUG_ATTACHMENTS", "") in {"1", "true", "yes", "on"}:
+        logger.warning(
+            "ws message session=%s content_len=%s attachments=%s",
+            session_id,
+            len(content),
+            [
+                {"name": attachment.name, "mime": attachment.mime_type, "path": attachment.path}
+                for attachment in (attachments or [])
+            ],
+        )
+
+    if not content and not attachments:
         await ws.send(json.dumps({"type": "error", "error": "Empty message"}))
         return
 
@@ -1009,7 +1157,7 @@ async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: Serv
     controller = _get_session_controller(state, session_id)
     queue = controller.subscribe()
     try:
-        await controller.start(content)
+        await controller.start(content, attachments=attachments)
     except Exception as exc:
         controller.unsubscribe(queue)
         await ws.send(json.dumps({"type": "error", "error": str(exc)}))
@@ -1032,6 +1180,25 @@ async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: Serv
         ws._worker_stream_tasks = stream_tasks
     stream_tasks.add(task)
     task.add_done_callback(lambda done: stream_tasks.discard(done))
+
+
+async def _handle_steer(
+    ws: ServerConnection,
+    msg: dict[str, Any],
+    state: ServerState,
+) -> None:
+    session_id = str(msg.get("session_id", "default")).strip() or "default"
+    content = str(msg.get("content", "")).strip()
+    if not content:
+        await ws.send(json.dumps({"type": "error", "error": "Empty steer message"}))
+        return
+    session = state.sessions.get(session_id)
+    controller = state.session_controllers.get(session_id)
+    if session is None or controller is None or not controller.running:
+        await ws.send(json.dumps({"type": "error", "error": "Session is not running"}))
+        return
+    session.steer(content)
+    await ws.send(json.dumps({"type": "status", "state": "steer queued", "busy": True}))
 
 
 async def _handle_tool_approval(
@@ -1078,14 +1245,137 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             "sessions": len(state.sessions),
             "max_sessions": state.config.server.max_sessions,
         })
+    def _project_config_path() -> Path:
+        return effective_project_config_path(state.default_project_dir)
+
+    def _read_text_file(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            return f"<error reading file: {exc}>"
+
+    def _redact_text(text: str) -> str:
+        if not text:
+            return ""
+        lines: list[str] = []
+        secret_tokens = (
+            "api_key",
+            "token",
+            "secret",
+            "password",
+            "access_key",
+            "refresh_token",
+        )
+        for line in text.splitlines():
+            if "=" in line:
+                key, sep, value = line.partition("=")
+                lowered = key.strip().lower().replace("-", "_")
+                has_secret = any(token in lowered for token in secret_tokens)
+                has_value = value.strip().strip('"').strip("'")
+                if has_secret and has_value:
+                    lines.append(f"{key}{sep} \"***REDACTED***\"")
+                    continue
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _redact_value(value: Any, key: str = "") -> Any:
+        lowered = key.lower().replace("-", "_")
+        secret_tokens = (
+            "api_key",
+            "token",
+            "secret",
+            "password",
+            "access_key",
+            "refresh_token",
+        )
+        if isinstance(value, dict):
+            return {str(k): _redact_value(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_redact_value(item, key) for item in value]
+        if any(token in lowered for token in secret_tokens):
+            if value in ("", None, False):
+                return value
+            return "***REDACTED***"
+        return value
+
     async def handle_server_info(request: web.Request) -> web.Response:
         return web.json_response(
             {
+                "version": "0.1.0",
+                "runtime_mode": "server",
                 "project_dir": state.default_project_dir,
                 "sessions_db": state.config.sessions.db_path,
                 "default_model": state.config.agent.model,
+                "auth_enabled": bool(token),
+                "max_sessions": state.config.server.max_sessions,
+                "loaded_extensions": len(state.server_extensions),
+                "provider_overlay_path": str(effective_server_provider_overlay_path()),
             }
         )
+
+    async def handle_config_paths(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "global_config": str(effective_global_config_path()),
+                "project_config": str(_project_config_path()),
+                "sessions_db": state.config.sessions.db_path,
+                "provider_overlay": str(effective_server_provider_overlay_path()),
+                "config_dir": str(CONFIG_DIR),
+            }
+        )
+
+    async def handle_config_effective(request: web.Request) -> web.Response:
+        effective = state.config.model_dump(exclude_none=True)
+        return web.json_response({"config": _redact_value(effective)})
+
+    async def handle_server_diagnostics(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "active_sessions": len(state.sessions),
+                "loaded_extensions": len(state.server_extensions),
+                "pending_oauth": len(state.pending_oauth),
+                "permission_requests": len(state.pending_permissions),
+                "auto_approve_sessions": len(state.auto_approve_sessions),
+                "project_dir_exists": Path(state.default_project_dir).exists(),
+                "global_config_exists": effective_global_config_path().exists(),
+                "project_config_exists": _project_config_path().exists(),
+                "provider_overlay_exists": effective_server_provider_overlay_path().exists(),
+                "sessions_db_exists": Path(state.config.sessions.db_path).exists(),
+            }
+        )
+
+    async def handle_config_raw(request: web.Request) -> web.Response:
+        scope = str(request.query.get("scope", "project")).strip().lower() or "project"
+        if scope == "global":
+            path = effective_global_config_path()
+        elif scope == "project":
+            path = _project_config_path()
+        else:
+            return web.json_response({"error": "Invalid scope"}, status=400)
+        return web.json_response(
+            {
+                "scope": scope,
+                "path": str(path),
+                "exists": path.exists(),
+                "content": _redact_text(_read_text_file(path)),
+            }
+        )
+
+    async def handle_config_init(request: web.Request) -> web.Response:
+        generate_global_config()
+        generate_project_config(state.default_project_dir)
+        return web.json_response(
+            {
+                "ok": True,
+                "message": "Initialized Artel config.",
+                "global_config": str(GLOBAL_CONFIG),
+                "project_config": str(project_config_path(state.default_project_dir)),
+                "agents_path": str(project_agents_path(state.default_project_dir)),
+            }
+        )
+
     async def handle_providers(request: web.Request) -> web.Response:
         from worker_core.cli import _resolve_api_key
 
@@ -1129,6 +1419,157 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
                 }
             )
         return web.json_response({"providers": providers_payload})
+
+    async def handle_prompts_list(request: web.Request) -> web.Response:
+        prompts = load_prompts(state.default_project_dir)
+        return web.json_response(
+            {
+                "prompts": [
+                    {
+                        "name": name,
+                        "preview": content[:120].replace("\n", " "),
+                    }
+                    for name, content in sorted(prompts.items())
+                ]
+            }
+        )
+
+    async def handle_prompt_render(request: web.Request) -> web.Response:
+        prompt_name = request.match_info["prompt_name"]
+        prompts = load_prompts(state.default_project_dir)
+        template = prompts.get(prompt_name)
+        if not template:
+            return web.json_response({"error": f"Prompt '{prompt_name}' not found"}, status=404)
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        arg = str(payload.get("arg", ""))
+        variables: dict[str, str] = {"input": arg} if arg else {}
+        if arg and "=" in arg:
+            variables = {}
+            for pair in arg.split():
+                if "=" in pair:
+                    key, _, value = pair.partition("=")
+                    variables[key] = value
+                else:
+                    variables.setdefault("input", "")
+                    variables["input"] += (" " if variables.get("input") else "") + pair
+        rendered = render_prompt(template, variables)
+        return web.json_response({"name": prompt_name, "content": rendered})
+
+    async def handle_skills_list(request: web.Request) -> web.Response:
+        skills = load_skills(state.default_project_dir)
+        return web.json_response(
+            {
+                "skills": [
+                    {
+                        "name": skill.name,
+                        "description": skill.description,
+                        "source": str(skill.source),
+                    }
+                    for skill in sorted(skills.values(), key=lambda item: item.name)
+                ]
+            }
+        )
+
+    async def handle_extensions_list(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "extensions": [
+                    {
+                        "name": ext.name,
+                        "version": ext.version,
+                        "source": ext.source,
+                    }
+                    for ext in list_installed_extensions()
+                ]
+            }
+        )
+
+    async def handle_extension_install(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        source = str(payload.get("source", "")).strip()
+        if not source:
+            return web.json_response({"error": "Missing source"}, status=400)
+        ok, message = install_extension(source)
+        status = 200 if ok else 400
+        return web.json_response({"ok": ok, "message": message}, status=status)
+
+    async def handle_extension_remove(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        ok, message = remove_extension(name)
+        status = 200 if ok else 400
+        return web.json_response({"ok": ok, "message": message}, status=status)
+
+    async def handle_extension_update(request: web.Request) -> web.Response:
+        name = request.match_info.get("name", "")
+        if name:
+            ok, message = update_extension(name)
+            status = 200 if ok else 400
+            return web.json_response({"ok": ok, "message": message}, status=status)
+        results = update_all_extensions()
+        return web.json_response(
+            {
+                "results": [
+                    {"name": ext_name, "ok": ok, "message": msg}
+                    for ext_name, ok, msg in results
+                ]
+            }
+        )
+
+    async def handle_extension_search(request: web.Request) -> web.Response:
+        query = str(request.query.get("q", "")).strip()
+        if not query:
+            return web.json_response({"results": []})
+        results = search_extensions(state.default_project_dir, query)
+        return web.json_response(
+            {
+                "results": [
+                    {
+                        "name": item.name,
+                        "description": item.description,
+                        "repo": item.repo,
+                        "author": item.author,
+                        "registry_name": item.registry_name,
+                        "tags": item.tags,
+                    }
+                    for item in results
+                ]
+            }
+        )
+
+    async def handle_extension_registries_list(request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "registries": [
+                    {"name": reg.name, "url": reg.url}
+                    for reg in list_registry_entries(state.default_project_dir)
+                ]
+            }
+        )
+
+    async def handle_extension_registries_add(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        name = str(payload.get("name", "")).strip()
+        url = str(payload.get("url", "")).strip()
+        if not name or not url:
+            return web.json_response({"error": "Missing name or url"}, status=400)
+        ok, message = add_registry(name, url)
+        status = 200 if ok else 400
+        return web.json_response({"ok": ok, "message": message}, status=status)
+
+    async def handle_extension_registries_remove(request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        ok, message = remove_registry(name)
+        status = 200 if ok else 400
+        return web.json_response({"ok": ok, "message": message}, status=status)
 
     async def handle_sessions_list(request: web.Request) -> web.Response:
         sessions_info = await _list_serialized_sessions(state)
@@ -1247,6 +1688,45 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=400)
         return web.json_response({"session": session})
+
+    async def handle_session_tasks_get(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        session = state.sessions.get(sid)
+        project_dir = _session_project_dir(state, sid, session)
+        content = await read_project_board_file(tasks_path(project_dir))
+        return web.json_response({"content": content, "path": str(tasks_path(project_dir))})
+
+    async def handle_session_tasks_put(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        content = str(payload.get("content", ""))
+        session = state.sessions.get(sid)
+        project_dir = _session_project_dir(state, sid, session)
+        await write_project_board_file(tasks_path(project_dir), content)
+        return web.json_response({"ok": True, "path": str(tasks_path(project_dir))})
+
+    async def handle_session_notes_get(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        session = state.sessions.get(sid)
+        project_dir = _session_project_dir(state, sid, session)
+        content = await read_project_board_file(operator_notes_path(project_dir))
+        return web.json_response({"content": content, "path": str(operator_notes_path(project_dir))})
+
+    async def handle_session_notes_put(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        content = str(payload.get("content", ""))
+        session = state.sessions.get(sid)
+        project_dir = _session_project_dir(state, sid, session)
+        await write_project_board_file(operator_notes_path(project_dir), content)
+        return web.json_response({"ok": True, "path": str(operator_notes_path(project_dir))})
+
     async def handle_session_compact_post(request: web.Request) -> web.Response:
         sid = request.match_info["session_id"]
         try:
@@ -1338,6 +1818,113 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             }
         )
 
+    async def handle_rules_list(request: web.Request) -> web.Response:
+        project_dir = _request_project_dir(state, request.query.get("project_dir", ""))
+        rules = [_serialize_rule(rule) for rule in list_rules(project_dir)]
+        return web.json_response({"rules": rules, "project_dir": project_dir})
+
+    async def handle_rules_post(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        scope = str(payload.get("scope", "")).strip()
+        text = str(payload.get("text", "")).strip()
+        enabled = bool(payload.get("enabled", True))
+        project_dir = _request_project_dir(state, str(payload.get("project_dir", "")))
+        try:
+            rule = add_rule(scope=scope, text=text, project_dir=project_dir, enabled=enabled)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"rule": _serialize_rule(rule), "project_dir": project_dir})
+
+    async def handle_rule_put(request: web.Request) -> web.Response:
+        rule_id = request.match_info["rule_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        project_dir = _request_project_dir(state, str(payload.get("project_dir", "")))
+        try:
+            rule = update_rule(
+                rule_id,
+                project_dir=project_dir,
+                text=str(payload["text"]).strip() if "text" in payload and payload.get("text") is not None else None,
+                scope=str(payload["scope"]).strip() if "scope" in payload and payload.get("scope") is not None else None,
+                enabled=bool(payload.get("enabled")) if "enabled" in payload else None,
+            )
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"rule": _serialize_rule(rule), "project_dir": project_dir})
+
+    async def handle_rule_move(request: web.Request) -> web.Response:
+        rule_id = request.match_info["rule_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        project_dir = _request_project_dir(state, str(payload.get("project_dir", "")))
+        position = payload.get("position")
+        offset = payload.get("offset")
+        if position is not None and not isinstance(position, int):
+            return web.json_response({"error": "Invalid position"}, status=400)
+        if offset is not None and not isinstance(offset, int):
+            return web.json_response({"error": "Invalid offset"}, status=400)
+        try:
+            rule = move_rule(rule_id, project_dir=project_dir, position=position, offset=offset)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"rule": _serialize_rule(rule), "project_dir": project_dir})
+
+    async def handle_rule_delete(request: web.Request) -> web.Response:
+        rule_id = request.match_info["rule_id"]
+        project_dir = _request_project_dir(state, request.query.get("project_dir", ""))
+        rule = delete_rule(rule_id, project_dir)
+        if rule is None:
+            return web.json_response({"error": f"Rule '{rule_id}' not found"}, status=404)
+        return web.json_response({"rule": _serialize_rule(rule), "project_dir": project_dir})
+
+    async def handle_session_rules_get(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        overrides = serialize_session_rule_overrides(_session_rule_overrides(state, sid))
+        return web.json_response({"session_id": sid, "rule_overrides": overrides})
+
+    async def handle_session_rule_put(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        rule_id = request.match_info["rule_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        if "enabled" not in payload:
+            return web.json_response({"error": "Missing enabled"}, status=400)
+        raw_enabled = payload.get("enabled")
+        overrides = _session_rule_overrides(state, sid)
+        if rule_id == "*":
+            if raw_enabled is not None:
+                return web.json_response({"error": "Use enabled=null with rule_id '*' to reset all overrides"}, status=400)
+            clear_session_rule_overrides(overrides)
+            enabled = None
+        elif raw_enabled is None:
+            reset_rule_for_session(overrides, rule_id)
+            enabled = None
+        else:
+            enabled = bool(raw_enabled)
+            set_rule_enabled_for_session(overrides, rule_id, enabled)
+        session = state.sessions.get(sid)
+        if session is not None:
+            session.rule_overrides = overrides
+            session.refresh_system_prompt()
+        return web.json_response(
+            {
+                "session_id": sid,
+                "rule_id": rule_id,
+                "enabled": enabled,
+                "rule_overrides": serialize_session_rule_overrides(overrides),
+                "session": await _serialize_session(state, sid),
+            }
+        )
+
     async def handle_credentials_import(request: web.Request) -> web.Response:
         try:
             payload = await request.json()
@@ -1371,12 +1958,17 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
 
             kind = str(auth.get("kind", "")).strip()
             overlay_update = dict(settings)
+            skip_reason = ""
             if kind == "api_key":
                 api_key = str(auth.get("api_key", "")).strip()
                 if not api_key:
                     skipped.append({"provider": provider_id, "reason": "Missing api_key."})
                     continue
-                overlay_update["api_key"] = api_key
+                if is_rejected_placeholder_api_key(api_key):
+                    overlay_update["api_key"] = ""
+                    skip_reason = "Rejected placeholder API key."
+                else:
+                    overlay_update["api_key"] = api_key
             elif kind == "oauth_token":
                 raw_token = auth.get("token")
                 if not isinstance(raw_token, dict):
@@ -1387,6 +1979,7 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
                 token = OAuthToken(**raw_token)
                 token.provider = provider_id
                 token_store.save(token)
+                overlay_update["api_key"] = ""
             else:
                 skipped.append(
                     {
@@ -1397,13 +1990,16 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
                 continue
 
             if overlay_update:
-                provider_config = upsert_provider_overlay(
+                upsert_provider_overlay(
                     state.provider_overlay,
                     provider_id,
                     overlay_update,
                 )
-                merge_provider_overlay(state.config, {provider_id: provider_config})
+                _refresh_provider_config_from_sources(state, provider_id)
                 overlay_changed = True
+            if skip_reason:
+                skipped.append({"provider": provider_id, "reason": skip_reason})
+                continue
             imported.append({"provider": provider_id, "auth_kind": kind})
 
         if overlay_changed:
@@ -1492,8 +2088,30 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
     app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/api/health", handle_health)
     app.router.add_get("/api/server/info", handle_server_info)
+    app.router.add_get("/api/server/diagnostics", handle_server_diagnostics)
+    app.router.add_get("/api/config/paths", handle_config_paths)
+    app.router.add_get("/api/config/effective", handle_config_effective)
+    app.router.add_get("/api/config/raw", handle_config_raw)
+    app.router.add_post("/api/config/init", handle_config_init)
     app.router.add_get("/api/providers", handle_providers)
     app.router.add_get("/api/models", handle_models)
+    app.router.add_get("/api/prompts", handle_prompts_list)
+    app.router.add_post("/api/prompts/{prompt_name}/render", handle_prompt_render)
+    app.router.add_get("/api/skills", handle_skills_list)
+    app.router.add_get("/api/rules", handle_rules_list)
+    app.router.add_post("/api/rules", handle_rules_post)
+    app.router.add_put("/api/rules/{rule_id}", handle_rule_put)
+    app.router.add_post("/api/rules/{rule_id}/move", handle_rule_move)
+    app.router.add_delete("/api/rules/{rule_id}", handle_rule_delete)
+    app.router.add_get("/api/extensions", handle_extensions_list)
+    app.router.add_post("/api/extensions/install", handle_extension_install)
+    app.router.add_delete("/api/extensions/{name}", handle_extension_remove)
+    app.router.add_post("/api/extensions/update", handle_extension_update)
+    app.router.add_post("/api/extensions/{name}/update", handle_extension_update)
+    app.router.add_get("/api/extensions/search", handle_extension_search)
+    app.router.add_get("/api/extensions/registries", handle_extension_registries_list)
+    app.router.add_post("/api/extensions/registries", handle_extension_registries_add)
+    app.router.add_delete("/api/extensions/registries/{name}", handle_extension_registries_remove)
     app.router.add_post("/api/credentials/import", handle_credentials_import)
     app.router.add_post("/api/oauth/start", handle_oauth_start)
     app.router.add_post("/api/oauth/complete", handle_oauth_complete)
@@ -1510,6 +2128,12 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
     app.router.add_put("/api/sessions/{session_id}/title", handle_session_title_put)
     app.router.add_put("/api/sessions/{session_id}/project", handle_session_project_put)
     app.router.add_put("/api/sessions/{session_id}/thinking", handle_session_thinking_put)
+    app.router.add_get("/api/sessions/{session_id}/rules", handle_session_rules_get)
+    app.router.add_put("/api/sessions/{session_id}/rules/{rule_id}", handle_session_rule_put)
+    app.router.add_get("/api/sessions/{session_id}/tasks", handle_session_tasks_get)
+    app.router.add_put("/api/sessions/{session_id}/tasks", handle_session_tasks_put)
+    app.router.add_get("/api/sessions/{session_id}/notes", handle_session_notes_get)
+    app.router.add_put("/api/sessions/{session_id}/notes", handle_session_notes_put)
     app.router.add_post("/api/sessions/{session_id}/compact", handle_session_compact_post)
     app.router.add_post("/api/sessions/{session_id}/fork", handle_session_fork_post)
     app.router.add_post("/api/sessions/{session_id}/skill", handle_session_skill_post)
@@ -1561,7 +2185,7 @@ async def run_server(
     token = auth_token or config.server.auth_token
     generated_token_path = None
     if not token:
-        token = f"wkr_{secrets.token_hex(16)}"
+        token = f"artel_{secrets.token_hex(16)}"
         generated_token_path = persist_server_auth_token(token, project_dir=project_dir)
         config.server.auth_token = token
         logger.info("Generated auth token: %s", token)
@@ -1587,12 +2211,12 @@ async def run_server(
     rest_site = web.TCPSite(rest_runner, host, rest_port)
     await rest_site.start()
 
-    logger.info("Worker server starting")
+    logger.info("Artel server starting")
     logger.info("  WebSocket: ws://%s:%d", host, port)
     logger.info("  REST API:  http://%s:%d/api/", host, rest_port)
     logger.info("  Auth token: %s", token)
     if announce is not None:
-        announce("Worker server starting")
+        announce("Artel server starting")
         announce(f"  WebSocket: ws://{host}:{port}")
         announce(f"  REST API:  http://{host}:{rest_port}/api/")
         announce(f"  Auth token: {token}")

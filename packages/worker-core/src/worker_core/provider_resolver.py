@@ -149,6 +149,18 @@ def _catalog_model_to_model_info(provider_id: str, model: Any) -> ModelInfo:
     )
 
 
+def _canonical_provider_id(config: WorkerConfig, provider_name: str) -> str:
+    normalized = str(provider_name or "").strip()
+    if not normalized:
+        return normalized
+    if normalized in config.providers:
+        return normalized
+    spec = get_provider_spec(normalized)
+    if spec is not None:
+        return spec.id
+    return normalized
+
+
 async def _builtin_models_from_provider(
     provider_type: str,
     provider_id: str,
@@ -371,15 +383,60 @@ async def get_effective_model_info(
     model_id: str,
 ) -> ModelInfo | None:
     """Return merged model metadata for *provider_name/model_id*."""
-    providers = await get_effective_provider_catalog(config)
-    provider = providers.get(provider_name)
-    if provider is None:
-        spec = get_provider_spec(provider_name)
-        if spec is not None and spec.id != provider_name:
-            provider = providers.get(spec.id)
-    if provider is None:
+    canonical_provider = _canonical_provider_id(config, provider_name)
+    provider_config = get_provider_config(config, canonical_provider)
+    spec = get_provider_spec(canonical_provider)
+    provider_type, kwargs = resolve_provider_runtime_config(config, canonical_provider)
+
+    if _supports_direct_model_discovery(provider_type, spec):
+        api_key = _resolve_api_key_for_discovery(config, canonical_provider)
+        if api_key is not None or not provider_requires_api_key(config, canonical_provider):
+            direct_models = await _builtin_models_from_provider(
+                provider_type,
+                canonical_provider,
+                kwargs,
+                api_key=api_key,
+                direct_discovery=True,
+            )
+            direct_model = direct_models.get(model_id)
+            if direct_model is not None:
+                override = provider_config.models.get(model_id) if provider_config else None
+                if override is None:
+                    return direct_model
+                if override.disabled:
+                    return None
+                return _apply_model_override(direct_model, override, canonical_provider)
+
+    raw_catalog = await ModelsCatalog.load()
+    catalog_provider = raw_catalog.get(_catalog_provider_name(canonical_provider, spec))
+    if catalog_provider is not None:
+        for model in catalog_provider.models:
+            if model.id == model_id:
+                base_model = _catalog_model_to_model_info(canonical_provider, model)
+                override = provider_config.models.get(model_id) if provider_config else None
+                if override is None:
+                    return base_model
+                if override.disabled:
+                    return None
+                return _apply_model_override(base_model, override, canonical_provider)
+
+    builtin_models = await _builtin_models_from_provider(
+        provider_type,
+        canonical_provider,
+        kwargs,
+    )
+    base_model = builtin_models.get(model_id)
+    if base_model is not None:
+        override = provider_config.models.get(model_id) if provider_config else None
+        if override is None:
+            return base_model
+        if override.disabled:
+            return None
+        return _apply_model_override(base_model, override, canonical_provider)
+
+    if provider_config is None:
         return None
-    for model in provider.models:
-        if model.id == model_id:
-            return model
-    return None
+    override = provider_config.models.get(model_id)
+    if override is None or override.disabled:
+        return None
+    return _model_from_override(canonical_provider, model_id, override)

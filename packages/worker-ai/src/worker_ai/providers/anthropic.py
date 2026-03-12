@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from worker_ai.attachments import attachment_data_base64
 from worker_ai.models import (
     Done,
     Message,
@@ -96,6 +97,26 @@ def _build_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     return result
 
 
+def _message_content_blocks(msg: Message) -> str | list[dict[str, Any]]:
+    if not msg.attachments:
+        return msg.content
+    content: list[dict[str, Any]] = []
+    if msg.content:
+        content.append({"type": "text", "text": msg.content})
+    for attachment in msg.attachments:
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": attachment.mime_type,
+                    "data": attachment_data_base64(attachment),
+                },
+            }
+        )
+    return content
+
+
 def _build_messages(messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
     """Split system prompt and convert messages to Anthropic format."""
     system: str | None = None
@@ -125,8 +146,12 @@ def _build_messages(messages: list[Message]) -> tuple[str | None, list[dict[str,
 
         if msg.role == Role.ASSISTANT and msg.tool_calls:
             content: list[dict[str, Any]] = []
-            if msg.content:
-                content.append({"type": "text", "text": msg.content})
+            blocks = _message_content_blocks(msg)
+            if isinstance(blocks, str):
+                if blocks:
+                    content.append({"type": "text", "text": blocks})
+            else:
+                content.extend(blocks)
             for tc in msg.tool_calls:
                 content.append(
                     {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.arguments}
@@ -134,7 +159,7 @@ def _build_messages(messages: list[Message]) -> tuple[str | None, list[dict[str,
             api_msgs.append({"role": "assistant", "content": content})
             continue
 
-        api_msgs.append({"role": msg.role.value, "content": msg.content})
+        api_msgs.append({"role": msg.role.value, "content": _message_content_blocks(msg)})
 
     return system, api_msgs
 

@@ -30,7 +30,7 @@ def test_mkdocs_nav_references_existing_pages() -> None:
     config = yaml.safe_load((repo_root / "mkdocs.yml").read_text(encoding="utf-8"))
     docs_dir = repo_root / "docs"
 
-    assert config["site_name"] == "Worker"
+    assert config["site_name"] == "Artel"
     assert config["theme"]["name"] == "material"
 
     referenced_pages = _collect_nav_paths(config["nav"])

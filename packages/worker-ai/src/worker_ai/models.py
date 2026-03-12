@@ -33,6 +33,14 @@ class ToolResult(BaseModel):
     is_error: bool = False
 
 
+class ImageAttachment(BaseModel):
+    """An image attachment included with a message."""
+
+    path: str
+    mime_type: str = "image/png"
+    name: str = ""
+
+
 class Message(BaseModel):
     """A single message in a conversation."""
 
@@ -41,6 +49,7 @@ class Message(BaseModel):
     tool_calls: list[ToolCall] | None = None
     tool_result: ToolResult | None = None
     reasoning: str | None = None
+    attachments: list[ImageAttachment] | None = None
 
 
 # ── Tool definitions ──────────────────────────────────────────────

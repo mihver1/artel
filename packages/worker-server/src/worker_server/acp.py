@@ -1,4 +1,4 @@
-"""ACP stdio agent entrypoint for Worker."""
+"""ACP stdio agent entrypoint for Artel."""
 
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ async def _close_state(state: server_mod.ServerState) -> None:
 
 
 async def run_acp() -> None:
-    """Run the Worker ACP agent on stdin/stdout."""
+    """Run the Artel ACP agent on stdin/stdout."""
 
     try:
         from acp import (
@@ -408,17 +408,17 @@ async def run_acp() -> None:
             }
 
         async def _replay_session_history(self, session_id: str) -> None:
-            from worker_ai.models import Role as WorkerRole
+            from worker_ai.models import Role as ArtelRole
 
             messages = await server_mod._session_history_messages(state, session_id)
             for message in messages:
-                if message.role == WorkerRole.USER:
+                if message.role == ArtelRole.USER:
                     for chunk in _text_chunks(message.content):
                         await self._conn.session_update(
                             session_id=session_id,
                             update=update_user_message_text(chunk),
                         )
-                elif message.role == WorkerRole.ASSISTANT and message.content:
+                elif message.role == ArtelRole.ASSISTANT and message.content:
                     for chunk in _text_chunks(message.reasoning or ""):
                         await self._conn.session_update(
                             session_id=session_id,
@@ -473,8 +473,8 @@ async def run_acp() -> None:
                     ),
                 ),
                 agent_info=Implementation(
-                    name="worker",
-                    title="Worker ACP",
+                    name="artel",
+                    title="Artel ACP",
                     version="0.1.0",
                 ),
             )

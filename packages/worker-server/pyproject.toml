@@ -1,12 +1,12 @@
 [project]
-name = "worker-server"
+name = "artel-server"
 version = "0.1.0"
 description = "WebSocket/HTTP server for remote agent access"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
     "agent-client-protocol>=0.8.1",
-    "worker-core",
+    "artel-core",
     "websockets>=14.0",
     "aiohttp>=3.10",
 ]
@@ -16,7 +16,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/worker_server"]
+packages = ["src/artel_server", "src/worker_server"]
 
 [tool.uv.sources]
-worker-core = { workspace = true }
+artel-core = { workspace = true }

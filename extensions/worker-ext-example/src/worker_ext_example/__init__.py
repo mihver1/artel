@@ -1,23 +1,23 @@
-"""Example Worker extension — demonstrates tools and hooks.
+"""Example Artel extension — demonstrates tools and hooks.
 
 Install:
-    worker ext install /path/to/extensions/worker-ext-example
+    artel ext install /path/to/extensions/worker-ext-example
 
 Or from git:
-    worker ext install git+https://github.com/your-org/worker-ext-example.git
+    artel ext install git+https://github.com/your-org/worker-ext-example.git
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
+from worker_ai.models import ToolDef, ToolParam
 from worker_core.extensions import CommandHandler, Extension, hook
 from worker_core.tools import Tool
-from worker_ai.models import ToolDef, ToolParam
 
-logger = logging.getLogger("worker.ext.example")
+logger = logging.getLogger("artel.ext.example")
 
 
 class TimestampTool(Tool):
@@ -28,7 +28,7 @@ class TimestampTool(Tool):
 
     async def execute(self, **kwargs: Any) -> str:
         fmt = kwargs.get("format", "%Y-%m-%d %H:%M:%S")
-        return datetime.now(timezone.utc).strftime(fmt)
+        return datetime.now(UTC).strftime(fmt)
 
     def definition(self) -> ToolDef:
         return ToolDef(
@@ -65,7 +65,7 @@ class ExampleExtension(Extension):
     async def _cmd_time(self, arg: str) -> str | None:
         """Handle /time command."""
         fmt = arg.strip() or "%Y-%m-%d %H:%M:%S"
-        return datetime.now(timezone.utc).strftime(fmt)
+        return datetime.now(UTC).strftime(fmt)
 
     @hook("before_turn")
     async def log_turn_start(self, session: Any, turn: int) -> None:

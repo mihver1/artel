@@ -1,1 +1,1 @@
-"""Worker TUI — Textual-based terminal UI for the coding agent."""
+"""Artel TUI compatibility package backed by the current worker_tui implementation."""

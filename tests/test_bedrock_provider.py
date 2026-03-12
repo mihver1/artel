@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 from worker_ai.models import (
     Done,
+    ImageAttachment,
     Message,
     ReasoningDelta,
     Role,
@@ -16,7 +17,7 @@ from worker_ai.models import (
     ToolParam,
 )
 from worker_ai.providers import create_default_registry
-from worker_ai.providers.bedrock import BedrockProvider
+from worker_ai.providers.bedrock import BedrockProvider, _build_messages
 from worker_ai.providers.openai_compat import OpenAIProvider
 
 
@@ -47,6 +48,28 @@ class TestBedrockProviderRegistry:
 
 
 class TestBedrockProviderRuntime:
+    def test_build_messages_includes_image_content_blocks(self, tmp_path):
+        image_path = tmp_path / "shot.png"
+        image_path.write_bytes(b"png-data")
+
+        system, messages = _build_messages(
+            [
+                Message(
+                    role=Role.USER,
+                    content="Look",
+                    attachments=[
+                        ImageAttachment(path=str(image_path), mime_type="image/png", name="shot.png")
+                    ],
+                )
+            ]
+        )
+
+        assert system == []
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"][0] == {"text": "Look"}
+        assert messages[0]["content"][1]["image"]["format"] == "png"
+        assert messages[0]["content"][1]["image"]["source"]["bytes"]
+
     @pytest.mark.asyncio
     async def test_stream_chat_uses_converse_stream_request_and_parses_events(self):
         provider = BedrockProvider(region="us-east-1")

@@ -1,11 +1,11 @@
 """OAuth authentication for LLM providers.
 
-Supports browser/OAuth flows for providers that expose them in Worker:
+Supports browser/OAuth flows for providers that expose them in Artel:
 - Browser PKCE with code paste: Anthropic
 - Browser PKCE with local callback: OpenAI
 - GitHub CLI broker flow: GitHub Copilot
 
-Token persistence in ~/.config/worker/auth.json with auto-refresh.
+Token persistence in ~/.config/artel/auth.json with legacy Worker fallback during migration.
 """
 
 from __future__ import annotations
@@ -30,12 +30,29 @@ import httpx
 
 from worker_ai.provider_specs import get_provider_spec
 
-logger = logging.getLogger("worker.oauth")
+logger = logging.getLogger("artel.oauth")
 _GITHUB_COPILOT_PROVIDER_IDS = frozenset({"github_copilot", "github_copilot_enterprise"})
+_CONFIG_DIR_ENV = "ARTEL_CONFIG_DIR"
+_LEGACY_CONFIG_DIR_ENV = "WORKER_CONFIG_DIR"
 
 # ── Token storage ─────────────────────────────────────────────────
 
-_DEFAULT_AUTH_PATH = Path("~/.config/worker/auth.json").expanduser()
+def _resolve_auth_path(*, env_names: tuple[str, ...], default_app_name: str) -> Path:
+    for env_name in env_names:
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return Path(value).expanduser() / "auth.json"
+    return Path(f"~/.config/{default_app_name}/auth.json").expanduser()
+
+
+_DEFAULT_AUTH_PATH = _resolve_auth_path(
+    env_names=(_CONFIG_DIR_ENV, _LEGACY_CONFIG_DIR_ENV),
+    default_app_name="artel",
+)
+_LEGACY_AUTH_PATH = _resolve_auth_path(
+    env_names=(_LEGACY_CONFIG_DIR_ENV,),
+    default_app_name="worker",
+)
 
 
 @dataclass
@@ -99,18 +116,33 @@ class TokenStore:
     """Persist OAuth tokens in a JSON file."""
 
     def __init__(self, path: Path | None = None):
+        self._use_default_path = path is None
         self.path = path or _DEFAULT_AUTH_PATH
 
+    def _candidate_paths(self) -> tuple[Path, ...]:
+        paths = [self.path]
+        if self._use_default_path:
+            paths.append(_LEGACY_AUTH_PATH)
+        unique: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            unique.append(path)
+        return tuple(unique)
+
     def load(self, provider: str) -> OAuthToken | None:
-        if not self.path.exists():
-            return None
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            entry = data.get(provider)
-            if entry:
-                return OAuthToken(**entry)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        for path in self._candidate_paths():
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                entry = data.get(provider)
+                if entry:
+                    return OAuthToken(**entry)
+            except (json.JSONDecodeError, TypeError):
+                continue
         return None
 
     def save(self, token: OAuthToken) -> None:
@@ -123,14 +155,15 @@ class TokenStore:
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def remove(self, provider: str) -> None:
-        if not self.path.exists():
-            return
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            data.pop(provider, None)
-            self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except json.JSONDecodeError:
-            pass
+        for path in self._candidate_paths():
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data.pop(provider, None)
+                path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except json.JSONDecodeError:
+                continue
 
 def _resolve_provider_id(name: str) -> str:
     spec = get_provider_spec(name)
@@ -513,7 +546,7 @@ class _DeviceFlowOAuth(OAuthProvider):
 
     DEVICE_AUTH_URL: str
     TOKEN_URL: str
-    CLIENT_ID: str = "worker-agent"
+    CLIENT_ID: str = "artel-agent"
     SCOPE: str = ""
 
     def _device_flow_headers(self) -> dict[str, str]:
@@ -966,7 +999,7 @@ class OpenAIOAuth(_LocalCallbackOAuth):
     EXTRA_PARAMS = {
         "id_token_add_organizations": "true",
         "codex_cli_simplified_flow": "true",
-        "originator": "worker",
+        "originator": "artel",
     }
 
 class _GitHubCliOAuth(OAuthProvider):
@@ -1018,7 +1051,7 @@ class _GitHubCliOAuth(OAuthProvider):
             token_value = await load_github_copilot_token_from_gh_cli(self.github_host)
         if not token_value:
             raise RuntimeError(
-                f"Unable to refresh {self.display_name} token. Re-run `worker login {self.name}`."
+                f"Unable to refresh {self.display_name} token. Re-run `artel login {self.name}`."
             )
 
         return OAuthToken(

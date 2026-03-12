@@ -1,5 +1,5 @@
 # ═══════════════════════════════════════════════════════════════
-# Worker — official extension registry
+# Artel — official extension registry
 # ═══════════════════════════════════════════════════════════════
 
 [[extensions]]
@@ -24,8 +24,8 @@ tags = ["mcp", "tools", "integration"]
 author = "mihver1"
 
 [[extensions]]
-name = "worker-ext-example"
-description = "Example extension — demonstrates tools and hooks"
+name = "artel-ext-example"
+description = "Example Artel extension — demonstrates tools and hooks"
 repo = "git+https://github.com/mihver1/worker-agent.git#subdirectory=extensions/worker-ext-example"
 tags = ["example", "demo"]
 author = "mihver1"

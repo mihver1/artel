@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
+import importlib
+import sys
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from worker_ai.models import (
-    Done,
-    Message,
-    ModelInfo,
-    StreamEvent,
-    TextDelta,
-    ToolCallDelta,
-    ToolDef,
-    Usage,
-)
-from worker_ai.provider import Provider
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_SRC_PATHS = [
+    REPO_ROOT / "packages/worker-ai/src",
+    REPO_ROOT / "packages/worker-core/src",
+    REPO_ROOT / "packages/worker-server/src",
+    REPO_ROOT / "packages/worker-tui/src",
+    REPO_ROOT / "packages/worker-web/src",
+]
+for package_path in reversed(PACKAGE_SRC_PATHS):
+    package_str = str(package_path)
+    if package_str not in sys.path:
+        sys.path.insert(0, package_str)
+_worker_ai_models = importlib.import_module("worker_ai.models")
+Done = _worker_ai_models.Done
+Message = _worker_ai_models.Message
+ModelInfo = _worker_ai_models.ModelInfo
+ReasoningDelta = _worker_ai_models.ReasoningDelta
+StreamEvent = _worker_ai_models.StreamEvent
+TextDelta = _worker_ai_models.TextDelta
+ToolDef = _worker_ai_models.ToolDef
+Usage = _worker_ai_models.Usage
+Provider = importlib.import_module("worker_ai.provider").Provider
 
 
 class MockProvider(Provider):
@@ -73,3 +85,8 @@ def tmp_workdir(tmp_path):
     (tmp_path / "subdir").mkdir()
     (tmp_path / "subdir" / "nested.py").write_text("print('nested')\n")
     return str(tmp_path)
+
+
+@pytest.fixture
+def repo_src_path():
+    yield PACKAGE_SRC_PATHS

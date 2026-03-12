@@ -7,9 +7,14 @@ from pathlib import Path
 
 import pytest
 from worker_core.tools.builtins import (
+    AddTaskTool,
+    AppendOperatorNoteTool,
     BashTool,
     EditTool,
+    ReadOperatorNotesTool,
+    ReadTasksTool,
     ReadTool,
+    UpdateTaskTool,
     WriteTool,
     create_builtin_tools,
 )
@@ -187,7 +192,51 @@ class TestBashTool:
 # ── create_builtin_tools ──────────────────────────────────────────
 
 
+class TestBoardTools:
+    @pytest.mark.asyncio
+    async def test_task_tools_round_trip(self, tmp_workdir):
+        add = AddTaskTool(tmp_workdir)
+        read = ReadTasksTool(tmp_workdir)
+        update = UpdateTaskTool(tmp_workdir)
+
+        result = await add.execute(title="Implement sidebar")
+        assert result == "Added task #1: Implement sidebar"
+
+        result = await add.execute(title="Add operator notes", parent_task_id=1)
+        assert result == "Added task #2: Add operator notes"
+
+        result = await update.execute(task_id=1, status="done")
+        assert result == "Updated task #1"
+
+        rendered = await read.execute()
+        assert "1|- [x] Implement sidebar" in rendered
+        assert "2|  - [ ] Add operator notes" in rendered
+
+    @pytest.mark.asyncio
+    async def test_operator_notes_tools_round_trip(self, tmp_workdir):
+        append = AppendOperatorNoteTool(tmp_workdir)
+        read = ReadOperatorNotesTool(tmp_workdir)
+
+        result = await append.execute(text="Remember to document sidebar")
+        assert result == "Appended operator note."
+
+        rendered = await read.execute()
+        assert "1|Remember to document sidebar" in rendered
+
+
 def test_create_builtin_tools():
     tools = create_builtin_tools("/tmp")
     names = {t.name for t in tools}
-    assert names == {"read", "write", "edit", "bash"}
+    assert names == {
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "web_search",
+        "web_fetch",
+        "read_tasks",
+        "add_task",
+        "update_task",
+        "read_operator_notes",
+        "append_operator_note",
+    }

@@ -1,4 +1,4 @@
-"""Shared runtime bootstrap helpers for Worker modes (CLI/TUI/RPC/server)."""
+"""Shared runtime bootstrap helpers for Artel modes (CLI/TUI/RPC/server)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from worker_ai.providers import create_default_registry
 
 from worker_core import provider_resolver as _provider_resolver
 from worker_core.agent import AgentSession
+from worker_core.builtin_capabilities import load_builtin_capabilities
 from worker_core.config import WorkerConfig
 from worker_core.extensions import (
     Extension,
@@ -80,7 +81,13 @@ async def bootstrap_runtime(
 ) -> RuntimeBootstrap:
     """Create provider/tools/hooks/extensions and model metadata for a session."""
     registry = create_default_registry()
-    extension_context = ExtensionContext(project_dir=project_dir, runtime=runtime, config=config)
+    builtin_capabilities = load_builtin_capabilities(project_dir=project_dir)
+    extension_context = ExtensionContext(
+        project_dir=project_dir,
+        runtime=runtime,
+        config=config,
+        extras={"builtin_capabilities": builtin_capabilities},
+    )
     if include_extensions:
         ai_extensions = await load_ai_extensions_async(context=extension_context)
         for ext in ai_extensions:

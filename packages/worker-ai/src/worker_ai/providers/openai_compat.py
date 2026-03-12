@@ -8,11 +8,14 @@ Responses API / Codex support.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
 
+from worker_ai.attachments import attachment_data_base64
 from worker_ai.models import (
     Done,
     Message,
@@ -30,6 +33,8 @@ from worker_ai.tool_schema import tool_input_schema
 
 _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+
+logger = logging.getLogger("artel.openai_compat")
 
 # ── Known models (OpenAI only — other providers override) ─────────
 
@@ -244,6 +249,27 @@ def _build_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     return result
 
 
+def _message_content_parts_openai(msg: Message) -> str | list[dict[str, Any]]:
+    if not msg.attachments:
+        return msg.content
+    parts: list[dict[str, Any]] = []
+    if msg.content:
+        parts.append({"type": "text", "text": msg.content})
+    for attachment in msg.attachments:
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": (
+                        f"data:{attachment.mime_type};base64,"
+                        f"{attachment_data_base64(attachment)}"
+                    )
+                },
+            }
+        )
+    return parts
+
+
 def _build_messages(messages: list[Message]) -> list[dict[str, Any]]:
     api_msgs: list[dict[str, Any]] = []
     for msg in messages:
@@ -268,11 +294,15 @@ def _build_messages(messages: list[Message]) -> list[dict[str, Any]]:
                 for tc in msg.tool_calls
             ]
             api_msgs.append(
-                {"role": "assistant", "content": msg.content or None, "tool_calls": tc_list}
+                {
+                    "role": "assistant",
+                    "content": _message_content_parts_openai(msg) or None,
+                    "tool_calls": tc_list,
+                }
             )
             continue
 
-        api_msgs.append({"role": msg.role.value, "content": msg.content})
+        api_msgs.append({"role": msg.role.value, "content": _message_content_parts_openai(msg)})
     return api_msgs
 
 
@@ -313,6 +343,24 @@ def _build_chat_completions_body(
 # ── Helpers — Responses API (Codex backend) ──────────────────────
 
 
+def _message_content_parts_responses(msg: Message) -> str | list[dict[str, Any]]:
+    if not msg.attachments:
+        return msg.content
+    parts: list[dict[str, Any]] = []
+    if msg.content:
+        parts.append({"type": "input_text", "text": msg.content})
+    for attachment in msg.attachments:
+        parts.append(
+            {
+                "type": "input_image",
+                "image_url": (
+                    f"data:{attachment.mime_type};base64,{attachment_data_base64(attachment)}"
+                ),
+            }
+        )
+    return parts
+
+
 def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[dict[str, Any]]]:
     """Convert internal messages to Responses API input items.
 
@@ -345,12 +393,11 @@ def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[di
             continue
 
         if msg.role == Role.ASSISTANT and msg.tool_calls:
-            # Emit text part first if present
-            if msg.content:
+            if msg.content or msg.attachments:
                 items.append({
                     "type": "message",
                     "role": "assistant",
-                    "content": msg.content,
+                    "content": _message_content_parts_responses(msg),
                 })
             for tc in msg.tool_calls:
                 if tc.id not in tool_result_ids:
@@ -372,7 +419,7 @@ def _build_responses_input(messages: list[Message]) -> tuple[str | None, list[di
         items.append({
             "type": "message",
             "role": msg.role.value,
-            "content": msg.content,
+            "content": _message_content_parts_responses(msg),
         })
 
     return instructions, items
@@ -389,6 +436,31 @@ def _build_responses_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
             "parameters": tool_input_schema(t),
         })
     return result
+
+
+def _debug_log_responses_body(model: str, body: dict[str, Any]) -> None:
+    if os.environ.get("ARTEL_DEBUG_ATTACHMENTS", "") not in {"1", "true", "yes", "on"}:
+        return
+    input_items = body.get("input", [])
+    summary: list[dict[str, Any]] = []
+    for item in input_items if isinstance(input_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, list):
+            part_summary = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "input_image":
+                    image_url = str(part.get("image_url", ""))
+                    part_summary.append({"type": "input_image", "url_prefix": image_url[:32], "chars": len(image_url)})
+                else:
+                    part_summary.append({"type": part.get("type", "unknown")})
+            summary.append({"role": item.get("role"), "parts": part_summary})
+        else:
+            summary.append({"role": item.get("role"), "content_type": type(content).__name__})
+    logger.warning("Responses request model=%s input_summary=%s", model, summary)
 
 
 def _build_responses_body(
@@ -427,6 +499,7 @@ def _build_responses_body(
     }
     effort = effort_map.get(thinking_level, "medium")
     body["reasoning"] = {"effort": effort, "summary": "auto"}
+    _debug_log_responses_body(model, body)
     return body
 
 

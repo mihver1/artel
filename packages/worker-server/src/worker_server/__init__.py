@@ -1,1 +1,1 @@
-"""worker-server — WebSocket/HTTP server for remote agent access."""
+"""Artel server compatibility package backed by the current worker_server implementation."""

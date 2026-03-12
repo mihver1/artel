@@ -1,6 +1,6 @@
 """JSON-RPC 2.0 server over stdin/stdout.
 
-Allows embedding Worker as a subprocess in editors, IDEs, and other tools.
+Allows embedding Artel as a subprocess in editors, IDEs, and other tools.
 Protocol: one JSON object per line on stdin, one JSON object per line on stdout.
 
 Supported methods:

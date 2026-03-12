@@ -1,14 +1,14 @@
 # Providers
 
-Worker chooses models with a `provider/model-id` string such as `anthropic/claude-sonnet-4-20250514` or `openai/gpt-4.1`.
+Artel chooses models with a `provider/model-id` string such as `anthropic/claude-sonnet-4-20250514`, `openai/gpt-4.1`, or `zai/glm-5`.
 
 ## How provider setup works
 
 Most providers can be configured in one of these ways:
 
-- set credentials in `~/.config/worker/config.toml`
+- set credentials in `~/.config/artel/config.toml`
 - use provider-specific environment variables
-- use `worker login <provider>` when OAuth is supported
+- use `artel login <provider>` when OAuth is supported
 - rely on cloud-native credential chains for platforms such as Bedrock or Vertex AI
 
 Example:
@@ -29,6 +29,7 @@ These providers usually require an API key in config or an environment variable:
 - `openai`
 - `google`
 - `kimi`
+- `minimax`
 - `azure_openai`
 - `github_copilot`
 - `github_copilot_enterprise`
@@ -45,11 +46,12 @@ Examples of additional settings include `region`, `profile`, `project`, and `loc
 
 ## OpenAI-compatible providers
 
-Worker also supports a wide range of OpenAI-compatible endpoints:
+Artel also supports a wide range of OpenAI-compatible endpoints:
 
 - `groq`
 - `mistral`
 - `xai`
+- `zai`
 - `openrouter`
 - `together`
 - `cerebras`
@@ -62,10 +64,11 @@ Worker also supports a wide range of OpenAI-compatible endpoints:
 - `nebius`
 
 These usually need `api_key` plus a provider-specific `base_url`.
+`zai` also accepts the `z.ai` alias in `provider/model-id` strings.
 
 ## Local and self-hosted providers
 
-Worker includes integrations for local or self-hosted runtimes:
+Artel includes integrations for local or self-hosted runtimes:
 
 - `ollama`
 - `ollama_cloud`
@@ -79,10 +82,10 @@ These providers often use a local base URL and may not require an API key.
 Some providers support interactive login:
 
 ```bash
-worker login <provider>
+artel login <provider>
 ```
 
-If a provider does not support OAuth, Worker will tell you which environment variable or config key to use instead.
+If a provider does not support OAuth, Artel will tell you which environment variable or config key to use instead.
 
 ## Tips
 

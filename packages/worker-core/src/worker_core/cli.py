@@ -1,4 +1,4 @@
-"""CLI entry point for Worker."""
+"""CLI entry point for Artel."""
 
 from __future__ import annotations
 
@@ -10,12 +10,23 @@ from typing import Any
 
 import click
 
+from worker_core.cmux import (
+    DEFAULT_ARTEL_DASHBOARD_SURFACE_TITLE,
+    DEFAULT_ARTEL_ORCHESTRATOR_SURFACE_TITLE,
+    bootstrap_artel_workspace,
+)
 from worker_core.config import (
+    GLOBAL_CONFIG,
+    effective_global_config_path,
+    effective_project_config_path,
     generate_global_config,
     generate_project_config,
     load_config,
+    project_agents_path,
+    project_config_path,
     resolve_model,
 )
+from worker_core.rules import add_rule, delete_rule, get_rule, list_rules, move_rule, update_rule
 
 
 @click.group(invoke_without_command=True)
@@ -41,14 +52,18 @@ def cli(
     continue_session: bool,
     resume_id: str | None,
 ) -> None:
-    """Worker — extensible Python coding agent."""
-    # Check for migrations on startup
-    from worker_core.migrations import check_and_migrate
+    """Artel — extensible Python coding agent."""
+    from worker_core.artel_bootstrap import bootstrap_artel
 
-    check_and_migrate()
+    bootstrap = bootstrap_artel(
+        os.getcwd(),
+        command_name=ctx.invoked_subcommand,
+        prompt=prompt,
+    )
+    project_dir = bootstrap.project_dir
 
     if prompt:
-        # Support piped stdin: cat file.txt | worker -p "explain this"
+        # Support piped stdin: cat file.txt | artel -p "explain this"
         stdin_content = ""
         if not sys.stdin.isatty():
             stdin_content = sys.stdin.read()
@@ -64,10 +79,25 @@ def cli(
         )
         return
     if ctx.invoked_subcommand is None:
-        # Default: managed local server-backed TUI.
+        preflight = bootstrap.cmux_preflight
+        if preflight is not None and not preflight.ok:
+            raise click.ClickException(preflight.format_message())
+
+        # Default: cmux-backed orchestrator surface with managed local server.
         from worker_tui.app import run_tui
         from worker_tui.local_server import ensure_managed_local_server
-        handle = asyncio.run(ensure_managed_local_server(os.getcwd()))
+
+        workspace = asyncio.run(bootstrap_artel_workspace(cwd=project_dir))
+        handle = asyncio.run(ensure_managed_local_server(project_dir))
+        if workspace.dashboard is not None:
+            click.echo(
+                f"Artel dashboard surface ready: {workspace.dashboard.title or DEFAULT_ARTEL_DASHBOARD_SURFACE_TITLE}"
+            )
+        if workspace.orchestrator is not None:
+            click.echo(
+                "Artel orchestrator surface ready: "
+                f"{workspace.orchestrator.title or DEFAULT_ARTEL_ORCHESTRATOR_SURFACE_TITLE}"
+            )
         run_tui(
             remote_url=handle.remote_url,
             auth_token=handle.auth_token,
@@ -78,14 +108,14 @@ def cli(
 
 @cli.command()
 def init() -> None:
-    """Initialize Worker config (global + project)."""
+    """Initialize Artel config (global + project)."""
     generate_global_config()
     cwd = os.getcwd()
     generate_project_config(cwd)
-    click.echo("Initialized Worker config:")
-    click.echo("  Global: ~/.config/worker/config.toml")
-    click.echo(f"  Project: {cwd}/.worker/config.toml")
-    click.echo(f"  Project: {cwd}/.worker/AGENTS.md")
+    click.echo("Initialized Artel config:")
+    click.echo(f"  Global: {GLOBAL_CONFIG}")
+    click.echo(f"  Project: {project_config_path(cwd)}")
+    click.echo(f"  Project: {project_agents_path(cwd)}")
 
 
 @cli.command()
@@ -107,6 +137,15 @@ def serve(host: str | None, port: int | None, token: str) -> None:
     asyncio.run(run_server(**kwargs))
 
 
+@cli.command("server-tray")
+@click.option("--project-dir", default="", help="Project directory for the managed local server")
+def server_tray(project_dir: str) -> None:
+    """Start the macOS menu-bar companion for the managed local server."""
+    from worker_tui.server_tray import run_server_tray
+
+    run_server_tray(project_dir)
+
+
 @cli.command()
 @click.argument("url")
 @click.option("--token", default="", help="Bearer auth token")
@@ -116,12 +155,54 @@ def serve(host: str | None, port: int | None, token: str) -> None:
     help="Forward local credentials to the remote server (all or comma-separated providers)",
 )
 def connect(url: str, token: str, forward_credentials: str) -> None:
-    """Connect TUI to a remote Worker server."""
+    """Connect TUI to a remote Artel server."""
     from worker_tui.app import run_tui
     run_tui(
         remote_url=url,
         auth_token=token,
         forward_credentials=forward_credentials,
+    )
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", help="Bind address for the web UI")
+@click.option("--port", default=8743, type=int, help="Bind port for the web UI")
+@click.option("--remote-url", default="", help="Connect web UI to a remote Artel server")
+@click.option("--token", default="", help="Bearer auth token for --remote-url")
+@click.option("--native", is_flag=True, help="Run the web UI in native desktop mode")
+@click.option(
+    "--no-open-browser",
+    is_flag=True,
+    help="Do not open the browser automatically",
+)
+def web(
+    host: str,
+    port: int,
+    remote_url: str,
+    token: str,
+    native: bool,
+    no_open_browser: bool,
+) -> None:
+    """Start the NiceGUI-based web UI."""
+    from worker_tui.local_server import ensure_managed_local_server
+    from worker_web.app import run_web
+
+    project_dir = os.getcwd()
+    resolved_remote_url = remote_url
+    resolved_auth_token = token
+    if not resolved_remote_url:
+        handle = asyncio.run(ensure_managed_local_server(project_dir))
+        resolved_remote_url = handle.remote_url
+        resolved_auth_token = handle.auth_token
+
+    run_web(
+        host=host,
+        port=port,
+        remote_url=resolved_remote_url,
+        auth_token=resolved_auth_token,
+        native=native,
+        open_browser=not no_open_browser,
+        project_dir=project_dir,
     )
 
 
@@ -138,103 +219,59 @@ def ext_install(source: str) -> None:
     If SOURCE is a plain package name (no '/', ':', '.'), it is looked up
     in the configured registries first.
     """
-    import subprocess
-
-    from worker_core import ext_manifest
+    from worker_core.extensions_admin import install_extension
 
     install_source = _resolve_install_source(source)
     click.echo(f"Installing extension from {install_source}...")
-    try:
-        result = subprocess.run(
-            ["uv", "pip", "install", "--no-sources", install_source],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            pkg_name = _parse_installed_package_name(result.stdout, install_source)
-            ext_manifest.add(pkg_name, install_source)
-            click.echo("Extension installed.")
-        else:
-            click.echo(f"Install failed:\n{result.stderr}", err=True)
-    except FileNotFoundError:
-        click.echo("Error: 'uv' not found. Install it first: https://docs.astral.sh/uv/", err=True)
+    ok, message = install_extension(source)
+    stream = click.echo if ok else (lambda value: click.echo(value, err=True))
+    stream(message)
 
 
 @ext.command("list")
 def ext_list() -> None:
     """List installed extensions."""
-    from worker_core.extensions import discover_extensions
+    from worker_core.extensions_admin import list_installed_extensions
 
-    extensions = discover_extensions()
+    extensions = list_installed_extensions()
     if not extensions:
         click.echo("No extensions installed.")
         return
-    for name, cls in extensions.items():
-        ver = getattr(cls, "version", "?")
-        click.echo(f"  {name} v{ver}")
+    for ext in extensions:
+        click.echo(f"  {ext.name} v{ext.version}")
 
 
 @ext.command("remove")
 @click.argument("name")
 def ext_remove(name: str) -> None:
     """Remove an installed extension."""
-    import subprocess
-
-    from worker_core import ext_manifest
+    from worker_core.extensions_admin import remove_extension
 
     click.echo(f"Removing extension {name}...")
-    try:
-        result = subprocess.run(
-            ["uv", "pip", "uninstall", name],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            ext_manifest.remove(name)
-            click.echo(f"Extension '{name}' removed.")
-        else:
-            click.echo(f"Remove failed:\n{result.stderr}", err=True)
-    except FileNotFoundError:
-        click.echo("Error: 'uv' not found.", err=True)
+    ok, message = remove_extension(name)
+    stream = click.echo if ok else (lambda value: click.echo(value, err=True))
+    stream(message)
 
 
 @ext.command("update")
 @click.argument("name", required=False, default=None)
 def ext_update(name: str | None) -> None:
     """Update an extension (or all if no name given)."""
-    import subprocess
-
-    from worker_core import ext_manifest
-    from worker_core.extensions import discover_extensions
+    from worker_core.extensions_admin import update_all_extensions, update_extension
 
     if name:
-        # Prefer the original source from manifest so VCS extensions update correctly
-        entry = next((e for e in ext_manifest.list_entries() if e.name == name), None)
-        source = entry.source if entry else name
         click.echo(f"Updating extension '{name}'...")
-        result = subprocess.run(
-            ["uv", "pip", "install", "--no-sources", "--upgrade", source],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            click.echo(f"Extension '{name}' updated.")
-        else:
-            click.echo(f"Update failed:\n{result.stderr}", err=True)
+        ok, message = update_extension(name)
+        stream = click.echo if ok else (lambda value: click.echo(value, err=True))
+        stream(message)
     else:
-        extensions = discover_extensions()
-        if not extensions:
+        results = update_all_extensions()
+        if not results:
             click.echo("No extensions to update.")
             return
-        click.echo(f"Updating {len(extensions)} extension(s)...")
-        manifest_entries = {e.name: e for e in ext_manifest.list_entries()}
-        for ext_name in extensions:
-            entry = manifest_entries.get(ext_name)
-            source = entry.source if entry else ext_name
-            result = subprocess.run(
-                ["uv", "pip", "install", "--no-sources", "--upgrade", source],
-                capture_output=True, text=True,
-            )
-            status = "\u2713" if result.returncode == 0 else "\u2717"
+        click.echo(f"Updating {len(results)} extension(s)...")
+        for ext_name, ok, _message in results:
+            status = "\u2713" if ok else "\u2717"
             click.echo(f"  {status} {ext_name}")
 
 
@@ -242,12 +279,11 @@ def ext_update(name: str | None) -> None:
 @click.argument("query")
 def ext_search(query: str) -> None:
     """Search across all configured extension registries."""
-    from worker_core.ext_registry import search_all
+    from worker_core.extensions_admin import search_extensions
 
-    config = load_config(os.getcwd())
     click.echo(f"Searching for '{query}'...")
     try:
-        matches = search_all(config.extensions.registries, query)
+        matches = search_extensions(os.getcwd(), query)
     except Exception as e:
         click.echo(f"Search failed: {e}", err=True)
         return
@@ -259,7 +295,7 @@ def ext_search(query: str) -> None:
         if m.registry_name:
             label += f"  [{m.registry_name}]"
         click.echo(f"{label} — {m.description}")
-        click.echo(f"    install: worker ext install {m.repo or m.name}")
+        click.echo(f"    install: artel ext install {m.repo or m.name}")
 
 
 # ── ext registry subgroup ─────────────────────────────────────────
@@ -273,8 +309,9 @@ def ext_registry_group() -> None:
 @ext_registry_group.command("list")
 def ext_registry_list() -> None:
     """List configured extension registries."""
-    config = load_config(os.getcwd())
-    regs = config.extensions.registries
+    from worker_core.extensions_admin import list_registry_entries
+
+    regs = list_registry_entries(os.getcwd())
     if not regs:
         click.echo("No registries configured.")
         return
@@ -287,63 +324,22 @@ def ext_registry_list() -> None:
 @click.argument("url")
 def ext_registry_add(name: str, url: str) -> None:
     """Add a custom extension registry."""
-    import tomllib
+    from worker_core.extensions_admin import add_registry
 
-    import tomli_w
-
-    from worker_core.config import GLOBAL_CONFIG
-
-    # Read current config
-    data: dict = {}
-    if GLOBAL_CONFIG.exists():
-        with open(GLOBAL_CONFIG, "rb") as f:
-            data = tomllib.load(f)
-
-    ext_section = data.setdefault("extensions", {})
-    registries = ext_section.setdefault("registries", [])
-
-    # Check for duplicate name
-    for r in registries:
-        if r.get("name") == name:
-            click.echo(f"Registry '{name}' already exists. Remove it first.")
-            return
-
-    registries.append({"name": name, "url": url})
-    GLOBAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    GLOBAL_CONFIG.write_text(tomli_w.dumps(data), encoding="utf-8")
-    click.echo(f"Registry '{name}' added: {url}")
+    ok, message = add_registry(name, url)
+    stream = click.echo if ok else (lambda value: click.echo(value, err=True))
+    stream(message)
 
 
 @ext_registry_group.command("remove")
 @click.argument("name")
 def ext_registry_remove(name: str) -> None:
     """Remove a custom extension registry (cannot remove 'official')."""
-    import tomllib
+    from worker_core.extensions_admin import remove_registry
 
-    import tomli_w
-
-    from worker_core.config import GLOBAL_CONFIG
-
-    if name == "official":
-        click.echo("Cannot remove the built-in 'official' registry.")
-        return
-
-    data: dict = {}
-    if GLOBAL_CONFIG.exists():
-        with open(GLOBAL_CONFIG, "rb") as f:
-            data = tomllib.load(f)
-
-    ext_section = data.get("extensions", {})
-    registries = ext_section.get("registries", [])
-    new_regs = [r for r in registries if r.get("name") != name]
-    if len(new_regs) == len(registries):
-        click.echo(f"Registry '{name}' not found.")
-        return
-
-    ext_section["registries"] = new_regs
-    data["extensions"] = ext_section
-    GLOBAL_CONFIG.write_text(tomli_w.dumps(data), encoding="utf-8")
-    click.echo(f"Registry '{name}' removed.")
+    ok, message = remove_registry(name)
+    stream = click.echo if ok else (lambda value: click.echo(value, err=True))
+    stream(message)
 
 
 @cli.group(invoke_without_command=True)
@@ -352,13 +348,13 @@ def ext_registry_remove(name: str) -> None:
 @click.pass_context
 def config(ctx: click.Context, show_global: bool, show_project: bool) -> None:
     """Show config file paths and merged configuration."""
-    from worker_core.config import GLOBAL_CONFIG
 
     cwd = os.getcwd()
-    project_config = Path(cwd) / ".worker" / "config.toml"
+    global_config = effective_global_config_path()
+    project_config = effective_project_config_path(cwd)
 
     if show_global:
-        click.echo(str(GLOBAL_CONFIG))
+        click.echo(str(global_config))
         return
     if show_project:
         click.echo(str(project_config))
@@ -367,7 +363,7 @@ def config(ctx: click.Context, show_global: bool, show_project: bool) -> None:
         return
 
     # Default: list all config files with existence status
-    _print_config_path("Global", GLOBAL_CONFIG)
+    _print_config_path("Global", global_config)
     _print_config_path("Project", project_config)
 
 
@@ -434,6 +430,211 @@ def login(provider: str) -> None:
         asyncio.run(oauth.login())
     except Exception as e:
         click.echo(f"Login failed: {e}", err=True)
+
+
+@cli.command("rules")
+def rules_list_command() -> None:
+    """List global and project rules."""
+    rules = list_rules(os.getcwd())
+    if not rules:
+        click.echo("No rules configured.")
+        return
+    for rule in rules:
+        status = "enabled" if rule.enabled else "disabled"
+        click.echo(f"{rule.order}. {rule.id} [{rule.scope}] [{status}] {rule.text}")
+
+
+@cli.group("rule")
+def rule_group() -> None:
+    """Manage Artel rules."""
+
+
+@rule_group.command("add")
+@click.option("--scope", type=click.Choice(["project", "global"]), required=True, help="Rule scope")
+@click.option("--text", required=True, help="Rule text")
+@click.option("--disabled", is_flag=True, help="Create the rule as disabled")
+def rule_add_command(scope: str, text: str, disabled: bool) -> None:
+    """Add a rule."""
+    try:
+        rule = add_rule(scope=scope, text=text, project_dir=os.getcwd(), enabled=not disabled)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Rule added: {rule.id} [{rule.scope}] {'enabled' if rule.enabled else 'disabled'}")
+
+
+@rule_group.command("edit")
+@click.argument("rule_id")
+@click.option("--text", default=None, help="Updated rule text")
+@click.option("--scope", type=click.Choice(["project", "global"]), default=None, help="Updated rule scope")
+@click.option("--enable/--disable", "enabled", default=None, help="Updated enabled state")
+def rule_edit_command(rule_id: str, text: str | None, scope: str | None, enabled: bool | None) -> None:
+    """Edit a rule."""
+    try:
+        rule = update_rule(rule_id, project_dir=os.getcwd(), text=text, scope=scope, enabled=enabled)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Rule updated: {rule.id} [{rule.scope}] {'enabled' if rule.enabled else 'disabled'}")
+
+
+def _delete_rule_or_raise(rule_id: str) -> str:
+    rule = delete_rule(rule_id, os.getcwd())
+    if rule is None:
+        raise click.ClickException(f"Rule '{rule_id}' not found")
+    return rule.id
+
+
+@rule_group.command("delete")
+@click.argument("rule_id")
+def rule_delete_command(rule_id: str) -> None:
+    """Delete a rule."""
+    deleted_id = _delete_rule_or_raise(rule_id)
+    click.echo(f"Rule deleted: {deleted_id}")
+
+
+@rule_group.command("remove")
+@click.argument("rule_id", nargs=1)
+def rule_remove_command(rule_id: str) -> None:
+    """Remove a rule."""
+    deleted_id = _delete_rule_or_raise(rule_id)
+    click.echo(f"Rule deleted: {deleted_id}")
+
+
+@rule_group.command("rm")
+@click.argument("rule_id", nargs=1)
+def rule_rm_command(rule_id: str) -> None:
+    """Remove a rule."""
+    deleted_id = _delete_rule_or_raise(rule_id)
+    click.echo(f"Rule deleted: {deleted_id}")
+
+
+@rule_group.command("enable")
+@click.argument("rule_id")
+def rule_enable_command(rule_id: str) -> None:
+    """Enable a rule."""
+    try:
+        rule = update_rule(rule_id, project_dir=os.getcwd(), enabled=True)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Rule enabled: {rule.id}")
+
+
+@rule_group.command("disable")
+@click.argument("rule_id")
+def rule_disable_command(rule_id: str) -> None:
+    """Disable a rule."""
+    try:
+        rule = update_rule(rule_id, project_dir=os.getcwd(), enabled=False)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Rule disabled: {rule.id}")
+
+
+@rule_group.command("move")
+@click.argument("rule_id")
+@click.option("--to", "position", type=int, default=None, help="1-based target position")
+@click.option("--up", is_flag=True, help="Move rule up by one")
+@click.option("--down", is_flag=True, help="Move rule down by one")
+def rule_move_command(rule_id: str, position: int | None, up: bool, down: bool) -> None:
+    """Move a rule to control precedence/order."""
+    offset = None
+    if up and down:
+        raise click.ClickException("Choose only one of --up or --down")
+    if up:
+        offset = -1
+    elif down:
+        offset = 1
+    if position is None and offset is None:
+        raise click.ClickException("Provide --to, --up, or --down")
+    try:
+        rule = move_rule(rule_id, project_dir=os.getcwd(), position=position, offset=offset)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Rule moved: {rule.id} -> position {rule.order}")
+
+
+@cli.group()
+def employee() -> None:
+    """Manage Artel employee sessions."""
+
+
+@employee.command("create")
+@click.option("--id", "employee_id", default="", help="Employee identifier")
+@click.option("--name", "display_name", required=True, help="Employee display name")
+@click.option("--task", "assigned_task", required=True, help="Assigned task")
+@click.option("--project-dir", default=".", help="Project directory for worktree allocation")
+@click.option("--workspace", default="artel-main", help="cmux workspace name or id")
+@click.option("--command", default="artel", help="Command to run in the employee surface")
+@click.option(
+    "--prompt",
+    "initial_prompt",
+    default="",
+    help="Optional one-shot prompt to execute immediately in the employee surface",
+)
+@click.option(
+    "--no-create-worktree",
+    is_flag=True,
+    help="Plan the worktree path without running `git worktree add`",
+)
+def employee_create(
+    employee_id: str,
+    display_name: str,
+    assigned_task: str,
+    project_dir: str,
+    workspace: str,
+    command: str,
+    initial_prompt: str,
+    no_create_worktree: bool,
+) -> None:
+    """Create an Artel employee with a worktree and cmux surface."""
+    import re
+    import uuid
+
+    from worker_core.cmux import preflight_cmux_management
+    from worker_core.orchestration import OrchestratorRuntime
+
+    management_preflight = preflight_cmux_management()
+    if not management_preflight.ok:
+        raise click.ClickException(management_preflight.format_message())
+
+    resolved_project_dir = str(Path(project_dir).resolve(strict=False))
+    resolved_employee_id = employee_id.strip() or re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        display_name.strip().lower(),
+    ).strip("-")
+    if not resolved_employee_id:
+        resolved_employee_id = f"emp-{uuid.uuid4().hex[:8]}"
+
+    runtime = OrchestratorRuntime()
+    try:
+        employee_record = runtime.create_employee_session_sync(
+            employee_id=resolved_employee_id,
+            display_name=display_name,
+            project_dir=resolved_project_dir,
+            assigned_task=assigned_task,
+            workspace=workspace,
+            command=command,
+            initial_prompt=initial_prompt,
+            create_worktree=not no_create_worktree,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not employee_record.cmux_surface:
+        raise click.ClickException(
+            "Failed to create or locate a cmux surface for the employee session. "
+            "Make sure the cmux binary is installed, the daemon is reachable, and the target workspace is valid."
+        )
+
+    click.echo(f"Employee created: {employee_record.employee_id}")
+    click.echo(f"  Name: {employee_record.display_name}")
+    click.echo(f"  Task: {employee_record.assigned_task}")
+    click.echo(f"  Status: {employee_record.status}")
+    click.echo(f"  Project: {employee_record.project_path}")
+    click.echo(f"  Worktree: {employee_record.worktree_path}")
+    click.echo(f"  Branch: {employee_record.branch}")
+    if employee_record.cmux_surface:
+        click.echo(f"  Surface: {employee_record.cmux_surface}")
 
 
 # ── Print mode ────────────────────────────────────────────────────
@@ -591,7 +792,7 @@ def _resolve_install_source(source: str) -> str:
 def _parse_installed_package_name(pip_stdout: str, source: str) -> str:
     """Extract the canonical package name from uv pip install output or source.
 
-    uv outputs lines like "Installed 1 package ... worker-ext-foo v0.1.0".
+    uv outputs lines like "Installed 1 package ... artel-ext-foo v0.1.0".
     Falls back to the source string (basename without VCS prefix).
     """
     import re

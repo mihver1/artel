@@ -1,8 +1,9 @@
 """Skills system — on-demand knowledge packs (Claude Code style).
 
 Skills are loaded from:
-  1. ~/.config/worker/skills/  (global)
-  2. .worker/skills/           (project — overrides global)
+  1. ~/.config/artel/skills/   (global)
+  2. .artel/skills/            (project — overrides global)
+  3. Legacy Worker paths are still read as fallback during migration
 
 Each ``.md`` file starts with an optional YAML-like frontmatter::
 
@@ -24,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from worker_core.config import CONFIG_DIR
+from worker_core.config import skill_dirs
 
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)---[ \t]*\n", re.DOTALL)
 
@@ -44,10 +45,7 @@ class Skill:
 
 def _skills_dirs(project_dir: str = "") -> list[Path]:
     """Return skills directories in priority order."""
-    dirs = [CONFIG_DIR / "skills"]
-    if project_dir:
-        dirs.append(Path(project_dir) / ".worker" / "skills")
-    return dirs
+    return skill_dirs(project_dir)
 
 
 def _parse_frontmatter(raw: str) -> tuple[dict[str, str], str]:

@@ -91,6 +91,13 @@ _BUILTIN_PROVIDER_SPECS: dict[str, ProviderSpec] = {
         env_vars=("MOONSHOT_API_KEY",),
         default_base_url="https://api.kimi.com/coding/v1",
     ),
+    "minimax": ProviderSpec(
+        id="minimax",
+        provider_type="anthropic",
+        display_name="MiniMax",
+        env_vars=("MINIMAX_API_KEY",),
+        default_base_url="https://api.minimax.io/anthropic/v1",
+    ),
     "ollama": ProviderSpec(
         id="ollama",
         provider_type="ollama",
@@ -129,6 +136,14 @@ _BUILTIN_PROVIDER_SPECS: dict[str, ProviderSpec] = {
         display_name="xAI",
         env_vars=("XAI_API_KEY",),
         default_base_url="https://api.x.ai/v1",
+    ),
+    "zai": ProviderSpec(
+        id="zai",
+        provider_type="openai_compat",
+        display_name="Z.ai",
+        env_vars=("ZHIPU_API_KEY",),
+        default_base_url="https://api.z.ai/api/paas/v4",
+        aliases=("z.ai", "z-ai"),
     ),
     "openrouter": ProviderSpec(
         id="openrouter",

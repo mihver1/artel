@@ -137,6 +137,7 @@ class TestProviderRuntimeConfig:
             "helicone": "https://ai-gateway.helicone.ai/v1",
             "io-net": "https://api.intelligence.io.solutions/api/v1",
             "nebius": "https://api.tokenfactory.nebius.com/v1",
+            "zai": "https://api.z.ai/api/paas/v4",
         }
 
         for provider_name, base_url in expected.items():
@@ -144,6 +145,15 @@ class TestProviderRuntimeConfig:
             assert provider_type == "openai_compat"
             assert kwargs["base_url"] == base_url
             assert provider_requires_api_key(config, provider_name) is True
+
+    def test_minimax_uses_anthropic_runtime_defaults(self):
+        config = WorkerConfig()
+
+        provider_type, kwargs = resolve_provider_runtime_config(config, "minimax")
+
+        assert provider_type == "anthropic"
+        assert kwargs["base_url"] == "https://api.minimax.io/anthropic/v1"
+        assert provider_requires_api_key(config, "minimax") is True
 
     def test_openai_compat_aliases_resolve_to_canonical_specs(self):
         config = WorkerConfig()
@@ -154,6 +164,8 @@ class TestProviderRuntimeConfig:
             "io.net": "https://api.intelligence.io.solutions/api/v1",
             "ionet": "https://api.intelligence.io.solutions/api/v1",
             "302.ai": "https://api.302.ai/v1",
+            "z.ai": "https://api.z.ai/api/paas/v4",
+            "z-ai": "https://api.z.ai/api/paas/v4",
         }
 
         for provider_name, base_url in expected.items():
@@ -342,17 +354,22 @@ class TestLoadConfig:
         import worker_core.config as cfg_mod
 
         monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", tmp_path / "config.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", tmp_path / "legacy-config.toml")
         config = load_config("/nonexistent/path")
         assert config.agent.model == "anthropic/claude-sonnet-4-20250514"
         assert config.agent.temperature == 0.0
         assert config.permissions.bash == "ask"
         assert config.server.port == 7432
-
-    def test_project_overlay(self, tmp_path):
+    def test_project_overlay(self, tmp_path, monkeypatch):
         """Project config merges over global defaults."""
-        worker_dir = tmp_path / ".worker"
-        worker_dir.mkdir()
-        (worker_dir / "config.toml").write_text(
+        import worker_core.config as cfg_mod
+
+        monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", tmp_path / "global.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", tmp_path / "legacy-global.toml")
+
+        artel_dir = tmp_path / ".artel"
+        artel_dir.mkdir()
+        (artel_dir / "config.toml").write_text(
             '[agent]\nmodel = "openai/gpt-4.1"\ntemperature = 0.5\n'
         )
         config = load_config(str(tmp_path))
@@ -360,6 +377,23 @@ class TestLoadConfig:
         assert config.agent.temperature == 0.5
         # Other fields stay at defaults
         assert config.permissions.bash == "ask"
+
+    def test_project_overlay_falls_back_to_legacy_worker_dir(self, tmp_path, monkeypatch):
+        """Legacy .worker/config.toml is still readable until migration runs."""
+        import worker_core.config as cfg_mod
+
+        monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", tmp_path / "global.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", tmp_path / "legacy-global.toml")
+
+        worker_dir = tmp_path / ".worker"
+        worker_dir.mkdir()
+        (worker_dir / "config.toml").write_text(
+            '[agent]\nmodel = "openai/gpt-4.1-mini"\n',
+            encoding="utf-8",
+        )
+
+        config = load_config(str(tmp_path))
+        assert config.agent.model == "openai/gpt-4.1-mini"
 
 
 class TestGenerateConfig:
@@ -378,8 +412,8 @@ class TestGenerateConfig:
 
     def test_generate_project(self, tmp_path):
         generate_project_config(str(tmp_path))
-        assert (tmp_path / ".worker" / "config.toml").exists()
-        assert (tmp_path / ".worker" / "AGENTS.md").exists()
+        assert (tmp_path / ".artel" / "config.toml").exists()
+        assert (tmp_path / ".artel" / "AGENTS.md").exists()
 
     def test_no_overwrite(self, tmp_path, monkeypatch):
         """Generating global config shouldn't overwrite existing."""
@@ -397,26 +431,28 @@ class TestPersistServerAuthToken:
 
         monkeypatch.setattr(cfg_mod, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", tmp_path / "config.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", tmp_path / "legacy-config.toml")
 
-        saved_path = persist_server_auth_token("wkr_first_run_token")
+        saved_path = persist_server_auth_token("artel_first_run_token")
 
         assert saved_path == tmp_path / "config.toml"
         saved = tomllib.loads((tmp_path / "config.toml").read_text())
-        assert saved["server"]["auth_token"] == "wkr_first_run_token"
-        assert load_config("/nonexistent/path").server.auth_token == "wkr_first_run_token"
+        assert saved["server"]["auth_token"] == "artel_first_run_token"
+        assert load_config("/nonexistent/path").server.auth_token == "artel_first_run_token"
     def test_updates_global_config_when_no_project_override(self, tmp_path, monkeypatch):
         import worker_core.config as cfg_mod
 
         monkeypatch.setattr(cfg_mod, "CONFIG_DIR", tmp_path)
         monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", tmp_path / "config.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", tmp_path / "legacy-config.toml")
         generate_global_config()
 
-        saved_path = persist_server_auth_token("wkr_test_token")
+        saved_path = persist_server_auth_token("artel_test_token")
 
         assert saved_path == tmp_path / "config.toml"
         saved = tomllib.loads((tmp_path / "config.toml").read_text())
-        assert saved["server"]["auth_token"] == "wkr_test_token"
-        assert load_config("/nonexistent/path").server.auth_token == "wkr_test_token"
+        assert saved["server"]["auth_token"] == "artel_test_token"
+        assert load_config("/nonexistent/path").server.auth_token == "artel_test_token"
 
     def test_updates_project_config_when_it_explicitly_owns_auth_token(self, tmp_path, monkeypatch):
         import worker_core.config as cfg_mod
@@ -424,19 +460,47 @@ class TestPersistServerAuthToken:
         global_dir = tmp_path / "global"
         monkeypatch.setattr(cfg_mod, "CONFIG_DIR", global_dir)
         monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", global_dir / "config.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", global_dir / "legacy-config.toml")
         generate_global_config()
 
         project_dir = tmp_path / "project"
-        project_config = project_dir / ".worker" / "config.toml"
+        project_config = project_dir / ".artel" / "config.toml"
         project_config.parent.mkdir(parents=True)
         project_config.write_text("[server]\nauth_token = \"\"\n", encoding="utf-8")
 
-        saved_path = persist_server_auth_token("wkr_project_token", project_dir=str(project_dir))
+        saved_path = persist_server_auth_token("artel_project_token", project_dir=str(project_dir))
 
         assert saved_path == project_config
         saved = tomllib.loads(project_config.read_text())
-        assert saved["server"]["auth_token"] == "wkr_project_token"
-        assert load_config(str(project_dir)).server.auth_token == "wkr_project_token"
+        assert saved["server"]["auth_token"] == "artel_project_token"
+        assert load_config(str(project_dir)).server.auth_token == "artel_project_token"
+
+    def test_updates_artel_global_config_even_when_only_legacy_worker_config_exists(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import worker_core.config as cfg_mod
+
+        artel_dir = tmp_path / "artel"
+        legacy_dir = tmp_path / "worker"
+        monkeypatch.setattr(cfg_mod, "CONFIG_DIR", artel_dir)
+        monkeypatch.setattr(cfg_mod, "GLOBAL_CONFIG", artel_dir / "config.toml")
+        monkeypatch.setattr(cfg_mod, "LEGACY_CONFIG_DIR", legacy_dir)
+        monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_CONFIG", legacy_dir / "config.toml")
+
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "config.toml").write_text(
+            '[agent]\nmodel = "openai/gpt-4.1"\n',
+            encoding="utf-8",
+        )
+
+        saved_path = persist_server_auth_token("artel_migrated_token")
+
+        assert saved_path == artel_dir / "config.toml"
+        saved = tomllib.loads((artel_dir / "config.toml").read_text())
+        assert saved["agent"]["model"] == "openai/gpt-4.1"
+        assert saved["server"]["auth_token"] == "artel_migrated_token"
 
 
 class TestWorkerConfigDefaults:
