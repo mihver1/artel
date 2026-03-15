@@ -48,7 +48,7 @@ Options:
 
 ### `artel web`
 
-Starts the NiceGUI-based web UI.
+Reserved compatibility command for the web surface. The current checkout does not include the full web UI implementation, so this command is unavailable at runtime and exits with an explanatory error.
 
 Options:
 

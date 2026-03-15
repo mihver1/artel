@@ -53,6 +53,7 @@ nav:
       - Installation: installation.md
       - Quick start: quickstart.md
   - Guides:
+      - Product scope: product-scope.md
       - Configuration: configuration.md
       - Run modes: run-modes.md
       - ACP integration: acp.md
@@ -60,4 +61,3 @@ nav:
       - Extensions: extensions.md
   - Reference:
       - CLI: cli.md
-      - Web UI: web.md

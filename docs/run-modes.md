@@ -1,6 +1,6 @@
 # Run modes
 
-Artel supports four main ways to run the agent, depending on how much UI, isolation, and network separation you need. For embedding and editor integrations, it also exposes RPC and ACP over stdio.
+Artel supports four primary user-facing run modes today: print mode, local TUI mode, headless server mode, and remote TUI mode. For embedding and editor integrations, it also exposes RPC and ACP over stdio.
 
 ## Print mode
 
@@ -98,3 +98,7 @@ artel acp
 
 This mode is intended for editors, IDEs, and other frontends that speak the Agent Client Protocol.
 See [ACP integration](acp.md) for the supported session lifecycle, permission modes, and per-session configuration options.
+
+## Unavailable web surface in this checkout
+
+The CLI still exposes `artel web`, but the current repository checkout does not include the full web UI runtime. Treat it as a reserved compatibility command rather than a supported run mode.

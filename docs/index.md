@@ -28,6 +28,7 @@ artel connect ws://host:7432
 
 - [Installation](installation.md) explains how to install Artel from source or with the bootstrap script.
 - [Quick start](quickstart.md) walks through first-run setup and the most important commands.
+- [Product scope](product-scope.md) lists which user-facing surfaces are supported in the current checkout.
 - [Configuration](configuration.md) covers global and project overrides, provider setup, permissions, and UI settings.
 - [Run modes](run-modes.md) explains local, print, server, and remote usage.
 - [ACP integration](acp.md) shows how to expose Artel as an ACP agent for editor and client integrations.
@@ -37,4 +38,4 @@ artel connect ws://host:7432
 
 ## Best place to start
 
-If you are new to the project, read [Installation](installation.md) and then [Quick start](quickstart.md). If you already have Artel running, jump straight to [Configuration](configuration.md) or [CLI reference](cli.md).
+If you are new to the project, read [Installation](installation.md), [Quick start](quickstart.md), and [Product scope](product-scope.md). If you already have Artel running, jump straight to [Configuration](configuration.md) or [CLI reference](cli.md).

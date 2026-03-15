@@ -148,7 +148,10 @@ def connect(url: str, token: str, forward_credentials: str) -> None:
     )
 
 
-@cli.command()
+@cli.command(
+    help="Run the reserved web command (web UI unavailable in this checkout).",
+    short_help="Reserved web command; unavailable in this checkout.",
+)
 @click.option("--host", default="127.0.0.1", help="Bind address for the web UI")
 @click.option("--port", default=8743, type=int, help="Bind port for the web UI")
 @click.option("--remote-url", default="", help="Connect web UI to a remote Artel server")
@@ -167,7 +170,7 @@ def web(
     native: bool,
     no_open_browser: bool,
 ) -> None:
-    """Start the NiceGUI-based web UI."""
+    """Run the reserved web command (web UI unavailable in this checkout)."""
     from worker_tui.local_server import ensure_managed_local_server
     from worker_web.app import run_web
 

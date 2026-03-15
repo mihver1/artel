@@ -1,6 +1,6 @@
 # Artel
 
-Extensible Python coding agent for local development, remote execution, ACP integrations, and an in-progress web UI.
+Extensible Python coding agent for local development, remote execution, and server-backed integrations.
 
 ## Documentation
 
@@ -26,7 +26,6 @@ uv run mkdocs serve
 - **First-party MCP stores**: global MCP config in `~/.config/artel/mcp.json`, project MCP config in `.artel/mcp.json`, with project entries merged over global definitions by server name
 - **Python-native extensions**: install tools, hooks, and UI widgets from registries, Git URLs, or local paths
 - **Broad provider support**: hosted APIs, OpenAI-compatible backends, cloud platforms, and local runtimes
-- **Experimental web UI**: NiceGUI-based interface with active development and partial feature coverage
 
 ## Quick start
 
@@ -66,9 +65,6 @@ artel schedule add morning-review --kind cron --cron "0 9 * * 1-5" --prompt-name
 # Connect to remote server
 artel connect ws://host:7432
 
-# Start web UI
-artel web
-
 # Start ACP mode for editor integrations
 artel acp
 ```
@@ -83,7 +79,28 @@ Artel currently supports these primary modes:
 - `artel connect ws://host:7432` — remote TUI connected to a server
 - `artel rpc` — JSON-RPC over stdio
 - `artel acp` — ACP agent over stdio
-- `artel web` — experimental web UI
+
+## Product scope
+
+Supported now:
+- local TUI (`artel`)
+- print mode (`artel -p`)
+- continue/resume session flow
+- headless server (`artel serve`)
+- remote TUI (`artel connect`)
+- JSON-RPC (`artel rpc`)
+- ACP (`artel acp`)
+- rules and rule enforcement
+- MCP config/runtime basics
+- schedules
+- built-in worktree and search tools
+- orchestration/delegation tools
+- Python-native extensions
+
+Unavailable in this checkout:
+- full web UI runtime behind `artel web`
+
+The `artel web` command remains present as a compatibility/placeholder surface, but the full web UI source is not included in this checkout.
 
 ## Configuration
 
@@ -277,4 +294,4 @@ artel ext remove artel-ext-foo
 
 ## Web UI status
 
-`artel web` is available, but the web UI is still under active development and does not yet have full parity with the TUI/CLI workflow. The longer-term plan is tracked in `WEB_UI_PLAN.md`.
+`artel web` is still exposed in the CLI, but the current checkout does not include the full web UI implementation. Running it will raise a runtime error explaining that the web surface is unavailable in this checkout.
