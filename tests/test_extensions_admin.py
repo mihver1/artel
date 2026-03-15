@@ -25,6 +25,7 @@ def test_list_installed_extensions_reads_discovery_and_manifest(monkeypatch):
 
     assert by_name["worker-ext-demo"].version == "1.2.3"
     assert by_name["worker-ext-demo"].source == "git+https://example.com/demo.git"
+    assert by_name["artel-lsp"].source == "bundled"
     assert by_name["artel-mcp"].source == "bundled"
 
 

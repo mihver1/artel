@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import pytest
-
 from worker_core.config import PermissionsConfig
-from worker_core.permissions import Decision, PermissionPolicy
+from worker_core.permissions import PermissionPolicy
 
 
 @pytest.mark.asyncio
@@ -90,7 +89,23 @@ async def test_read_always_allowed():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["grep", "find", "ls", "web_search", "web_fetch"])
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "grep",
+        "find",
+        "ls",
+        "web_search",
+        "web_fetch",
+        "lsp_hover",
+        "lsp_definition",
+        "lsp_references",
+        "lsp_implementation",
+        "lsp_document_symbols",
+        "lsp_workspace_symbols",
+        "lsp_diagnostics",
+    ],
+)
 async def test_readonly_search_tools_are_allowed(tool_name: str):
     config = PermissionsConfig(edit="deny", write="deny", bash="deny")
     policy = PermissionPolicy(config)

@@ -47,6 +47,7 @@ class RuntimeBootstrap:
     small_provider: Any | None = None
     small_model_id: str = ""
     mcp_runtime: Any | None = None
+    lsp_runtime: Any | None = None
 
 
 async def fetch_model_runtime_info(
@@ -90,6 +91,7 @@ async def bootstrap_runtime(
         extras={"builtin_capabilities": builtin_capabilities},
     )
     mcp_runtime = None
+    lsp_runtime = None
     if include_extensions:
         ai_extensions = await load_ai_extensions_async(context=extension_context)
         for ext in ai_extensions:
@@ -115,6 +117,16 @@ async def bootstrap_runtime(
             await mcp_runtime.load(extension_context)
             tools.extend(mcp_runtime.tools)
             extension_context.extras["mcp_runtime"] = mcp_runtime
+
+    lsp_capability = builtin_capabilities.get("artel-lsp")
+    if lsp_capability is not None:
+        with suppress(Exception):
+            from worker_core.lsp_runtime import LspRuntimeManager
+
+            lsp_runtime = LspRuntimeManager()
+            await lsp_runtime.load(extension_context)
+            tools.extend(lsp_runtime.tools)
+            extension_context.extras["lsp_runtime"] = lsp_runtime
 
     extensions: list[Extension] = []
     hooks = HookDispatcher()
@@ -157,6 +169,7 @@ async def bootstrap_runtime(
         small_provider=small_provider,
         small_model_id=small_model_id,
         mcp_runtime=mcp_runtime,
+        lsp_runtime=lsp_runtime,
     )
 
 
@@ -190,5 +203,6 @@ def create_agent_session_from_bootstrap(
         small_provider=bootstrap.small_provider,
         small_model=bootstrap.small_model_id,
     )
-    setattr(session, "mcp_runtime", bootstrap.mcp_runtime)
+    session.mcp_runtime = bootstrap.mcp_runtime
+    session.lsp_runtime = bootstrap.lsp_runtime
     return session

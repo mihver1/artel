@@ -22,7 +22,7 @@ uv run mkdocs serve
 - **Remote execution**: headless server mode plus remote TUI over WebSocket
 - **Scheduled tasks**: `artel serve` can execute prompt-based jobs on cron/interval timers while the server is running, with overlap policy, manual run, persisted state, and per-job execution/session modes
 - **Integration modes**: JSON-RPC over stdio and ACP over stdio for editor/client integrations
-- **Built-in tools**: file editing, shell, shared task board/operator notes, git worktree management, filesystem globbing, optional `ag`/`ripgrep` search helpers when those binaries are installed, plus web search and public page fetch with untrusted-content prompt-injection guards, safe summary/strict modes, optional domain allow/deny filtering, and mini-model-backed utility summarization
+- **Built-in tools**: file editing, shell, shared task board/operator notes, git worktree management, filesystem globbing, optional `ag`/`ripgrep` search helpers when those binaries are installed, first-party LSP-backed semantic navigation/hover/diagnostics tools with automatic install/start for built-in servers when a supported installer is available, plus web search and public page fetch with untrusted-content prompt-injection guards, safe summary/strict modes, optional domain allow/deny filtering, and mini-model-backed utility summarization
 - **First-party MCP stores**: global MCP config in `~/.config/artel/mcp.json`, project MCP config in `.artel/mcp.json`, with project entries merged over global definitions by server name
 - **Python-native extensions**: install tools, hooks, and UI widgets from registries, Git URLs, or local paths
 - **Broad provider support**: hosted APIs, OpenAI-compatible backends, cloud platforms, and local runtimes
@@ -59,6 +59,9 @@ artel --continue
 # Start server daemon
 artel serve
 
+# Inspect LSP availability
+artel lsp status
+
 # Add a scheduled job in project scope
 artel schedule add morning-review --kind cron --cron "0 9 * * 1-5" --prompt-name daily-review --execution-mode readonly
 
@@ -94,6 +97,7 @@ Supported now:
 - MCP config/runtime basics
 - schedules
 - built-in worktree and search tools
+- LSP-backed semantic code-intelligence tools (including first-use auto-install for built-in servers)
 - orchestration/delegation tools
 - Python-native extensions
 

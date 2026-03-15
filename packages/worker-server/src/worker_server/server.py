@@ -54,6 +54,7 @@ from worker_core.config import (
     project_config_path,
     resolve_model,
 )
+from worker_core.delegation.registry import get_registry as get_delegation_registry
 from worker_core.extensions import ExtensionContext, load_server_extensions_async
 from worker_core.extensions_admin import (
     add_registry,
@@ -66,28 +67,31 @@ from worker_core.extensions_admin import (
     update_all_extensions,
     update_extension,
 )
-from worker_core.delegation.registry import get_registry as get_delegation_registry
 from worker_core.mcp import MCPConfig, MCPRegistry, MCPServerConfig
 from worker_core.mcp_runtime import McpRuntimeManager
 from worker_core.prompts import load_prompts, render_prompt
+from worker_core.provider_resolver import (
+    get_effective_model_info,
+    get_effective_provider_catalog,
+)
+from worker_core.provider_setup import collect_provider_setup_entries
 from worker_core.rules import (
     SessionRuleOverrides,
     add_rule,
     clear_session_rule_overrides,
     delete_rule,
-    deserialize_session_rule_overrides,
     list_rules,
+    move_rule,
     reset_rule_for_session,
     serialize_session_rule_overrides,
     set_rule_enabled_for_session,
-    move_rule,
     update_rule,
 )
 from worker_core.schedules import (
     ScheduleRecord,
+    ScheduleRegistry,
     ScheduleRunRecord,
     ScheduleStateRecord,
-    ScheduleRegistry,
     add_schedule,
     delete_schedule,
     load_schedule_states_for_scope,
@@ -100,11 +104,6 @@ from worker_core.schedules import (
     update_schedule,
     write_schedule_states,
 )
-from worker_core.provider_resolver import (
-    get_effective_model_info,
-    get_effective_provider_catalog,
-)
-from worker_core.provider_setup import collect_provider_setup_entries
 from worker_core.sessions import SessionInfo, SessionStore
 from worker_core.skills import load_skills
 
@@ -373,7 +372,7 @@ class ScheduleService:
                     try:
                         await asyncio.wait_for(self._reload_event.wait(), timeout=wait_seconds)
                         continue
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pass
                 await self._trigger_due_schedule(record)
         except asyncio.CancelledError:
@@ -509,7 +508,7 @@ class ScheduleService:
             state_record.last_result_preview = run_record.result_preview
             state_record.last_error = ""
             state_record.last_session_id = session_id
-        except asyncio.TimeoutError:
+        except TimeoutError:
             controller = self.state.session_controllers.get(session_id)
             if controller is not None:
                 with suppress(Exception):
@@ -2812,6 +2811,10 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             if mcp_runtime is not None:
                 with suppress(Exception):
                     await mcp_runtime.close()
+            lsp_runtime = getattr(session, "lsp_runtime", None)
+            if lsp_runtime is not None:
+                with suppress(Exception):
+                    await lsp_runtime.close()
             deleted = True
         else:
             state.session_provider_models.pop(sid, None)
@@ -3000,6 +3003,10 @@ async def run_server(
             if mcp_runtime is not None:
                 with suppress(Exception):
                     await mcp_runtime.close()
+            lsp_runtime = getattr(session, "lsp_runtime", None)
+            if lsp_runtime is not None:
+                with suppress(Exception):
+                    await lsp_runtime.close()
         if state.mcp_runtime is not None:
             with suppress(Exception):
                 await state.mcp_runtime.close()

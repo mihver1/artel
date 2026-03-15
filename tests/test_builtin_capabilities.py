@@ -7,14 +7,19 @@ import json
 
 def test_load_builtin_capabilities_returns_bundled_capabilities() -> None:
     from worker_core.builtin_capabilities import load_builtin_capabilities
+    from worker_core.lsp_runtime import LspRuntimeManager
     from worker_core.mcp import MCPRegistry
 
     capabilities = load_builtin_capabilities(project_dir="/tmp/project")
 
     assert sorted(capabilities) == [
+        "artel-lsp",
         "artel-mcp",
     ]
+    assert isinstance(capabilities["artel-lsp"].instance, LspRuntimeManager)
     assert isinstance(capabilities["artel-mcp"].instance, MCPRegistry)
+    assert capabilities["artel-lsp"].bundled is True
+    assert capabilities["artel-lsp"].removable is False
     assert capabilities["artel-mcp"].bundled is True
     assert capabilities["artel-mcp"].removable is False
 
@@ -149,7 +154,11 @@ def test_runtime_bootstrap_binds_builtin_capabilities_into_extension_context(mon
 
     async def fake_load_extensions_async(context=None):
         seen_contexts.append(context)
-        return [], __import__("worker_core.extensions", fromlist=["HookDispatcher"]).HookDispatcher()
+        hook_dispatcher = __import__(
+            "worker_core.extensions",
+            fromlist=["HookDispatcher"],
+        ).HookDispatcher()
+        return [], hook_dispatcher
 
     class _Provider:
         async def close(self):
@@ -160,7 +169,10 @@ def test_runtime_bootstrap_binds_builtin_capabilities_into_extension_context(mon
             return _Provider()
 
     monkeypatch.setattr("worker_core.bootstrap.create_default_registry", lambda: _Registry())
-    monkeypatch.setattr("worker_core.bootstrap.load_ai_extensions_async", fake_load_ai_extensions_async)
+    monkeypatch.setattr(
+        "worker_core.bootstrap.load_ai_extensions_async",
+        fake_load_ai_extensions_async,
+    )
     monkeypatch.setattr("worker_core.bootstrap.load_extensions_async", fake_load_extensions_async)
     monkeypatch.setattr(
         "worker_core.bootstrap.resolve_provider_runtime_config",
@@ -168,7 +180,10 @@ def test_runtime_bootstrap_binds_builtin_capabilities_into_extension_context(mon
     )
     monkeypatch.setattr(
         "worker_core.bootstrap.fetch_model_runtime_info",
-        lambda config, provider_name, model_id: __import__("asyncio").sleep(0, result=(0, 0.0, 0.0)),
+        lambda config, provider_name, model_id: __import__("asyncio").sleep(
+            0,
+            result=(0, 0.0, 0.0),
+        ),
     )
 
     runtime = __import__("asyncio").run(
@@ -189,6 +204,7 @@ def test_runtime_bootstrap_binds_builtin_capabilities_into_extension_context(mon
         assert context is not None
         assert "builtin_capabilities" in context.extras
         assert sorted(context.extras["builtin_capabilities"]) == [
+            "artel-lsp",
             "artel-mcp",
         ]
 
@@ -211,7 +227,9 @@ def test_list_installed_extensions_includes_bundled_capabilities(monkeypatch):
     result = list_installed_extensions()
     names = [item.name for item in result]
 
+    assert "artel-lsp" in names
     assert "artel-mcp" in names
     assert "worker-ext-demo" in names
     bundled = {item.name: item for item in result if item.source == "bundled"}
+    assert bundled["artel-lsp"].version == "bundled"
     assert bundled["artel-mcp"].version == "bundled"

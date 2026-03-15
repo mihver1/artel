@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import difflib
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 _MAX_PREVIEW_LINES = 120
@@ -84,6 +83,22 @@ def format_tool_call_display(tool_name: str, args: dict[str, Any]) -> ToolCallDi
             ]
         )
         return ToolCallDisplay(title=title, body=body)
+    if tool_name.startswith("lsp_"):
+        title = f"⚙ {tool_name} {path}".strip() if path else f"⚙ {tool_name}"
+        details: list[str] = []
+        query = str(args.get("query", "") or "").strip()
+        if query:
+            details.append(f"query={query!r}")
+        line = args.get("line")
+        column = args.get("column")
+        if line:
+            details.append(f"line={line}")
+        if column:
+            details.append(f"column={column}")
+        max_results = args.get("max_results")
+        if max_results:
+            details.append(f"max_results={max_results}")
+        return ToolCallDisplay(title=title, body=", ".join(details))
     if args:
         rendered = ", ".join(f"{key}={_inline(value)!r}" for key, value in args.items())
         return ToolCallDisplay(title=f"⚙ {tool_name}", body=rendered)

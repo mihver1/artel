@@ -339,6 +339,22 @@ class PermissionsConfig(BaseModel):
     bash_commands: dict[str, Literal["allow", "ask", "deny"]] = Field(default_factory=dict)
 
 
+class LspServerConfig(BaseModel):
+    command: list[str] = Field(default_factory=list)
+    extensions: list[str] = Field(default_factory=list)
+    root_markers: list[str] = Field(default_factory=list)
+    initialization: dict[str, Any] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    disabled: bool = False
+
+
+class LspConfig(BaseModel):
+    enabled: bool = True
+    auto_install: bool = True
+    install_dir: str = str(CONFIG_DIR / "lsp")
+    servers: dict[str, LspServerConfig] = Field(default_factory=dict)
+
+
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 7432
@@ -393,6 +409,7 @@ class WorkerConfig(BaseModel):
     agent: AgentConfig = Field(default_factory=AgentConfig)
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
+    lsp: LspConfig = Field(default_factory=LspConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     extensions: ExtensionsConfig = Field(default_factory=ExtensionsConfig)
     sessions: SessionsConfig = Field(default_factory=SessionsConfig)
@@ -731,6 +748,32 @@ bash = "ask"
 # "rm *" = "deny"
 # "sudo *" = "deny"
 
+# ── LSP / Code Intelligence ───────────────────────────────────
+[lsp]
+# Enable first-party LSP-backed code intelligence tools when a compatible
+# language server is available on PATH, configured below, or can be installed
+# automatically by Artel on first use.
+# enabled = true
+# auto_install = true
+# install_dir = "~/.config/artel/lsp"
+
+# Override or add server definitions by logical id.
+# Common built-ins:
+#   python      -> basedpyright-langserver | pyright-langserver | pylsp
+#   typescript  -> typescript-language-server --stdio
+#   go          -> gopls
+#   rust        -> rust-analyzer
+#
+# [lsp.servers.python]
+# # disabled = true
+# # command = ["basedpyright-langserver", "--stdio"]
+# # extensions = [".py"]
+# # root_markers = ["pyproject.toml", ".git"]
+# # [lsp.servers.python.env]
+# # PYRIGHT_PYTHON_FORCE_VERSION = "latest"
+# # [lsp.servers.python.initialization]
+# # diagnosticMode = "workspace"
+
 # ── Server ────────────────────────────────────────────────────
 [server]
 # Host and port for `artel serve`
@@ -812,6 +855,12 @@ _PROJECT_TEMPLATE = """\
 # [permissions.bash_commands]
 # "git *" = "allow"
 # "make *" = "allow"
+#
+# [lsp]
+# enabled = true
+# auto_install = true
+# [lsp.servers.python]
+# command = ["basedpyright-langserver", "--stdio"]
 #
 # [server]
 # scheduler_enabled = true

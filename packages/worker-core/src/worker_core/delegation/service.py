@@ -130,7 +130,15 @@ class DelegationService:
 
     def _session_tools(self, bootstrap_tools: list[Any], project_dir: str, mode: str) -> list[Any]:
         if mode == "readonly":
-            return create_readonly_tools(project_dir)
+            builtin_tools = create_readonly_tools(project_dir)
+            builtin_names = {tool.name for tool in builtin_tools}
+            readonly_runtime_tools = [
+                tool
+                for tool in bootstrap_tools
+                if getattr(tool, "name", "").startswith("lsp_")
+                and getattr(tool, "name", "") not in builtin_names
+            ]
+            return [*builtin_tools, *readonly_runtime_tools]
         builtin_tools = create_all_tools(project_dir)
         builtin_names = {tool.name for tool in builtin_tools}
         extension_tools = [
@@ -235,6 +243,9 @@ class DelegationService:
                 if runtime.mcp_runtime is not None:
                     with suppress(Exception):
                         await runtime.mcp_runtime.close()
+                if runtime.lsp_runtime is not None:
+                    with suppress(Exception):
+                        await runtime.lsp_runtime.close()
 
 
 __all__ = ["DelegationService"]

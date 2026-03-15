@@ -16,15 +16,18 @@ import webbrowser
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import MethodType
 from typing import Any
 
+from pygments import lex
 from pygments.lexers import TextLexer, get_lexer_for_filename, guess_lexer, guess_lexer_for_filename
+from pygments.styles import get_style_by_name
 from pygments.util import ClassNotFound
 import worker_core.cmux as cmux
 from rich.markdown import Markdown
-from rich.syntax import Syntax
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 from textual import events, work
@@ -138,6 +141,7 @@ _RU_QWERTY_KEY_ALIASES: dict[str, str] = {
 }
 
 _DIFF_SYNTAX_THEME = "ansi_dark"
+_DIFF_PYGMENTS_STYLE = "monokai"
 
 
 def _layout_safe_binding_variants(key: str) -> list[str]:
@@ -207,6 +211,36 @@ def _resolve_diff_lexer(path: str, diff_text: str) -> Any:
     return TextLexer()
 
 
+@lru_cache(maxsize=16)
+def _pygments_style(theme_name: str) -> Any:
+    return get_style_by_name(theme_name)
+
+
+@lru_cache(maxsize=512)
+def _rich_style_for_token(theme_name: str, token_type: Any) -> Style | None:
+    spec = _pygments_style(theme_name).style_for_token(token_type)
+    if not spec:
+        return None
+    return Style(
+        color=f"#{spec['color']}" if spec.get("color") else None,
+        bold=bool(spec.get("bold", False)),
+        italic=bool(spec.get("italic", False)),
+        underline=bool(spec.get("underline", False)),
+    )
+
+
+def _highlight_diff_code_text(code: str, lexer: Any) -> Text:
+    highlighted = Text()
+    try:
+        for token_type, value in lex(code or " ", lexer):
+            if not value:
+                continue
+            highlighted.append(value, style=_rich_style_for_token(_DIFF_PYGMENTS_STYLE, token_type))
+    except Exception:
+        highlighted = Text(code or " ")
+    return highlighted if highlighted.plain else Text(" ")
+
+
 def _build_syntax_highlighted_diff(path: str, diff_text: str) -> Table:
     lexer = _resolve_diff_lexer(path, diff_text)
     table = Table.grid(expand=True, padding=(0, 1))
@@ -224,13 +258,7 @@ def _build_syntax_highlighted_diff(path: str, diff_text: str) -> Table:
         if prefix in {"+", "-", " "}:
             table.add_row(
                 Text(prefix, style=_diff_prefix_style(prefix)),
-                Syntax(
-                    line[1:] or " ",
-                    lexer,
-                    theme=_DIFF_SYNTAX_THEME,
-                    word_wrap=True,
-                    background_color="default",
-                ),
+                _highlight_diff_code_text(line[1:] or " ", lexer),
             )
             continue
         table.add_row(Text(" "), Text(line))
@@ -3562,6 +3590,9 @@ class WorkerApp(App):
             mcp_runtime = getattr(self._session, "mcp_runtime", None)
             if mcp_runtime is not None:
                 await mcp_runtime.close()
+            lsp_runtime = getattr(self._session, "lsp_runtime", None)
+            if lsp_runtime is not None:
+                await lsp_runtime.close()
         session_id = str(uuid.uuid4())
         if self._store:
             await self._store.create_session(
@@ -5712,6 +5743,10 @@ class WorkerApp(App):
             if mcp_runtime is not None:
                 with suppress(Exception):
                     await mcp_runtime.close()
+            lsp_runtime = getattr(self._session, "lsp_runtime", None)
+            if lsp_runtime is not None:
+                with suppress(Exception):
+                    await lsp_runtime.close()
         if self._ws:
             with suppress(Exception):
                 await self._ws.close()

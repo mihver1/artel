@@ -23,8 +23,14 @@ from worker_core.config import (
     project_config_path,
     resolve_model,
 )
-from worker_core.rules import add_rule, delete_rule, get_rule, list_rules, move_rule, update_rule
-from worker_core.schedules import add_schedule, delete_schedule, load_schedules, serialize_schedule, update_schedule
+from worker_core.rules import add_rule, delete_rule, list_rules, move_rule, update_rule
+from worker_core.schedules import (
+    add_schedule,
+    delete_schedule,
+    load_schedules,
+    serialize_schedule,
+    update_schedule,
+)
 
 
 @click.group(invoke_without_command=True)
@@ -196,6 +202,42 @@ def web(
 @cli.group()
 def mcp() -> None:
     """Manage first-party MCP configuration."""
+
+
+@cli.group()
+def lsp() -> None:
+    """Inspect first-party LSP runtime status."""
+
+
+@lsp.command("status")
+@click.option(
+    "--json-output",
+    "json_output",
+    is_flag=True,
+    help="Print structured LSP state payload",
+)
+def lsp_status(json_output: bool) -> None:
+    """Show current LSP runtime status."""
+    from worker_core.extensions import ExtensionContext
+    from worker_core.lsp_runtime import LspRuntimeManager
+
+    runtime = LspRuntimeManager()
+    try:
+        asyncio.run(
+            runtime.load(
+                ExtensionContext(
+                    project_dir=os.getcwd(),
+                    runtime="local",
+                    config=load_config(os.getcwd()),
+                )
+            )
+        )
+        if json_output:
+            click.echo(json.dumps(runtime.status_payload(), indent=2, sort_keys=True))
+        else:
+            click.echo(runtime.status_text())
+    finally:
+        asyncio.run(runtime.close())
 
 
 @mcp.command("show")
@@ -993,6 +1035,8 @@ async def _print_mode(
     await runtime.provider.close()
     if runtime.mcp_runtime is not None:
         await runtime.mcp_runtime.close()
+    if runtime.lsp_runtime is not None:
+        await runtime.lsp_runtime.close()
 
 
 

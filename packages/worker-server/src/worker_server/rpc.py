@@ -189,6 +189,9 @@ class RpcServer:
             mcp_runtime = getattr(self._session, "mcp_runtime", None)
             if mcp_runtime is not None:
                 await mcp_runtime.close()
+            lsp_runtime = getattr(self._session, "lsp_runtime", None)
+            if lsp_runtime is not None:
+                await lsp_runtime.close()
             self._session = None
 
 

@@ -172,6 +172,10 @@ async def _close_state(state: server_mod.ServerState) -> None:
         if mcp_runtime is not None:
             with server_mod.suppress(Exception):
                 await mcp_runtime.close()
+        lsp_runtime = getattr(session, "lsp_runtime", None)
+        if lsp_runtime is not None:
+            with server_mod.suppress(Exception):
+                await lsp_runtime.close()
     if state.mcp_runtime is not None:
         with server_mod.suppress(Exception):
             await state.mcp_runtime.close()

@@ -52,3 +52,15 @@ def test_format_tool_result_display_renders_diff_markdown():
     assert display.title == "src/app.py"
     assert display.status_badge == "+1  -0"
     assert "+print('hello')" in display.body
+
+
+def test_format_tool_call_display_compacts_lsp_call():
+    display = format_tool_call_display(
+        "lsp_definition",
+        {"path": "src/app.py", "line": 12, "column": 5, "max_results": 8},
+    )
+
+    assert display.title == "⚙ lsp_definition src/app.py"
+    assert "line=12" in display.body
+    assert "column=5" in display.body
+    assert "max_results=8" in display.body

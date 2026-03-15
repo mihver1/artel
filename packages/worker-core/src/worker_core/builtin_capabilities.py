@@ -24,13 +24,21 @@ class BuiltinCapability:
 
 def load_builtin_capabilities(*, project_dir: str = "") -> dict[str, BuiltinCapability]:
     del project_dir
+    from worker_core.lsp_runtime import LspRuntimeManager
+
     mcp = BuiltinCapability(
         name="artel-mcp",
         kind="mcp",
         instance=MCPRegistry(),
     )
+    lsp = BuiltinCapability(
+        name="artel-lsp",
+        kind="lsp",
+        instance=LspRuntimeManager(),
+    )
     return {
         mcp.name: mcp,
+        lsp.name: lsp,
     }
 
 
