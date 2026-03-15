@@ -46,6 +46,7 @@ class RuntimeBootstrap:
     output_price_per_m: float
     small_provider: Any | None = None
     small_model_id: str = ""
+    mcp_runtime: Any | None = None
 
 
 async def fetch_model_runtime_info(
@@ -88,6 +89,7 @@ async def bootstrap_runtime(
         config=config,
         extras={"builtin_capabilities": builtin_capabilities},
     )
+    mcp_runtime = None
     if include_extensions:
         ai_extensions = await load_ai_extensions_async(context=extension_context)
         for ext in ai_extensions:
@@ -103,6 +105,16 @@ async def bootstrap_runtime(
         kwargs["auth_type"] = "oauth"
     provider = registry.create(provider_type, api_key=api_key, **kwargs)
     tools = create_builtin_tools(project_dir)
+
+    mcp_capability = builtin_capabilities.get("artel-mcp")
+    if mcp_capability is not None:
+        with suppress(Exception):
+            from worker_core.mcp_runtime import McpRuntimeManager
+
+            mcp_runtime = McpRuntimeManager()
+            await mcp_runtime.load(extension_context)
+            tools.extend(mcp_runtime.tools)
+            extension_context.extras["mcp_runtime"] = mcp_runtime
 
     extensions: list[Extension] = []
     hooks = HookDispatcher()
@@ -144,6 +156,7 @@ async def bootstrap_runtime(
         output_price_per_m=output_price_per_m,
         small_provider=small_provider,
         small_model_id=small_model_id,
+        mcp_runtime=mcp_runtime,
     )
 
 
@@ -157,7 +170,7 @@ def create_agent_session_from_bootstrap(
     permission_callback: Any | None = None,
 ) -> AgentSession:
     """Create an AgentSession with consistent defaults across all modes."""
-    return AgentSession(
+    session = AgentSession(
         provider=bootstrap.provider,
         model=bootstrap.model_id,
         tools=bootstrap.tools,
@@ -177,3 +190,5 @@ def create_agent_session_from_bootstrap(
         small_provider=bootstrap.small_provider,
         small_model=bootstrap.small_model_id,
     )
+    setattr(session, "mcp_runtime", bootstrap.mcp_runtime)
+    return session

@@ -65,6 +65,8 @@ def _patch_config_paths(monkeypatch, tmp_path):
         "LEGACY_SERVER_PROVIDER_OVERLAY_PATH",
         legacy_root / "server-provider-overlay.json",
     )
+    monkeypatch.setattr(cfg_mod, "GLOBAL_MCP_PATH", artel_root / "mcp.json")
+    monkeypatch.setattr(cfg_mod, "LEGACY_GLOBAL_MCP_PATH", legacy_root / "mcp.json")
     monkeypatch.setattr(cfg_mod, "GLOBAL_STATE_FILE", artel_root / "state.json")
     monkeypatch.setattr(
         cfg_mod,
@@ -109,6 +111,10 @@ class TestMigrations:
         (legacy_root / "skills" / "testing.md").write_text("Testing skill\n", encoding="utf-8")
         (legacy_root / "registry_cache").mkdir()
         (legacy_root / "registry_cache" / "cache.json").write_text("{}", encoding="utf-8")
+        (legacy_root / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"global-demo": {"command": "uvx"}}}),
+            encoding="utf-8",
+        )
         (legacy_root / "state.json").write_text(
             json.dumps({"config_version": 1, "legacy_marker": "present"}),
             encoding="utf-8",
@@ -147,6 +153,7 @@ class TestMigrations:
             legacy_root / "config.toml"
         ).read_text(encoding="utf-8")
         assert (artel_root / "auth.json").exists()
+        assert (artel_root / "mcp.json").exists()
         assert (artel_root / "prompts" / "review.md").read_text(
             encoding="utf-8"
         ) == "Review prompt\n"
@@ -195,20 +202,13 @@ class TestArtelBootstrap:
             "check_and_migrate",
             lambda project_dir=None: seen.append(project_dir),
         )
-        monkeypatch.setattr(
-            bootstrap_mod,
-            "preflight_cmux",
-            lambda: bootstrap_mod.CmuxPreflightResult(ok=True, summary="cmux preflight passed."),
-        )
-
         raw_project_dir = tmp_path / "nested" / ".." / "project"
         result = bootstrap_mod.bootstrap_artel(str(raw_project_dir))
         resolved = str(raw_project_dir.resolve())
 
         assert result.project_dir == resolved
-        assert result.cmux_required is True
-        assert result.cmux_preflight is not None
-        assert result.cmux_preflight.ok is True
+        assert result.cmux_required is False
+        assert result.cmux_preflight is None
         assert seen == [resolved]
 
     def test_bootstrap_artel_skips_cmux_preflight_for_non_interactive_command(self, tmp_path, monkeypatch):
@@ -221,14 +221,6 @@ class TestArtelBootstrap:
             lambda project_dir=None: seen.append(project_dir),
         )
 
-        called = {"preflight": 0}
-
-        def fake_preflight():
-            called["preflight"] += 1
-            return bootstrap_mod.CmuxPreflightResult(ok=True, summary="cmux preflight passed.")
-
-        monkeypatch.setattr(bootstrap_mod, "preflight_cmux", fake_preflight)
-
         result = bootstrap_mod.bootstrap_artel(
             str(tmp_path / "project"),
             command_name="serve",
@@ -237,24 +229,16 @@ class TestArtelBootstrap:
         assert result.project_dir == str((tmp_path / "project").resolve())
         assert result.cmux_required is False
         assert result.cmux_preflight is None
-        assert called["preflight"] == 0
         assert seen == [result.project_dir]
 
     def test_bootstrap_artel_skips_cmux_preflight_for_connect_command(self, tmp_path, monkeypatch):
         import worker_core.artel_bootstrap as bootstrap_mod
 
-        called = {"preflight": 0}
         monkeypatch.setattr(
             bootstrap_mod,
             "check_and_migrate",
             lambda project_dir=None: None,
         )
-
-        def fake_preflight():
-            called["preflight"] += 1
-            return bootstrap_mod.CmuxPreflightResult(ok=True, summary="cmux preflight passed.")
-
-        monkeypatch.setattr(bootstrap_mod, "preflight_cmux", fake_preflight)
 
         result = bootstrap_mod.bootstrap_artel(
             str(tmp_path / "project"),
@@ -263,4 +247,3 @@ class TestArtelBootstrap:
 
         assert result.cmux_required is False
         assert result.cmux_preflight is None
-        assert called["preflight"] == 0

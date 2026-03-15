@@ -11,8 +11,9 @@ build/
 uv.lock
 *.db
 *.db-journal
-.artel/*
-!.artel/AGENTS.md
+.artel/
+.cursor/
+.neteragen/
 .worker/*
 !.worker/AGENTS.md
 .pytest_cache/

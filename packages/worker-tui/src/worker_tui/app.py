@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import shlex
+import subprocess
 import tempfile
 import urllib.parse
 import uuid
@@ -92,6 +93,60 @@ from worker_core.tools.builtins import create_builtin_tools
 from worker_tui.credential_forwarding import collect_forward_credentials
 from worker_tui.local_server import restart_managed_local_server
 from worker_tui.remote_control import RemoteControlClient
+
+
+_RU_QWERTY_KEY_ALIASES: dict[str, str] = {
+    "q": "й",
+    "w": "ц",
+    "e": "у",
+    "r": "к",
+    "t": "е",
+    "y": "н",
+    "u": "г",
+    "i": "ш",
+    "o": "щ",
+    "p": "з",
+    "[": "х",
+    "]": "ъ",
+    "a": "ф",
+    "s": "ы",
+    "d": "в",
+    "f": "а",
+    "g": "п",
+    "h": "р",
+    "j": "о",
+    "k": "л",
+    "l": "д",
+    ";": "ж",
+    "'": "э",
+    "z": "я",
+    "x": "ч",
+    "c": "с",
+    "v": "м",
+    "b": "и",
+    "n": "т",
+    "m": "ь",
+    ",": "б",
+    ".": "ю",
+}
+
+
+def _layout_safe_binding_variants(key: str) -> list[str]:
+    """Return layout aliases for a Textual key string when possible."""
+
+    normalized = str(key or "").strip().lower()
+    if not normalized:
+        return []
+    parts = normalized.split("+")
+    base = parts[-1]
+    alias = _RU_QWERTY_KEY_ALIASES.get(base)
+    if not alias:
+        return []
+    parts[-1] = alias
+    variant = "+".join(parts)
+    if variant == normalized:
+        return []
+    return [variant]
 
 
 class ComposerTextArea(TextArea):
@@ -329,6 +384,11 @@ BUILTIN_COMMAND_SUGGESTIONS: tuple[SlashCommandSuggestion, ...] = (
     SlashCommandSuggestion("/image-clear", "clear pending image attachments"),
     SlashCommandSuggestion("/image-remove", "remove a pending image attachment by index"),
     SlashCommandSuggestion("/copy", "copy the last assistant message"),
+    SlashCommandSuggestion("/delegates", "show orchestrated delegated runs in the current window"),
+    SlashCommandSuggestion("/agents", "legacy alias for /delegates"),
+    SlashCommandSuggestion("/mcp", "show MCP config sources, connections, and errors"),
+    SlashCommandSuggestion("/schedules", "inspect and control scheduled tasks on the active server"),
+    SlashCommandSuggestion("/wt", "manage git worktrees for the current repository"),
     SlashCommandSuggestion("/tasks", "show the shared task board"),
     SlashCommandSuggestion("/task-add", "add a task to the shared task board"),
     SlashCommandSuggestion("/task-done", "mark a task as done"),
@@ -991,12 +1051,21 @@ class WorkerApp(App):
 
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
+        Binding("ctrl+с", "quit", "Quit", show=False),
+        Binding("ctrl+p", "command_palette", "Command palette", show=False),
+        Binding("ctrl+з", "command_palette", "Command palette", show=False),
         Binding("ctrl+l", "clear", "Clear"),
+        Binding("ctrl+д", "clear", "Clear", show=False),
         Binding("ctrl+o", "toggle_tools", "Toggle tools"),
+        Binding("ctrl+щ", "toggle_tools", "Toggle tools", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Toggle board"),
+        Binding("ctrl+и", "toggle_sidebar", "Toggle board", show=False),
         Binding("ctrl+t", "focus_tasks", "Focus tasks", show=False),
+        Binding("ctrl+е", "focus_tasks", "Focus tasks", show=False),
         Binding("ctrl+n", "focus_notes", "Focus notes", show=False),
+        Binding("ctrl+т", "focus_notes", "Focus notes", show=False),
         Binding("ctrl+shift+c", "copy_last_assistant_message", "Copy last reply", show=False),
+        Binding("ctrl+shift+с", "copy_last_assistant_message", "Copy last reply", show=False),
     ]
 
     def __init__(
@@ -1059,6 +1128,7 @@ class WorkerApp(App):
         self._last_loaded_tasks_text: str = ""
         self._last_loaded_notes_text: str = ""
         self._board_poll_inflight: bool = False
+        self._delegation_events_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1095,10 +1165,13 @@ class WorkerApp(App):
         self._prompts = load_prompts(project_dir)
         self._skills = load_skills(project_dir)
         await self._load_tui_extensions(config)
+        await self._mount_builtin_delegation_widget()
 
         # Apply custom keybindings from config
         for key, action in config.keybindings.bindings.items():
             self.bind(key, action, description=action)
+            for alias in _layout_safe_binding_variants(key):
+                self.bind(alias, action, description=action, show=False)
 
         if self.remote_url:
             await self._restore_initial_remote_session()
@@ -1107,11 +1180,50 @@ class WorkerApp(App):
 
         self._sync_pending_attachments_bar()
         await self._load_board_state()
+        self._start_delegation_events()
         self.call_after_refresh(self._focus_input)
 
     def _focus_input(self) -> None:
         """Keep the main input focused for immediate typing."""
         self.query_one("#input-bar", TextArea).focus()
+
+    def _start_delegation_events(self) -> None:
+        if self.remote_url:
+            return
+        if self._delegation_events_task is not None and not self._delegation_events_task.done():
+            return
+        from worker_core.delegation.registry import get_registry
+
+        queue = get_registry().subscribe()
+        self._delegation_events_task = asyncio.create_task(self._consume_delegation_events(queue))
+
+    async def _consume_delegation_events(self, queue: asyncio.Queue[dict[str, object]]) -> None:
+        from worker_core.delegation.registry import get_registry
+
+        try:
+            while True:
+                payload = await queue.get()
+                event_type = str(payload.get("type", ""))
+                run = payload.get("run", {})
+                if not isinstance(run, dict):
+                    continue
+                if event_type == "completed":
+                    task = str(run.get("task", "")).strip()
+                    preview = str(run.get("result_preview", "")).strip()
+                    message = f"✅ Delegation completed: {task}" if task else "✅ Delegation completed"
+                    if preview:
+                        message += f"\n{preview}"
+                    self._add_message(message, role="tool")
+                elif event_type == "failed":
+                    task = str(run.get("task", "")).strip()
+                    error = str(run.get("error", "")).strip()
+                    message = f"✗ Delegation failed: {task}" if task else "✗ Delegation failed"
+                    if error:
+                        message += f"\n{error}"
+                    self._add_message(message, role="error")
+        except asyncio.CancelledError:
+            get_registry().unsubscribe(queue)
+            raise
 
     def _board_sidebar(self) -> BoardSidebar:
         return self.query_one("#board-sidebar", BoardSidebar)
@@ -1271,6 +1383,29 @@ class WorkerApp(App):
         set_level = getattr(footer, "set_thinking_level", None)
         if callable(set_level):
             set_level(level)
+
+    async def _sync_cmux_session_metadata(self) -> None:
+        project_dir = self._remote_project_dir.strip() if self.remote_url else os.getcwd()
+        model = self._provider_model.strip()
+        branch = ""
+        if project_dir:
+            try:
+                result = subprocess.run(
+                    ["git", "-C", project_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if result.returncode == 0:
+                    branch = result.stdout.strip()
+            except Exception:
+                branch = ""
+        if project_dir:
+            await cmux.set_status("project", project_dir, icon="folder", color="#94e2d5")
+        if branch and branch != "HEAD":
+            await cmux.set_status("branch", branch, icon="git-branch", color="#cba6f7")
+        if model:
+            await cmux.set_status("model", model, icon="cpu", color="#89b4fa")
 
     def _composer(self) -> TextArea:
         return self.query_one("#input-bar", TextArea)
@@ -1455,6 +1590,7 @@ class WorkerApp(App):
         if project_dir:
             self._remote_project_dir = project_dir
             footer.set_cwd(project_dir)
+        self.run_worker(self._sync_cmux_session_metadata, exclusive=False, thread=False)
         overrides = session.get("rule_overrides")
         if isinstance(overrides, dict):
             self._remote_rule_overrides = overrides
@@ -1585,6 +1721,14 @@ class WorkerApp(App):
             with suppress(Exception):
                 await ext.mount(self)
             self._register_tui_extension_keybindings(ext)
+
+    async def _mount_builtin_delegation_widget(self) -> None:
+        from worker_tui.delegation_widget import DelegationStatusWidget
+
+        main = self.query_one("#main-content")
+        input_bar = self.query_one("#input-bar")
+        with suppress(Exception):
+            await main.mount(DelegationStatusWidget(self), before=input_bar)
 
     def _register_tui_extension_keybindings(self, ext: Any) -> None:
         """Bind dynamic keybindings exported by TUI extensions."""
@@ -2371,6 +2515,7 @@ class WorkerApp(App):
         self._provider_model = f"{provider_name}/{model_id}"
         self.sub_title = self._provider_model
         self.query_one("#status-footer", StatusFooter).set_model(self._provider_model)
+        await self._sync_cmux_session_metadata()
         current_thinking = (
             self._session.thinking_level if self._session is not None else config.agent.thinking
         )
@@ -2532,6 +2677,11 @@ class WorkerApp(App):
                 "  /image-clear        — clear pending image attachments\n"
                 "  /image-remove <n>   — remove one pending image attachment\n"
                 "  /copy               — copy the last assistant message\n"
+                "  /delegates [subcmd] — inspect delegated orchestration runs\n"
+                "  /agents [subcmd]    — alias for /delegates\n"
+                "  /mcp [reload]       — show MCP status or reload MCP connections\n"
+                "  /schedules [subcmd] — list/run/reload scheduled tasks on the active server\n"
+                "  /wt [branch]        — manage git worktrees for the current repository\n"
                 "  /tasks              — show the shared task board\n"
                 "  /task-add <title>   — add a task to the shared task board\n"
                 "  /task-done <id>     — mark a task as done\n"
@@ -2629,6 +2779,14 @@ class WorkerApp(App):
             self._cmd_image_remove(arg)
         elif cmd == "/copy":
             self.action_copy_last_assistant_message()
+        elif cmd in {"/agents", "/delegates"}:
+            await self._cmd_agents(arg)
+        elif cmd == "/mcp":
+            await self._cmd_mcp(arg)
+        elif cmd == "/schedules":
+            await self._cmd_schedules(arg)
+        elif cmd == "/wt":
+            await self._cmd_wt(arg)
         elif cmd == "/tasks":
             await self._cmd_tasks()
         elif cmd == "/task-add":
@@ -2832,6 +2990,7 @@ class WorkerApp(App):
                     if self._session:
                         est = self._session._estimate_tokens()
                         footer.update_context_pct(est, self._session.context_window)
+                        await cmux.set_status("context", str(est), icon="database", color="#89dceb")
                         if self._session.context_window > 0:
                             pct = est / self._session.context_window
                             await cmux.set_progress(min(pct, 1.0), label=f"ctx {pct:.0%}")
@@ -3074,6 +3233,7 @@ class WorkerApp(App):
             self._apply_remote_session_state(session)
             self._provider_model = str(session.get("model", "")).strip() or model_str
             self.sub_title = self._provider_model
+            await self._sync_cmux_session_metadata()
             self._add_message(f"Switched to {self._provider_model}", role="tool")
             return
         if "/" not in model_str:
@@ -3131,6 +3291,9 @@ class WorkerApp(App):
         # Close old provider
         if self._session:
             await self._session.provider.close()
+            mcp_runtime = getattr(self._session, "mcp_runtime", None)
+            if mcp_runtime is not None:
+                await mcp_runtime.close()
         session_id = str(uuid.uuid4())
         if self._store:
             await self._store.create_session(
@@ -3151,6 +3314,7 @@ class WorkerApp(App):
         self._session.refresh_system_prompt()
         self._session.board_event_callback = self._handle_board_tool_event  # type: ignore[attr-defined]
         self._session.thinking_level = current_thinking  # type: ignore[assignment]
+        await self._sync_cmux_session_metadata()
 
         # Restore prior messages into new session
         if prior_messages:
@@ -3159,6 +3323,7 @@ class WorkerApp(App):
         self._provider_model = f"{provider_name}/{model_id}"
         self.sub_title = self._provider_model
         self.query_one("#status-footer", StatusFooter).set_model(self._provider_model)
+        await self._sync_cmux_session_metadata()
         self._set_footer_thinking_level(str(current_thinking))
         await self._load_board_state()
         self._add_message(f"Switched to {self._provider_model}", role="tool")
@@ -4553,6 +4718,243 @@ class WorkerApp(App):
         result = await cmux.browser_open(arg)
         self._add_message(f"Browser opened: {result or arg or '(empty)'}", role="tool")
 
+    async def _cmd_agents(self, arg: str) -> None:
+        """Inspect delegated orchestration runs."""
+        from worker_core.delegation.formatting import format_run_detail, format_run_list
+        from worker_core.delegation.registry import get_registry
+
+        command = arg.strip()
+        if self.remote_url:
+            sid = self._remote_session_id
+            try:
+                if not command or command in {"list", "ls"}:
+                    payload = await self._remote_control().request("GET", f"/api/sessions/{sid}/delegates")
+                    delegates = payload.get("delegates", [])
+                    if delegates:
+                        counts: dict[str, int] = {}
+                        for item in delegates:
+                            status = str(item.get("status", ""))
+                            counts[status] = counts.get(status, 0) + 1
+                        summary = ", ".join(f"{name}={counts[name]}" for name in sorted(counts))
+                        output = f"Orchestration runs: {len(delegates)} total ({summary})\n" + "\n".join(
+                            f"- {item['id']} [{item['status']}] ({item['mode']}) {item['task']}" + (f" — {item.get('latest_update', '')}" if item.get('latest_update') else "")
+                            for item in delegates
+                        )
+                    else:
+                        output = "No orchestration runs found."
+                else:
+                    parts = shlex.split(command)
+                    if parts[0] == "show" and len(parts) == 2:
+                        payload = await self._remote_control().request("GET", f"/api/sessions/{sid}/delegates/{parts[1]}")
+                        delegate = payload.get("delegate", {})
+                        output = "Orchestration run:\n" + "\n".join(
+                            [
+                                f"- id: {delegate.get('id', '')}",
+                                f"- parent_session_id: {delegate.get('parent_session_id', '')}",
+                                f"- status: {delegate.get('status', '')}",
+                                f"- model: {delegate.get('model', '')}",
+                                f"- mode: {delegate.get('mode', '')}",
+                                f"- project_dir: {delegate.get('project_dir', '')}",
+                                f"- created_at: {delegate.get('created_at', '')}",
+                                f"- task: {delegate.get('task', '')}",
+                            ]
+                        )
+                        if delegate.get("result"):
+                            output += f"\n\nResult:\n{delegate['result']}"
+                        if delegate.get("error"):
+                            output += f"\n\nError:\n{delegate['error']}"
+                    elif parts[0] == "tail" and len(parts) == 2:
+                        payload = await self._remote_control().request("GET", f"/api/sessions/{sid}/delegates/{parts[1]}")
+                        delegate = payload.get("delegate", {})
+                        events = delegate.get("events", []) or []
+                        lines = [f"Tail for orchestration run {parts[1]}:"]
+                        lines.extend(f"- {item}" for item in events[-10:])
+                        if delegate.get("latest_update"):
+                            lines.append("")
+                            lines.append(f"Latest: {delegate['latest_update']}")
+                        output = "\n".join(lines)
+                    elif parts[0] == "cancel" and len(parts) == 2:
+                        payload = await self._remote_control().request("POST", f"/api/sessions/{sid}/delegates/{parts[1]}/cancel", json_data={})
+                        output = f"Cancelled orchestration run: {parts[1]}" if payload.get("cancelled") else f"Failed to cancel orchestration run: {parts[1]}"
+                    else:
+                        output = "Usage:\n  /delegates\n  /delegates list\n  /delegates show <run_id>\n  /delegates tail <run_id>\n  /delegates cancel <run_id>\n\nAlias: /agents"
+            except Exception as exc:
+                self._add_message(f"agents error: {exc}", role="error")
+                return
+            self._add_message(output, role="tool")
+            return
+
+        registry = get_registry()
+        session_id = self._session.session_id if self._session is not None else ""
+        try:
+            parts = shlex.split(command)
+        except ValueError as exc:
+            self._add_message(f"agents error: {exc}", role="error")
+            return
+        if not parts or parts[0] in {"list", "ls"}:
+            runs = registry.list_runs(session_id)
+            rendered = format_run_list(runs)
+            if rendered.startswith("Delegates:"):
+                rendered = rendered.replace("Delegates:", "Orchestration runs:", 1)
+            elif rendered == "No delegates found.":
+                rendered = "No orchestration runs found."
+            self._add_message(rendered, role="tool")
+            return
+        if parts[0] == "show" and len(parts) == 2:
+            run = registry.get_session_run(session_id, parts[1])
+            if run is None:
+                self._add_message(f"delegates error: Unknown orchestration run: {parts[1]}", role="error")
+                return
+            rendered = format_run_detail(run)
+            if rendered.startswith("Delegate:"):
+                rendered = rendered.replace("Delegate:", "Orchestration run:", 1)
+            self._add_message(rendered, role="tool")
+            return
+        if parts[0] == "tail" and len(parts) == 2:
+            run = registry.get_session_run(session_id, parts[1])
+            if run is None:
+                self._add_message(f"delegates error: Unknown orchestration run: {parts[1]}", role="error")
+                return
+            lines = [f"Tail for orchestration run {parts[1]}:"]
+            lines.extend(f"- {item}" for item in run.events[-10:])
+            if run.latest_update:
+                lines.append("")
+                lines.append(f"Latest: {run.latest_update}")
+            self._add_message("\n".join(lines), role="tool")
+            return
+        if parts[0] == "cancel" and len(parts) == 2:
+            run = registry.get_session_run(session_id, parts[1])
+            if run is None:
+                self._add_message(f"delegates error: Unknown orchestration run: {parts[1]}", role="error")
+                return
+            registry.cancel(run.id)
+            rendered = format_run_detail(run)
+            if rendered.startswith("Delegate:"):
+                rendered = rendered.replace("Delegate:", "Orchestration run:", 1)
+            self._add_message(rendered, role="tool")
+            return
+        self._add_message(
+            "Usage:\n  /delegates\n  /delegates list\n  /delegates show <run_id>\n  /delegates tail <run_id>\n  /delegates cancel <run_id>\n\nAlias: /agents",
+            role="tool",
+        )
+
+    async def _cmd_schedules(self, arg: str) -> None:
+        """Show or control scheduled tasks on the active server."""
+        if not self.remote_url:
+            self._add_message(
+                "Scheduled tasks are managed by the server. Use a managed/remote server session.",
+                role="error",
+            )
+            return
+        command = arg.strip()
+        try:
+            if not command or command in {"list", "ls"}:
+                payload = await self._remote_control().list_schedules()
+                schedules = payload.get("schedules", [])
+                if not schedules:
+                    output = "No scheduled tasks configured."
+                else:
+                    lines = [
+                        f"Scheduled tasks: {payload.get('count', len(schedules))} total; next={payload.get('next_run_at', '') or '-'}"
+                    ]
+                    for item in schedules:
+                        schedule = item.get("schedule", {})
+                        state = item.get("state", {})
+                        trigger = (
+                            f"every {schedule.get('every_seconds', 0)}s"
+                            if schedule.get("kind") == "interval"
+                            else str(schedule.get("cron", ""))
+                        )
+                        lines.append(
+                            f"- {schedule.get('id', '')} [{'enabled' if schedule.get('enabled') else 'disabled'}] "
+                            f"{schedule.get('kind', '')}={trigger} status={state.get('last_status', 'idle')} "
+                            f"next={state.get('next_run_at', '') or '-'}"
+                        )
+                    output = "\n".join(lines)
+            else:
+                parts = shlex.split(command)
+                if parts[0] == "reload":
+                    payload = await self._remote_control().reload_schedules()
+                    output = f"Reloaded schedules: {payload.get('count', 0)} configured"
+                elif parts[0] == "run" and len(parts) == 2:
+                    payload = await self._remote_control().run_schedule(parts[1])
+                    output = f"Triggered schedule: {parts[1]}\nnext={payload.get('next_run_at', '') or '-'}"
+                elif parts[0] == "show" and len(parts) == 2:
+                    payload = await self._remote_control().list_schedules()
+                    found = None
+                    for item in payload.get("schedules", []):
+                        schedule = item.get("schedule", {})
+                        if str(schedule.get("id", "")) == parts[1]:
+                            found = item
+                            break
+                    if found is None:
+                        output = f"Unknown schedule: {parts[1]}"
+                    else:
+                        output = json.dumps(found, indent=2, sort_keys=True)
+                else:
+                    output = "Usage:\n  /schedules\n  /schedules list\n  /schedules show <id>\n  /schedules run <id>\n  /schedules reload"
+        except Exception as exc:
+            self._add_message(f"schedules error: {exc}", role="error")
+            return
+        self._add_message(output, role="tool")
+
+    async def _cmd_mcp(self, arg: str) -> None:
+        """Show or reload first-party MCP runtime state."""
+        if self.remote_url:
+            action = arg.strip().lower()
+            try:
+                if action == "reload":
+                    payload = await self._remote_control().request("POST", "/api/mcp/reload", json_data={})
+                else:
+                    payload = await self._remote_control().request("GET", "/api/mcp")
+            except Exception as exc:
+                self._add_message(f"mcp error: {exc}", role="error")
+                return
+            output = str(payload.get("status", "")).strip() or str(payload.get("error", "")).strip()
+            self._add_message(output or "(no output)", role="tool")
+            return
+
+        try:
+            from worker_core.mcp_runtime import McpRuntimeManager
+            from worker_core.extensions import ExtensionContext
+            from worker_core.config import load_config
+
+            runtime = McpRuntimeManager()
+            context = ExtensionContext(project_dir=os.getcwd(), runtime="local", config=load_config(os.getcwd()))
+            await runtime.load(context)
+            if arg.strip().lower() == "reload":
+                await runtime.reload()
+            output = runtime.status_text()
+            await runtime.close()
+            self._add_message(output or "(no output)", role="tool")
+        except Exception as exc:
+            self._add_message(f"mcp error: {exc}", role="error")
+
+    async def _cmd_wt(self, arg: str) -> None:
+        """Manage git worktrees for the current project."""
+        if self.remote_url:
+            try:
+                payload = await self._remote_control().request(
+                    "POST",
+                    f"/api/sessions/{self._remote_session_id}/wt",
+                    json_data={"arg": arg},
+                )
+            except Exception as exc:
+                self._add_message(f"wt error: {exc}", role="error")
+                return
+            output = str(payload.get("output", "")).strip()
+            session = payload.get("session")
+            if isinstance(session, dict):
+                self._apply_remote_session_state(session)
+            self._add_message(output or "(no output)", role="tool")
+            return
+
+        project_dir = self._session.project_dir if self._session is not None else os.getcwd()
+        from worker_core.worktree import run_worktree_command
+
+        output = await asyncio.to_thread(run_worktree_command, project_dir, arg)
+        self._add_message(output or "(no output)", role="tool")
+
     async def _cmd_server_restart(self) -> None:
         """Restart the managed local Artel server for this project."""
         if not self.remote_url:
@@ -4793,10 +5195,19 @@ class WorkerApp(App):
         """Close all open async resources."""
         self._cancel_board_save_task(self._tasks_save_task)
         self._cancel_board_save_task(self._notes_save_task)
+        if self._delegation_events_task is not None:
+            self._delegation_events_task.cancel()
+            with suppress(Exception):
+                await self._delegation_events_task
+            self._delegation_events_task = None
         await self._close_store()
         if self._session and self._session.provider:
             with suppress(Exception):
                 await self._session.provider.close()
+            mcp_runtime = getattr(self._session, "mcp_runtime", None)
+            if mcp_runtime is not None:
+                with suppress(Exception):
+                    await mcp_runtime.close()
         if self._ws:
             with suppress(Exception):
                 await self._ws.close()

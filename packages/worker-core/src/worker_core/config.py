@@ -60,6 +60,8 @@ SERVER_PROVIDER_OVERLAY_PATH = CONFIG_DIR / "server-provider-overlay.json"
 LEGACY_SERVER_PROVIDER_OVERLAY_PATH = (
     LEGACY_CONFIG_DIR / "server-provider-overlay.json"
 )
+GLOBAL_MCP_PATH = CONFIG_DIR / "mcp.json"
+LEGACY_GLOBAL_MCP_PATH = LEGACY_CONFIG_DIR / "mcp.json"
 GLOBAL_STATE_FILE = CONFIG_DIR / "state.json"
 LEGACY_GLOBAL_STATE_FILE = LEGACY_CONFIG_DIR / "state.json"
 
@@ -245,6 +247,10 @@ def effective_project_mcp_path(project_dir: str) -> Path:
     )
 
 
+def effective_global_mcp_path() -> Path:
+    return _first_existing_path(GLOBAL_MCP_PATH, LEGACY_GLOBAL_MCP_PATH) or GLOBAL_MCP_PATH
+
+
 def effective_server_provider_overlay_path() -> Path:
     return (
         _first_existing_path(
@@ -340,6 +346,7 @@ class ServerConfig(BaseModel):
     tls_cert: str = ""
     tls_key: str = ""
     max_sessions: int = 10
+    scheduler_enabled: bool = True
 
 
 OFFICIAL_REGISTRY_URL = (
@@ -741,6 +748,9 @@ bash = "ask"
 # Maximum concurrent sessions
 # max_sessions = 10
 
+# Enable built-in scheduled tasks runner inside `artel serve`
+# scheduler_enabled = true
+
 # ── Extensions ────────────────────────────────────────────────
 [extensions]
 # Directory for installed extensions
@@ -802,6 +812,9 @@ _PROJECT_TEMPLATE = """\
 # [permissions.bash_commands]
 # "git *" = "allow"
 # "make *" = "allow"
+#
+# [server]
+# scheduler_enabled = true
 """
 
 _AGENTS_MD_TEMPLATE = """\

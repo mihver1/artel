@@ -916,6 +916,16 @@ class TestStatusFooter:
 # ── Bash !/!! tests ───────────────────────────────────────────────
 
 
+class TestKeyboardLayoutFallbacks:
+    def test_layout_safe_binding_variants_adds_cyrillic_alias_for_ctrl_shortcuts(self):
+        from worker_tui.app import _layout_safe_binding_variants
+
+        assert _layout_safe_binding_variants("ctrl+l") == ["ctrl+д"]
+        assert _layout_safe_binding_variants("ctrl+p") == ["ctrl+з"]
+        assert _layout_safe_binding_variants("ctrl+shift+c") == ["ctrl+shift+с"]
+        assert _layout_safe_binding_variants("escape") == []
+
+
 class TestCopyAssistantMessage:
     def test_copy_last_assistant_message_uses_clipboard(self):
         from worker_tui.app import MessageWidget, WorkerApp
@@ -1448,6 +1458,44 @@ class TestBoardSidebar:
             rendered = (tmp_path / ".artel" / "tasks.md").read_text(encoding="utf-8")
             assert "- [x] Existing task" in rendered
             assert "- [ ] New task" in rendered
+
+    @pytest.mark.asyncio
+    async def test_cyrillic_ctrl_shortcuts_trigger_critical_actions(self, monkeypatch, tmp_path):
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+
+        app = WorkerApp()
+        copied: list[str] = []
+        palette_calls: list[str] = []
+        monkeypatch.setattr(app, "copy_to_clipboard", lambda text: copied.append(text))
+        monkeypatch.setattr(app, "action_command_palette", lambda: palette_calls.append("palette"))
+        app._assistant_message_history = [SimpleNamespace(content="copied reply")]
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+з")
+            await pilot.pause()
+            assert palette_calls == ["palette"]
+
+            await pilot.press("ctrl+д")
+            await pilot.pause()
+            assert len(app.query_one("#chat-container").children) == 0
+
+            await pilot.press("ctrl+и")
+            await pilot.pause()
+            assert app._sidebar_visible is True
+
+            await pilot.press("ctrl+т")
+            await pilot.pause()
+            assert app.query_one("#notes-editor").has_focus
+
+            await pilot.press("ctrl+shift+с")
+            await pilot.pause()
+            assert copied == ["copied reply"]
 
     @pytest.mark.asyncio
     async def test_notes_open_focuses_notes_editor(self, monkeypatch, tmp_path):
@@ -3098,9 +3146,18 @@ class TestRemoteModeCommandRouting:
 
         import worker_tui.app as tui_app
 
-        monkeypatch.setattr(tui_app.cmux, "set_status", _noop)
+        status_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        progress_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        async def _status(*args, **kwargs):
+            status_calls.append((args, kwargs))
+
+        async def _progress(*args, **kwargs):
+            progress_calls.append((args, kwargs))
+
+        monkeypatch.setattr(tui_app.cmux, "set_status", _status)
         monkeypatch.setattr(tui_app.cmux, "notify", _notify)
-        monkeypatch.setattr(tui_app.cmux, "set_progress", _noop)
+        monkeypatch.setattr(tui_app.cmux, "set_progress", _progress)
         monkeypatch.setattr(tui_app.cmux, "log", _log)
 
         await app._run_local.__wrapped__(app, "hello")
@@ -3108,7 +3165,38 @@ class TestRemoteModeCommandRouting:
         assert reasoning_blocks == ["pre-tool ", "post-tool"]
         assert assistant_messages == ["done"]
         assert ("tool: read", "info", "artel") in log_calls
+        assert (("context", "0"), {"icon": "database", "color": "#89dceb"}) in status_calls
+        assert progress_calls == []
         assert notify_calls == [("Artel", "Task complete", None)]
+
+    @pytest.mark.asyncio
+    async def test_sync_cmux_session_metadata_sets_project_branch_and_model(self, monkeypatch, tmp_path):
+        from worker_tui.app import WorkerApp
+        import worker_tui.app as tui_app
+
+        app = WorkerApp()
+        app._provider_model = "openai/gpt-4.1"
+
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        async def fake_set_status(*args, **kwargs):
+            calls.append((args, kwargs))
+
+        class _Result:
+            returncode = 0
+            stdout = "main\n"
+
+        monkeypatch.setattr(tui_app.cmux, "set_status", fake_set_status)
+        monkeypatch.setattr(tui_app.os, "getcwd", lambda: str(tmp_path))
+        monkeypatch.setattr(tui_app.subprocess, "run", lambda *args, **kwargs: _Result())
+
+        await app._sync_cmux_session_metadata()
+
+        assert calls == [
+            (("project", str(tmp_path)), {"icon": "folder", "color": "#94e2d5"}),
+            (("branch", "main"), {"icon": "git-branch", "color": "#cba6f7"}),
+            (("model", "openai/gpt-4.1"), {"icon": "cpu", "color": "#89b4fa"}),
+        ]
 
     @pytest.mark.asyncio
     async def test_run_remote_creates_new_reasoning_block_after_tool_call(self, monkeypatch):

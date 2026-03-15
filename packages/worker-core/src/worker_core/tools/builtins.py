@@ -21,6 +21,7 @@ from worker_core.board import (
 )
 from worker_core.execution import get_current_tool_execution_context
 from worker_core.tools import Tool
+from worker_core.worktree import run_worktree_command
 
 _MAX_READ_SIZE = 256 * 1024  # 256 KB
 
@@ -514,16 +515,97 @@ class AppendOperatorNoteTool(Tool):
         )
 
 
+class WorktreeTool(Tool):
+    """Manage git worktrees via the first-party Artel worktree service."""
+
+    name = "worktree"
+    description = (
+        "Manage git worktrees for the current repository. Supports creating, listing, removing, "
+        "and finishing managed worktrees using the same syntax as /wt."
+    )
+
+    def __init__(self, working_dir: str = "."):
+        self.working_dir = working_dir
+
+    async def execute(self, **kwargs: Any) -> str:
+        action = str(kwargs.get("action", "")).strip().lower()
+        branch = str(kwargs.get("branch", "")).strip()
+        target = str(kwargs.get("target", "")).strip()
+
+        if action in {"", "create"}:
+            arg = branch
+        elif action in {"list", "ls"}:
+            arg = "list"
+        elif action in {"remove", "rm"}:
+            if not target:
+                return "wt error: Usage: /wt rm <uniq_subpath>"
+            arg = f"rm {target}"
+        elif action in {"finish", "merge"}:
+            if not target:
+                return "wt error: Usage: /wt finish <uniq_subpath>"
+            arg = f"finish {target}"
+        elif action == "help":
+            arg = "help"
+        else:
+            return "Error: Invalid action. Expected one of: create, list, remove, finish, help."
+
+        return await asyncio.to_thread(run_worktree_command, self.working_dir, arg)
+
+    def definition(self) -> ToolDef:
+        return ToolDef(
+            name=self.name,
+            description=self.description,
+            parameters=[
+                ToolParam(
+                    name="action",
+                    type="string",
+                    description="Action to perform: create, list, remove, finish, or help",
+                    required=False,
+                    enum=["create", "list", "remove", "finish", "help"],
+                    default="create",
+                ),
+                ToolParam(
+                    name="branch",
+                    type="string",
+                    description="Branch name to create or check out when action=create",
+                    required=False,
+                ),
+                ToolParam(
+                    name="target",
+                    type="string",
+                    description="Unique managed worktree path fragment for remove/finish",
+                    required=False,
+                ),
+            ],
+        )
+
+
 def create_builtin_tools(working_dir: str = ".") -> list[Tool]:
     """Create the default Artel tools."""
+    from worker_core.delegation.service import DelegationService
+    from worker_core.delegation.tools import (
+        CancelDelegateTool,
+        DelegateTaskTool,
+        GetDelegateTool,
+        ListDelegatesTool,
+    )
+    from worker_core.tools.extra_search import create_extra_tools
     from worker_core.tools.web_fetch import WebFetchTool
     from worker_core.tools.web_search import WebSearchTool
+
+    delegation_service = lambda: DelegationService()  # noqa: E731
 
     return [
         ReadTool(working_dir),
         WriteTool(working_dir),
         EditTool(working_dir),
         BashTool(working_dir),
+        WorktreeTool(working_dir),
+        DelegateTaskTool(delegation_service),
+        ListDelegatesTool(delegation_service),
+        GetDelegateTool(delegation_service),
+        CancelDelegateTool(delegation_service),
+        *create_extra_tools(working_dir),
         WebSearchTool(),
         WebFetchTool(),
         ReadTasksTool(working_dir),
@@ -535,31 +617,50 @@ def create_builtin_tools(working_dir: str = ".") -> list[Tool]:
 
 
 def create_all_tools(working_dir: str = ".") -> list[Tool]:
-    """Create all 7 built-in tools including grep, find, ls."""
+    """Create the expanded local toolset including grep/find/ls and extra search tools."""
+    from worker_core.delegation.service import DelegationService
+    from worker_core.delegation.tools import (
+        CancelDelegateTool,
+        DelegateTaskTool,
+        GetDelegateTool,
+        ListDelegatesTool,
+    )
+    from worker_core.tools.extra_search import create_extra_tools
     from worker_core.tools.find import FindTool
     from worker_core.tools.grep import GrepTool
     from worker_core.tools.ls import LsTool
+
+    delegation_service = lambda: DelegationService()  # noqa: E731
 
     return [
         ReadTool(working_dir),
         WriteTool(working_dir),
         EditTool(working_dir),
         BashTool(working_dir),
+        WorktreeTool(working_dir),
+        DelegateTaskTool(delegation_service),
+        ListDelegatesTool(delegation_service),
+        GetDelegateTool(delegation_service),
+        CancelDelegateTool(delegation_service),
         GrepTool(working_dir),
         FindTool(working_dir),
         LsTool(working_dir),
+        *create_extra_tools(working_dir),
     ]
 
 
 def create_readonly_tools(working_dir: str = ".") -> list[Tool]:
-    """Create read-only tools for exploration (read, grep, find, ls)."""
+    """Create read-only tools for exploration."""
+    from worker_core.tools.extra_search import create_extra_tools
     from worker_core.tools.find import FindTool
     from worker_core.tools.grep import GrepTool
     from worker_core.tools.ls import LsTool
 
     return [
         ReadTool(working_dir),
+        WorktreeTool(working_dir),
         GrepTool(working_dir),
         FindTool(working_dir),
         LsTool(working_dir),
+        *create_extra_tools(working_dir),
     ]

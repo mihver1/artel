@@ -58,8 +58,24 @@ class PermissionPolicy:
         """Determine the base decision from config."""
         if tool_name == "bash":
             return self._check_bash(args)
-        if tool_name in {"read", "grep", "find", "ls", "web_search", "web_fetch"}:
+        if tool_name in {
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "glob",
+            "ag",
+            "ripgrep",
+            "web_search",
+            "web_fetch",
+            "list_delegates",
+            "get_delegate",
+        }:
             return Decision.ALLOW
+        if tool_name == "worktree":
+            return self._worktree_decision()
+        if tool_name in {"delegate_task", "cancel_delegate"}:
+            return Decision.ASK
 
         mapping = {
             "edit": self.config.edit,
@@ -83,3 +99,7 @@ class PermissionPolicy:
 
         # Fall back to general bash policy
         return Decision(self.config.bash)
+
+    def _worktree_decision(self) -> Decision:
+        raw = self.config.write
+        return Decision(raw)

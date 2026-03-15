@@ -11,8 +11,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from worker_core.mcp import MCPRegistry
-from worker_core.orchestration import OrchestratorRuntime
-from worker_core.worktree import WorktreeManager
 
 
 @dataclass(slots=True)
@@ -25,24 +23,13 @@ class BuiltinCapability:
 
 
 def load_builtin_capabilities(*, project_dir: str = "") -> dict[str, BuiltinCapability]:
-    worktree = BuiltinCapability(
-        name="artel-worktree",
-        kind="worktree",
-        instance=WorktreeManager(),
-    )
-    orchestration = BuiltinCapability(
-        name="artel-orchestration",
-        kind="orchestration",
-        instance=OrchestratorRuntime(worktrees=worktree.instance),
-    )
+    del project_dir
     mcp = BuiltinCapability(
         name="artel-mcp",
         kind="mcp",
         instance=MCPRegistry(),
     )
     return {
-        worktree.name: worktree,
-        orchestration.name: orchestration,
         mcp.name: mcp,
     }
 

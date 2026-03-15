@@ -184,6 +184,9 @@ class RpcServer:
     async def close(self) -> None:
         if self._session:
             await self._session.provider.close()
+            mcp_runtime = getattr(self._session, "mcp_runtime", None)
+            if mcp_runtime is not None:
+                await mcp_runtime.close()
             self._session = None
 
 

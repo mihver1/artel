@@ -31,10 +31,8 @@ from worker_core.control import (
 from worker_core.export import export_html
 from worker_core.extensions import Extension, HookDispatcher
 from worker_core.mcp import MCPConfig, MCPRegistry, MCPServerConfig
-from worker_core.orchestration import EmployeeRecord, EmployeeRegistry, OrchestratorRuntime
 from worker_core.sessions import SessionStore
 from worker_core.tools import Tool
-from worker_core.worktree import WorktreeHandle, WorktreeManager
 
 __all__ = [
     "AgentEvent",
@@ -50,9 +48,6 @@ __all__ = [
     "MCPConfig",
     "MCPRegistry",
     "MCPServerConfig",
-    "EmployeeRecord",
-    "EmployeeRegistry",
-    "OrchestratorRuntime",
     "bootstrap_artel_workspace",
     "ensure_artel_dashboard_surface",
     "ensure_artel_orchestrator_surface",
@@ -62,8 +57,6 @@ __all__ = [
     "RemoteWorkerControl",
     "SessionStore",
     "Tool",
-    "WorktreeHandle",
-    "WorktreeManager",
     "WorkerConfig",
     "WorkerControl",
     "export_html",

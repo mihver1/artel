@@ -62,6 +62,18 @@ class WorkerControl(Protocol):
 
     async def init_config(self) -> dict[str, Any]: ...
 
+    async def get_mcp_status(self) -> dict[str, Any]: ...
+
+    async def reload_mcp(self) -> dict[str, Any]: ...
+
+    async def get_mcp_config(self, scope: str = "effective") -> dict[str, Any]: ...
+
+    async def put_mcp_config(self, *, scope: str, servers: list[dict[str, Any]]) -> dict[str, Any]: ...
+
+    async def upsert_mcp_server(self, *, scope: str, server: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def remove_mcp_server(self, *, scope: str, name: str) -> dict[str, Any]: ...
+
     async def list_sessions(self) -> dict[str, Any]: ...
 
     async def get_session(self, session_id: str) -> dict[str, Any]: ...
@@ -176,6 +188,18 @@ class WorkerControl(Protocol):
         login_id: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]: ...
+
+    async def list_schedules(self) -> dict[str, Any]: ...
+
+    async def create_schedule(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def update_schedule(self, schedule_id: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    async def delete_schedule(self, schedule_id: str) -> dict[str, Any]: ...
+
+    async def run_schedule(self, schedule_id: str) -> dict[str, Any]: ...
+
+    async def reload_schedules(self) -> dict[str, Any]: ...
 
 
 def remote_rest_base_url(remote_url: str) -> str:
@@ -292,6 +316,39 @@ class RemoteWorkerControl:
 
     async def init_config(self) -> dict[str, Any]:
         return await self.request("POST", "/api/config/init", json_data={})
+
+    async def get_mcp_status(self) -> dict[str, Any]:
+        return await self.request("GET", "/api/mcp")
+
+    async def reload_mcp(self) -> dict[str, Any]:
+        return await self.request("POST", "/api/mcp/reload", json_data={})
+
+    async def get_mcp_config(self, scope: str = "effective") -> dict[str, Any]:
+        return await self.request("GET", f"/api/mcp/config?scope={quote(scope, safe='')}")
+
+    async def put_mcp_config(self, *, scope: str, servers: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self.request("PUT", "/api/mcp/config", json_data={"scope": scope, "servers": servers})
+
+    async def upsert_mcp_server(self, *, scope: str, server: dict[str, Any]) -> dict[str, Any]:
+        payload = await self.get_mcp_config(scope)
+        current = payload.get("servers", [])
+        if isinstance(current, dict):
+            current_values = list(current.values())
+        else:
+            current_values = list(current)
+        filtered = [item for item in current_values if isinstance(item, dict) and str(item.get("name", "")) != str(server.get("name", ""))]
+        filtered.append(server)
+        return await self.put_mcp_config(scope=scope, servers=filtered)
+
+    async def remove_mcp_server(self, *, scope: str, name: str) -> dict[str, Any]:
+        payload = await self.get_mcp_config(scope)
+        current = payload.get("servers", [])
+        if isinstance(current, dict):
+            current_values = list(current.values())
+        else:
+            current_values = list(current)
+        filtered = [item for item in current_values if isinstance(item, dict) and str(item.get("name", "")) != name]
+        return await self.put_mcp_config(scope=scope, servers=filtered)
 
     async def list_sessions(self) -> dict[str, Any]:
         return await self.request("GET", "/api/sessions")
@@ -532,6 +589,24 @@ class RemoteWorkerControl:
             "/api/oauth/complete",
             json_data={"login_id": login_id, "payload": payload},
         )
+
+    async def list_schedules(self) -> dict[str, Any]:
+        return await self.request("GET", "/api/schedules")
+
+    async def create_schedule(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self.request("POST", "/api/schedules", json_data=payload)
+
+    async def update_schedule(self, schedule_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self.request("PUT", f"/api/schedules/{quote(schedule_id, safe='')}", json_data=payload)
+
+    async def delete_schedule(self, schedule_id: str) -> dict[str, Any]:
+        return await self.request("DELETE", f"/api/schedules/{quote(schedule_id, safe='')}")
+
+    async def run_schedule(self, schedule_id: str) -> dict[str, Any]:
+        return await self.request("POST", f"/api/schedules/{quote(schedule_id, safe='')}/run", json_data={})
+
+    async def reload_schedules(self) -> dict[str, Any]:
+        return await self.request("POST", "/api/schedules/reload", json_data={})
 
 
 ArtelControl = WorkerControl

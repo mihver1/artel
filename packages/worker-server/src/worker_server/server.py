@@ -11,7 +11,8 @@ import shlex
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +66,9 @@ from worker_core.extensions_admin import (
     update_all_extensions,
     update_extension,
 )
-from worker_core.orchestration import OrchestratorRuntime
+from worker_core.delegation.registry import get_registry as get_delegation_registry
+from worker_core.mcp import MCPConfig, MCPRegistry, MCPServerConfig
+from worker_core.mcp_runtime import McpRuntimeManager
 from worker_core.prompts import load_prompts, render_prompt
 from worker_core.rules import (
     SessionRuleOverrides,
@@ -79,6 +82,23 @@ from worker_core.rules import (
     set_rule_enabled_for_session,
     move_rule,
     update_rule,
+)
+from worker_core.schedules import (
+    ScheduleRecord,
+    ScheduleRunRecord,
+    ScheduleStateRecord,
+    ScheduleRegistry,
+    add_schedule,
+    delete_schedule,
+    load_schedule_states_for_scope,
+    next_schedule_time,
+    parse_timestamp,
+    render_prompt_variables,
+    serialize_schedule,
+    serialize_schedule_run,
+    serialize_schedule_state,
+    update_schedule,
+    write_schedule_states,
 )
 from worker_core.provider_resolver import (
     get_effective_model_info,
@@ -97,6 +117,16 @@ from worker_server.provider_overlay import (
 )
 
 logger = logging.getLogger("artel.server")
+
+
+def _schedule_now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_timestamp(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
 @dataclass
@@ -122,6 +152,9 @@ class ServerState:
     server_extensions: list[Any] = field(default_factory=list)
     default_project_dir: str = ""
     store: SessionStore | None = None
+    mcp_runtime: McpRuntimeManager | None = None
+    schedule_registry: ScheduleRegistry = field(default_factory=ScheduleRegistry)
+    schedule_service: ScheduleService | None = None
 
 def _tool_kind_for_name(tool_name: str) -> str:
     mapping = {
@@ -234,6 +267,426 @@ def _agent_event_payload(event: Any, *, cwd: str | None = None) -> dict[str, Any
     elif event.type == AgentEventType.ERROR:
         payload["error"] = event.error
     return payload
+
+
+class ScheduleService:
+    """In-process scheduler for server-side scheduled prompts/tasks."""
+
+    def __init__(self, state: ServerState) -> None:
+        self.state = state
+        self._loop_task: asyncio.Task[None] | None = None
+        self._reload_event = asyncio.Event()
+        self._lock = asyncio.Lock()
+        self._stop_requested = False
+        self._run_history: dict[str, list[ScheduleRunRecord]] = {}
+        self._run_tasks: dict[str, asyncio.Task[None]] = {}
+        self._schedule_states: dict[str, ScheduleStateRecord] = {}
+        self._schedule_tasks: dict[str, set[str]] = {}
+        self._schedule_scope: dict[str, str] = {}
+        self._loaded_schedules: dict[str, ScheduleRecord] = {}
+        self._history_path = Path(self.state.default_project_dir) / ".artel" / "schedules-history.json"
+
+    async def start(self) -> None:
+        await self.reload()
+        self._stop_requested = False
+        self._loop_task = asyncio.create_task(self._run_loop(), name="artel-scheduler")
+
+    async def stop(self) -> None:
+        self._stop_requested = True
+        self._reload_event.set()
+        if self._loop_task is not None:
+            self._loop_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await self._loop_task
+        for task in list(self._run_tasks.values()):
+            task.cancel()
+        for task in list(self._run_tasks.values()):
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        self._run_tasks.clear()
+
+    async def reload(self) -> dict[str, Any]:
+        async with self._lock:
+            loaded = self.state.schedule_registry.load_merged_config(self.state.default_project_dir)
+            self._loaded_schedules = loaded.schedules
+            self._schedule_scope = {schedule_id: record.scope for schedule_id, record in loaded.schedules.items()}
+            self._load_state_files()
+            self._load_history_file()
+            now = datetime.now(UTC)
+            for schedule_id, record in loaded.schedules.items():
+                state_record = self._schedule_states.setdefault(schedule_id, ScheduleStateRecord(schedule_id=schedule_id))
+                state_record.next_run_at = self._compute_next_run(record, state_record, now=now)
+                state_record.updated_at = _schedule_now()
+            for schedule_id in list(self._schedule_states):
+                if schedule_id not in loaded.schedules:
+                    self._schedule_states.pop(schedule_id, None)
+                    self._schedule_tasks.pop(schedule_id, None)
+            self._persist_states()
+        self._reload_event.set()
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        schedules_payload: list[dict[str, Any]] = []
+        for schedule_id, record in sorted(self._loaded_schedules.items()):
+            state_record = self._schedule_states.get(schedule_id, ScheduleStateRecord(schedule_id=schedule_id))
+            schedules_payload.append(
+                {
+                    "schedule": serialize_schedule(record),
+                    "state": serialize_schedule_state(state_record),
+                    "runs": [serialize_schedule_run(run) for run in self._run_history.get(schedule_id, [])],
+                }
+            )
+        next_run_at = ""
+        candidates = [
+            state_record.next_run_at
+            for schedule_id, state_record in self._schedule_states.items()
+            if self._loaded_schedules.get(schedule_id) is not None and state_record.next_run_at
+        ]
+        if candidates:
+            next_run_at = min(candidates)
+        return {
+            "enabled": bool(self.state.config.server.scheduler_enabled),
+            "count": len(self._loaded_schedules),
+            "next_run_at": next_run_at,
+            "schedules": schedules_payload,
+        }
+
+    async def run_now(self, schedule_id: str, *, trigger: str = "manual") -> dict[str, Any]:
+        record = self._loaded_schedules.get(schedule_id)
+        if record is None:
+            raise RuntimeError(f"Schedule '{schedule_id}' not found")
+        await self._trigger_schedule(record, trigger=trigger, scheduled_for=datetime.now(UTC))
+        return self.snapshot()
+
+    async def _run_loop(self) -> None:
+        try:
+            while not self._stop_requested:
+                record, wait_seconds = self._next_due_schedule()
+                if record is None:
+                    self._reload_event.clear()
+                    await self._reload_event.wait()
+                    continue
+                if wait_seconds > 0:
+                    self._reload_event.clear()
+                    try:
+                        await asyncio.wait_for(self._reload_event.wait(), timeout=wait_seconds)
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+                await self._trigger_due_schedule(record)
+        except asyncio.CancelledError:
+            raise
+
+    async def _trigger_due_schedule(self, record: ScheduleRecord) -> None:
+        state_record = self._schedule_states.setdefault(record.id, ScheduleStateRecord(schedule_id=record.id))
+        now = datetime.now(UTC)
+        due_at = parse_timestamp(state_record.next_run_at) or now
+        missed: list[datetime] = []
+        if due_at <= now:
+            if record.run_missed == "all":
+                current = due_at
+                limit = 25
+                while current <= now and limit > 0:
+                    missed.append(current)
+                    current = next_schedule_time(record, current) or (now + timedelta(days=366))
+                    limit -= 1
+            elif record.run_missed == "latest":
+                latest = due_at
+                current = due_at
+                limit = 25
+                while current <= now and limit > 0:
+                    latest = current
+                    current = next_schedule_time(record, current) or (now + timedelta(days=366))
+                    limit -= 1
+                missed.append(latest)
+            else:
+                missed.append(now)
+        if not missed:
+            missed.append(now)
+        for scheduled_for in missed:
+            await self._trigger_schedule(record, trigger="schedule", scheduled_for=scheduled_for)
+
+    def _next_due_schedule(self) -> tuple[ScheduleRecord | None, float]:
+        now = datetime.now(UTC)
+        best_record: ScheduleRecord | None = None
+        best_time: datetime | None = None
+        for schedule_id, record in self._loaded_schedules.items():
+            if not record.enabled:
+                continue
+            state_record = self._schedule_states.setdefault(schedule_id, ScheduleStateRecord(schedule_id=schedule_id))
+            next_run = parse_timestamp(state_record.next_run_at) if state_record.next_run_at else None
+            if next_run is None:
+                next_text = self._compute_next_run(record, state_record, now=now)
+                state_record.next_run_at = next_text
+                next_run = parse_timestamp(next_text) if next_text else None
+            if next_run is None:
+                continue
+            if best_time is None or next_run < best_time:
+                best_time = next_run
+                best_record = record
+        if best_record is None or best_time is None:
+            return None, 0.0
+        return best_record, max(0.0, (best_time - now).total_seconds())
+
+    async def _trigger_schedule(self, record: ScheduleRecord, *, trigger: str, scheduled_for: datetime) -> None:
+        schedule_id = record.id
+        state_record = self._schedule_states.setdefault(schedule_id, ScheduleStateRecord(schedule_id=schedule_id))
+        state_record.next_run_at = ""
+        running_ids = [run_id for run_id in state_record.running_run_ids if run_id in self._run_tasks and not self._run_tasks[run_id].done()]
+        state_record.running_run_ids = running_ids
+        if running_ids:
+            if record.overlap_policy == "skip":
+                self._append_run(
+                    ScheduleRunRecord(
+                        id=f"schedule-run-{uuid.uuid4().hex[:8]}",
+                        schedule_id=schedule_id,
+                        trigger=trigger,
+                        status="skipped",
+                        started_at=_schedule_now(),
+                        finished_at=_schedule_now(),
+                        scheduled_for=_format_timestamp(scheduled_for),
+                        error="Skipped due to overlap policy.",
+                    )
+                )
+                state_record.last_status = "skipped"
+                state_record.last_error = "Skipped due to overlap policy."
+                state_record.total_skips += 1
+                state_record.total_runs += 1
+                state_record.last_run_at = _schedule_now()
+                state_record.next_run_at = self._compute_next_run(record, state_record, now=scheduled_for)
+                state_record.updated_at = _schedule_now()
+                self._persist_states(record.scope)
+                return
+            if record.overlap_policy == "cancel_previous":
+                for run_id in running_ids:
+                    task = self._run_tasks.get(run_id)
+                    if task is not None:
+                        task.cancel()
+        run_id = f"schedule-run-{uuid.uuid4().hex[:8]}"
+        run_record = ScheduleRunRecord(
+            id=run_id,
+            schedule_id=schedule_id,
+            trigger=trigger,
+            status="running",
+            started_at=_schedule_now(),
+            scheduled_for=_format_timestamp(scheduled_for),
+        )
+        state_record.running_run_ids.append(run_id)
+        state_record.last_status = "running"
+        state_record.last_run_id = run_id
+        state_record.total_runs += 1
+        state_record.updated_at = _schedule_now()
+        self._append_run(run_record)
+        task = asyncio.create_task(self._execute_schedule(record, run_record), name=f"artel-schedule-{schedule_id}")
+        self._run_tasks[run_id] = task
+        self._schedule_tasks.setdefault(schedule_id, set()).add(run_id)
+        task.add_done_callback(lambda done, _run_id=run_id: self._run_tasks.pop(_run_id, None))
+        self._persist_states(record.scope)
+
+    async def _execute_schedule(self, record: ScheduleRecord, run_record: ScheduleRunRecord) -> None:
+        schedule_id = record.id
+        state_record = self._schedule_states.setdefault(schedule_id, ScheduleStateRecord(schedule_id=schedule_id))
+        project_dir = _request_project_dir(self.state, record.project_dir)
+        model = record.model.strip()
+        session_id = self._scheduled_session_id(record, run_record)
+        content = self._render_content(record, project_dir)
+        try:
+            session = await self._prepare_scheduled_session(record, session_id, project_dir, model)
+            controller = _get_session_controller(self.state, session_id)
+            await controller.start(content)
+            task = controller._run_task
+            assert task is not None
+            if record.max_runtime_seconds > 0:
+                await asyncio.wait_for(asyncio.shield(task), timeout=record.max_runtime_seconds)
+            else:
+                await asyncio.shield(task)
+            run_record.status = "succeeded"
+            run_record.result_preview = self._result_preview(session)
+            run_record.session_id = session_id
+            state_record.total_successes += 1
+            state_record.last_result_preview = run_record.result_preview
+            state_record.last_error = ""
+            state_record.last_session_id = session_id
+        except asyncio.TimeoutError:
+            controller = self.state.session_controllers.get(session_id)
+            if controller is not None:
+                with suppress(Exception):
+                    await controller.abort()
+            run_record.status = "failed"
+            run_record.error = f"Timed out after {record.max_runtime_seconds} seconds"
+            state_record.total_failures += 1
+            state_record.last_error = run_record.error
+        except asyncio.CancelledError:
+            controller = self.state.session_controllers.get(session_id)
+            if controller is not None:
+                with suppress(Exception):
+                    await controller.abort()
+            run_record.status = "cancelled"
+            run_record.error = "Cancelled"
+            state_record.last_error = run_record.error
+            raise
+        except Exception as exc:
+            run_record.status = "failed"
+            run_record.error = str(exc)
+            state_record.total_failures += 1
+            state_record.last_error = str(exc)
+        finally:
+            run_record.finished_at = _schedule_now()
+            state_record.last_status = run_record.status
+            state_record.last_run_at = run_record.started_at
+            state_record.last_run_id = run_record.id
+            if run_record.session_id:
+                state_record.last_session_id = run_record.session_id
+            state_record.running_run_ids = [item for item in state_record.running_run_ids if item != run_record.id]
+            state_record.next_run_at = self._compute_next_run(record, state_record, now=datetime.now(UTC))
+            state_record.updated_at = _schedule_now()
+            self._persist_states(record.scope)
+
+    async def _prepare_scheduled_session(
+        self,
+        record: ScheduleRecord,
+        session_id: str,
+        project_dir: str,
+        model: str,
+    ) -> AgentSession:
+        await _ensure_session_idle(self.state, session_id)
+        session_config = self.state.config.model_copy(deep=True)
+        if record.session_mode == "new":
+            previous = self.state.sessions.pop(session_id, None)
+            if previous is not None:
+                with suppress(Exception):
+                    await previous.provider.close()
+            self.state.session_provider_models.pop(session_id, None)
+            self.state.session_projects.pop(session_id, None)
+            self.state.session_thinking_levels.pop(session_id, None)
+        if record.execution_mode == "readonly":
+            session_config.permissions.edit = "deny"
+            session_config.permissions.write = "deny"
+            session_config.permissions.bash = "deny"
+            session_config.permissions.bash_commands = {}
+        if model:
+            if "/" not in model:
+                raise RuntimeError("Schedule model must be in provider/model-id format")
+            provider_name, model_id = model.split("/", 1)
+            return await _create_server_session(
+                self.state,
+                session_id,
+                provider_name=provider_name,
+                model_id=model_id,
+                project_dir=project_dir,
+                session_config=session_config,
+            )
+        return await _create_server_session(
+            self.state,
+            session_id,
+            project_dir=project_dir,
+            session_config=session_config,
+        )
+
+    def _render_content(self, record: ScheduleRecord, project_dir: str) -> str:
+        if record.prompt.strip():
+            return record.prompt
+        prompts = load_prompts(project_dir)
+        template = prompts.get(record.prompt_name)
+        if not template:
+            raise RuntimeError(f"Prompt '{record.prompt_name}' not found")
+        return render_prompt(template, render_prompt_variables(record.arg))
+
+    def _result_preview(self, session: AgentSession) -> str:
+        for message in reversed(session.messages[1:]):
+            if getattr(message.role, "value", "") == "assistant" and message.content.strip():
+                return message.content.strip()[:400]
+        return ""
+
+    def _compute_next_run(self, record: ScheduleRecord, state_record: ScheduleStateRecord, *, now: datetime) -> str:
+        anchor = now
+        last_run = parse_timestamp(state_record.last_run_at)
+        if last_run is not None and last_run > anchor:
+            anchor = last_run
+        if state_record.next_run_at:
+            existing = parse_timestamp(state_record.next_run_at)
+            if existing is not None and existing > now and record.kind == "interval":
+                anchor = max(now, existing - timedelta(seconds=record.every_seconds))
+        if record.run_missed != "none" and last_run is not None:
+            candidate = next_schedule_time(record, last_run)
+            if candidate is not None and candidate <= now:
+                return _format_timestamp(now)
+        candidate = next_schedule_time(record, anchor)
+        return _format_timestamp(candidate) if candidate is not None else ""
+
+    def _append_run(self, run_record: ScheduleRunRecord) -> None:
+        runs = self._run_history.setdefault(run_record.schedule_id, [])
+        runs.append(run_record)
+        if len(runs) > 100:
+            del runs[:-100]
+        self._persist_history_file()
+
+    def _load_state_files(self) -> None:
+        self._schedule_states = {}
+        for scope in ("global", "project"):
+            states = load_schedule_states_for_scope(self.state.default_project_dir, scope=scope)  # type: ignore[arg-type]
+            for schedule_id, record in states.items():
+                self._schedule_states[schedule_id] = record
+
+    def _load_history_file(self) -> None:
+        self._run_history = {}
+        if not self._history_path.exists():
+            return
+        try:
+            payload = json.loads(self._history_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        raw_items = payload.get("schedules", {}) if isinstance(payload, dict) else {}
+        if not isinstance(raw_items, dict):
+            return
+        for schedule_id, values in raw_items.items():
+            if not isinstance(values, list):
+                continue
+            records: list[ScheduleRunRecord] = []
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                records.append(
+                    ScheduleRunRecord(
+                        id=str(item.get("id", "") or ""),
+                        schedule_id=str(item.get("schedule_id", schedule_id) or schedule_id),
+                        trigger=str(item.get("trigger", "") or ""),
+                        status=str(item.get("status", "idle") or "idle"),
+                        started_at=str(item.get("started_at", "") or ""),
+                        scheduled_for=str(item.get("scheduled_for", "") or ""),
+                        finished_at=str(item.get("finished_at", "") or ""),
+                        session_id=str(item.get("session_id", "") or ""),
+                        error=str(item.get("error", "") or ""),
+                        result_preview=str(item.get("result_preview", "") or ""),
+                    )
+                )
+            if records:
+                self._run_history[str(schedule_id)] = records[-100:]
+
+    def _persist_history_file(self) -> None:
+        self._history_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schedules": {
+                schedule_id: [serialize_schedule_run(run) for run in runs[-100:]]
+                for schedule_id, runs in sorted(self._run_history.items())
+            }
+        }
+        self._history_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _persist_states(self, scope: str | None = None) -> None:
+        scopes = [scope] if scope in {"global", "project"} else ["global", "project"]
+        for current_scope in scopes:
+            scoped = {
+                schedule_id: state_record
+                for schedule_id, state_record in self._schedule_states.items()
+                if self._schedule_scope.get(schedule_id, "project") == current_scope
+            }
+            write_schedule_states(self.state.default_project_dir, scoped, scope=current_scope)  # type: ignore[arg-type]
+
+    def _scheduled_session_id(self, record: ScheduleRecord, run_record: ScheduleRunRecord) -> str:
+        if record.session_mode == "reuse":
+            return f"schedule:{record.id}"
+        return f"schedule:{record.id}:{run_record.id}"
 
 
 class SessionController:
@@ -690,17 +1143,19 @@ async def _create_server_session(
     model_id: str | None = None,
     project_dir: str | None = None,
     prior_messages: list[Any] | None = None,
+    session_config: WorkerConfig | None = None,
 ) -> AgentSession:
     from worker_core.cli import _resolve_api_key
 
     stored_info, stored_messages = await _stored_session_context(state, session_id)
+    effective_config = session_config or state.config
     resolved_provider, resolved_model = (
         (provider_name, model_id)
         if provider_name is not None and model_id is not None
         else (
             stored_info.model.split("/", 1)
             if stored_info is not None and "/" in stored_info.model
-            else resolve_model(state.config)
+            else resolve_model(effective_config)
         )
     )
     resolved_project_dir = project_dir or _session_project_dir(
@@ -710,7 +1165,7 @@ async def _create_server_session(
         stored_info,
     )
     runtime = await bootstrap_runtime(
-        state.config,
+        effective_config,
         resolved_provider,
         resolved_model,
         project_dir=resolved_project_dir,
@@ -722,7 +1177,7 @@ async def _create_server_session(
     if permission_callback is None:
         permission_callback = _server_permission_callback(state, session_id)
     session = create_agent_session_from_bootstrap(
-        state.config,
+        effective_config,
         runtime,
         project_dir=resolved_project_dir,
         store=state.store,
@@ -1168,7 +1623,9 @@ async def _handle_message(ws: ServerConnection, msg: dict[str, Any], state: Serv
             while True:
                 payload = await queue.get()
                 await ws.send(json.dumps(payload))
-                if payload.get("type") in {"done", "error"}:
+                if payload.get("type") == "error":
+                    break
+                if payload.get("type") == "status" and payload.get("busy") is False:
                     break
         finally:
             controller.unsubscribe(queue)
@@ -1301,6 +1758,11 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
         return value
 
     async def handle_server_info(request: web.Request) -> web.Response:
+        schedule_summary = state.schedule_service.snapshot() if state.schedule_service is not None else {
+            "enabled": False,
+            "count": 0,
+            "next_run_at": "",
+        }
         return web.json_response(
             {
                 "version": "0.1.0",
@@ -1312,6 +1774,7 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
                 "max_sessions": state.config.server.max_sessions,
                 "loaded_extensions": len(state.server_extensions),
                 "provider_overlay_path": str(effective_server_provider_overlay_path()),
+                "scheduler": schedule_summary,
             }
         )
 
@@ -1331,6 +1794,7 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
         return web.json_response({"config": _redact_value(effective)})
 
     async def handle_server_diagnostics(request: web.Request) -> web.Response:
+        scheduler_snapshot = state.schedule_service.snapshot() if state.schedule_service is not None else None
         return web.json_response(
             {
                 "active_sessions": len(state.sessions),
@@ -1343,6 +1807,7 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
                 "project_config_exists": _project_config_path().exists(),
                 "provider_overlay_exists": effective_server_provider_overlay_path().exists(),
                 "sessions_db_exists": Path(state.config.sessions.db_path).exists(),
+                "scheduler": scheduler_snapshot,
             }
         )
 
@@ -1570,6 +2035,155 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
         ok, message = remove_registry(name)
         status = 200 if ok else 400
         return web.json_response({"ok": ok, "message": message}, status=status)
+
+    async def handle_mcp_get(request: web.Request) -> web.Response:
+        registry = MCPRegistry()
+        loaded = registry.load_merged_config(state.default_project_dir)
+        if state.mcp_runtime is not None:
+            runtime_status = state.mcp_runtime.status_payload()
+            status_text = state.mcp_runtime.status_text()
+        else:
+            runtime_status = {
+                "available": False,
+                "sources": [str(path) for path in loaded.sources],
+                "servers": [],
+                "summary": {
+                    "connected": 0,
+                    "disabled": 0,
+                    "failed": 0,
+                    "needs_auth": 0,
+                    "timeout": 0,
+                    "unavailable": len(loaded.servers),
+                    "total": len(loaded.servers),
+                },
+            }
+            status_text = "MCP runtime unavailable."
+        return web.json_response(
+            {
+                "sources": [str(path) for path in loaded.sources],
+                "servers": {name: asdict(server) for name, server in loaded.servers.items()},
+                "status": status_text,
+                "runtime": runtime_status,
+            }
+        )
+
+    async def handle_mcp_reload(request: web.Request) -> web.Response:
+        if state.mcp_runtime is None:
+            state.mcp_runtime = McpRuntimeManager()
+            await state.mcp_runtime.load(
+                ExtensionContext(
+                    project_dir=state.default_project_dir,
+                    runtime="server",
+                    config=state.config,
+                    extras={},
+                )
+            )
+        else:
+            await state.mcp_runtime.reload()
+        return web.json_response(
+            {
+                "status": state.mcp_runtime.status_text(),
+                "runtime": state.mcp_runtime.status_payload(),
+            }
+        )
+
+    async def handle_mcp_config_get(request: web.Request) -> web.Response:
+        scope = str(request.query.get("scope", "effective")).strip().lower() or "effective"
+        registry = MCPRegistry()
+        if scope == "global":
+            config = registry.load_global_config()
+            return web.json_response({"servers": [asdict(server) for server in config.servers]})
+        if scope == "project":
+            config = registry.load_project_config(state.default_project_dir)
+            return web.json_response({"servers": [asdict(server) for server in config.servers]})
+        loaded = registry.load_merged_config(state.default_project_dir)
+        return web.json_response(
+            {
+                "sources": [str(path) for path in loaded.sources],
+                "servers": {name: asdict(server) for name, server in loaded.servers.items()},
+            }
+        )
+
+    async def handle_mcp_config_put(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        scope = str(payload.get("scope", "project")).strip().lower() or "project"
+        servers_payload = payload.get("servers", [])
+        if not isinstance(servers_payload, list):
+            return web.json_response({"error": "servers must be a list"}, status=400)
+        servers: list[MCPServerConfig] = []
+        for item in servers_payload:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            if not name:
+                continue
+            servers.append(MCPServerConfig(name=name, **{k: v for k, v in item.items() if k != "name"}))
+        registry = MCPRegistry()
+        if scope == "global":
+            written = registry.write_global_config(MCPConfig(servers=servers))
+        else:
+            written = registry.write_project_config(state.default_project_dir, MCPConfig(servers=servers))
+        return web.json_response({"path": str(written), "servers": [asdict(server) for server in servers]})
+
+    async def handle_mcp_server_put(request: web.Request) -> web.Response:
+        scope = str(request.query.get("scope", "project")).strip().lower() or "project"
+        name = request.match_info["name"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        registry = MCPRegistry()
+        if scope == "global":
+            current = registry.load_global_config()
+        else:
+            current = registry.load_project_config(state.default_project_dir)
+        servers = {server.name: server for server in current.servers}
+        servers[name] = MCPServerConfig(name=name, **payload)
+        config = MCPConfig(servers=sorted(servers.values(), key=lambda item: item.name))
+        if scope == "global":
+            written = registry.write_global_config(config)
+        else:
+            written = registry.write_project_config(state.default_project_dir, config)
+        return web.json_response({"path": str(written), "server": asdict(servers[name])})
+
+    async def handle_mcp_server_delete(request: web.Request) -> web.Response:
+        scope = str(request.query.get("scope", "project")).strip().lower() or "project"
+        name = request.match_info["name"]
+        registry = MCPRegistry()
+        if scope == "global":
+            current = registry.load_global_config()
+            kept = [server for server in current.servers if server.name != name]
+            written = registry.write_global_config(MCPConfig(servers=kept))
+        else:
+            current = registry.load_project_config(state.default_project_dir)
+            kept = [server for server in current.servers if server.name != name]
+            written = registry.write_project_config(state.default_project_dir, MCPConfig(servers=kept))
+        return web.json_response({"path": str(written), "deleted": name})
+
+    async def handle_delegates_list(request: web.Request) -> web.Response:
+        session_id = request.match_info["session_id"]
+        runs = get_delegation_registry().list_runs(session_id)
+        return web.json_response({"delegates": [run.to_payload() for run in runs]})
+
+    async def handle_delegate_get(request: web.Request) -> web.Response:
+        session_id = request.match_info["session_id"]
+        run_id = request.match_info["run_id"]
+        run = get_delegation_registry().get_session_run(session_id, run_id)
+        if run is None:
+            return web.json_response({"error": "Delegate not found"}, status=404)
+        return web.json_response({"delegate": run.to_payload(include_result=True, include_events=True)})
+
+    async def handle_delegate_cancel(request: web.Request) -> web.Response:
+        session_id = request.match_info["session_id"]
+        run_id = request.match_info["run_id"]
+        run = get_delegation_registry().get_session_run(session_id, run_id)
+        if run is None:
+            return web.json_response({"error": "Delegate not found"}, status=404)
+        cancelled = get_delegation_registry().cancel(run_id)
+        return web.json_response({"cancelled": cancelled, "delegate": run.to_payload(include_result=True, include_events=True)})
 
     async def handle_sessions_list(request: web.Request) -> web.Response:
         sessions_info = await _list_serialized_sessions(state)
@@ -1818,6 +2432,28 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             }
         )
 
+    async def handle_session_wt(request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        arg = str(payload.get("arg", ""))
+        stored_info, _ = await _stored_session_context(state, sid)
+        project_dir = _session_project_dir(state, sid, state.sessions.get(sid), stored_info)
+        try:
+            from worker_core.worktree import run_worktree_command
+
+            output = await asyncio.to_thread(run_worktree_command, project_dir, arg)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response(
+            {
+                "output": output,
+                "session": await _serialize_session(state, sid),
+            }
+        )
+
     async def handle_rules_list(request: web.Request) -> web.Response:
         project_dir = _request_project_dir(state, request.query.get("project_dir", ""))
         rules = [_serialize_rule(rule) for rule in list_rules(project_dir)]
@@ -2057,6 +2693,102 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             }
         )
 
+    async def handle_schedules_list(request: web.Request) -> web.Response:
+        if state.schedule_service is None:
+            return web.json_response({"enabled": False, "schedules": []})
+        return web.json_response(state.schedule_service.snapshot())
+
+    async def handle_schedules_post(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        try:
+            schedule = add_schedule(
+                scope=str(payload.get("scope", "project")),
+                schedule_id=str(payload.get("id", "")),
+                project_dir=state.default_project_dir,
+                enabled=bool(payload.get("enabled", True)),
+                kind=str(payload.get("kind", "interval")),
+                every_seconds=int(payload.get("every_seconds", 0) or 0),
+                cron=str(payload.get("cron", "") or ""),
+                timezone=str(payload.get("timezone", "UTC") or "UTC"),
+                prompt=str(payload.get("prompt", "") or ""),
+                prompt_name=str(payload.get("prompt_name", "") or ""),
+                arg=str(payload.get("arg", "") or ""),
+                model=str(payload.get("model", "") or ""),
+                session_mode=str(payload.get("session_mode", "reuse") or "reuse"),
+                execution_mode=str(payload.get("execution_mode", "readonly") or "readonly"),
+                overlap_policy=str(payload.get("overlap_policy", "skip") or "skip"),
+                max_runtime_seconds=int(payload.get("max_runtime_seconds", 0) or 0),
+                run_missed=str(payload.get("run_missed", "none") or "none"),
+                target_project_dir=str(payload.get("project_dir", "") or ""),
+            )
+            if state.schedule_service is not None:
+                await state.schedule_service.reload()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"schedule": serialize_schedule(schedule), "snapshot": state.schedule_service.snapshot() if state.schedule_service is not None else {}})
+
+    async def handle_schedule_put(request: web.Request) -> web.Response:
+        schedule_id = request.match_info["schedule_id"]
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        try:
+            schedule = update_schedule(
+                schedule_id,
+                project_dir=state.default_project_dir,
+                scope=str(payload["scope"]) if "scope" in payload and payload.get("scope") is not None else None,
+                enabled=bool(payload.get("enabled")) if "enabled" in payload else None,
+                kind=str(payload["kind"]) if "kind" in payload and payload.get("kind") is not None else None,
+                every_seconds=int(payload["every_seconds"]) if "every_seconds" in payload and payload.get("every_seconds") is not None else None,
+                cron=str(payload["cron"]) if "cron" in payload and payload.get("cron") is not None else None,
+                timezone=str(payload["timezone"]) if "timezone" in payload and payload.get("timezone") is not None else None,
+                prompt=str(payload["prompt"]) if "prompt" in payload and payload.get("prompt") is not None else None,
+                prompt_name=str(payload["prompt_name"]) if "prompt_name" in payload and payload.get("prompt_name") is not None else None,
+                arg=str(payload["arg"]) if "arg" in payload and payload.get("arg") is not None else None,
+                model=str(payload["model"]) if "model" in payload and payload.get("model") is not None else None,
+                session_mode=str(payload["session_mode"]) if "session_mode" in payload and payload.get("session_mode") is not None else None,
+                execution_mode=str(payload["execution_mode"]) if "execution_mode" in payload and payload.get("execution_mode") is not None else None,
+                overlap_policy=str(payload["overlap_policy"]) if "overlap_policy" in payload and payload.get("overlap_policy") is not None else None,
+                max_runtime_seconds=int(payload["max_runtime_seconds"]) if "max_runtime_seconds" in payload and payload.get("max_runtime_seconds") is not None else None,
+                run_missed=str(payload["run_missed"]) if "run_missed" in payload and payload.get("run_missed") is not None else None,
+                target_project_dir=str(payload["project_dir"]) if "project_dir" in payload and payload.get("project_dir") is not None else None,
+            )
+            if state.schedule_service is not None:
+                await state.schedule_service.reload()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        return web.json_response({"schedule": serialize_schedule(schedule), "snapshot": state.schedule_service.snapshot() if state.schedule_service is not None else {}})
+
+    async def handle_schedule_delete(request: web.Request) -> web.Response:
+        schedule_id = request.match_info["schedule_id"]
+        schedule = delete_schedule(schedule_id, state.default_project_dir)
+        if schedule is None:
+            return web.json_response({"error": "Schedule not found"}, status=404)
+        if state.schedule_service is not None:
+            await state.schedule_service.reload()
+        return web.json_response({"schedule": serialize_schedule(schedule), "snapshot": state.schedule_service.snapshot() if state.schedule_service is not None else {}})
+
+    async def handle_schedule_run(request: web.Request) -> web.Response:
+        schedule_id = request.match_info["schedule_id"]
+        if state.schedule_service is None:
+            return web.json_response({"error": "Scheduler is disabled"}, status=400)
+        try:
+            snapshot = await state.schedule_service.run_now(schedule_id)
+        except Exception as exc:
+            status = 404 if "not found" in str(exc).lower() else 400
+            return web.json_response({"error": str(exc)}, status=status)
+        return web.json_response(snapshot)
+
+    async def handle_schedules_reload(request: web.Request) -> web.Response:
+        if state.schedule_service is None:
+            return web.json_response({"enabled": False, "schedules": []})
+        snapshot = await state.schedule_service.reload()
+        return web.json_response(snapshot)
+
     async def handle_session_delete(request: web.Request) -> web.Response:
         sid = request.match_info["session_id"]
         deleted = False
@@ -2073,6 +2805,10 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
             state.session_thinking_levels.pop(sid, None)
             with suppress(Exception):
                 await session.provider.close()
+            mcp_runtime = getattr(session, "mcp_runtime", None)
+            if mcp_runtime is not None:
+                with suppress(Exception):
+                    await mcp_runtime.close()
             deleted = True
         else:
             state.session_provider_models.pop(sid, None)
@@ -2112,13 +2848,28 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
     app.router.add_get("/api/extensions/registries", handle_extension_registries_list)
     app.router.add_post("/api/extensions/registries", handle_extension_registries_add)
     app.router.add_delete("/api/extensions/registries/{name}", handle_extension_registries_remove)
+    app.router.add_get("/api/mcp", handle_mcp_get)
+    app.router.add_post("/api/mcp/reload", handle_mcp_reload)
+    app.router.add_get("/api/mcp/config", handle_mcp_config_get)
+    app.router.add_put("/api/mcp/config", handle_mcp_config_put)
+    app.router.add_put("/api/mcp/servers/{name}", handle_mcp_server_put)
+    app.router.add_delete("/api/mcp/servers/{name}", handle_mcp_server_delete)
     app.router.add_post("/api/credentials/import", handle_credentials_import)
     app.router.add_post("/api/oauth/start", handle_oauth_start)
     app.router.add_post("/api/oauth/complete", handle_oauth_complete)
+    app.router.add_get("/api/schedules", handle_schedules_list)
+    app.router.add_post("/api/schedules", handle_schedules_post)
+    app.router.add_put("/api/schedules/{schedule_id}", handle_schedule_put)
+    app.router.add_delete("/api/schedules/{schedule_id}", handle_schedule_delete)
+    app.router.add_post("/api/schedules/{schedule_id}/run", handle_schedule_run)
+    app.router.add_post("/api/schedules/reload", handle_schedules_reload)
     app.router.add_get("/api/sessions", handle_sessions_list)
     app.router.add_get("/api/sessions/{session_id}", handle_session_get)
     app.router.add_get("/api/sessions/{session_id}/messages", handle_session_messages_get)
     app.router.add_get("/api/sessions/{session_id}/tree", handle_session_tree_get)
+    app.router.add_get("/api/sessions/{session_id}/delegates", handle_delegates_list)
+    app.router.add_get("/api/sessions/{session_id}/delegates/{run_id}", handle_delegate_get)
+    app.router.add_post("/api/sessions/{session_id}/delegates/{run_id}/cancel", handle_delegate_cancel)
     app.router.add_get("/api/sessions/{session_id}/commands", handle_session_commands_get)
     app.router.add_post(
         "/api/sessions/{session_id}/commands/{command_name}",
@@ -2139,6 +2890,7 @@ def _create_rest_app(state: ServerState, token: str) -> Any:
     app.router.add_post("/api/sessions/{session_id}/skill", handle_session_skill_post)
     app.router.add_post("/api/sessions/{session_id}/reload", handle_session_reload_post)
     app.router.add_post("/api/sessions/{session_id}/bash", handle_session_bash)
+    app.router.add_post("/api/sessions/{session_id}/wt", handle_session_wt)
     app.router.add_delete("/api/sessions/{session_id}", handle_session_delete)
     for ext in state.server_extensions:
         with suppress(Exception):
@@ -2168,6 +2920,8 @@ async def run_server(
     merge_provider_overlay(config, provider_overlay)
     context = ExtensionContext(project_dir=project_dir, runtime="server", config=config)
     server_extensions = await load_server_extensions_async(context=context)
+    mcp_runtime = McpRuntimeManager()
+    await mcp_runtime.load(context)
     store = SessionStore(config.sessions.db_path)
     await store.open()
     state = ServerState(
@@ -2176,7 +2930,11 @@ async def run_server(
         provider_overlay=provider_overlay,
         server_extensions=server_extensions,
         store=store,
+        mcp_runtime=mcp_runtime,
     )
+    if config.server.scheduler_enabled:
+        state.schedule_service = ScheduleService(state)
+        await state.schedule_service.start()
 
     # Use explicit args → config → defaults
     host = host or config.server.host
@@ -2215,11 +2973,13 @@ async def run_server(
     logger.info("  WebSocket: ws://%s:%d", host, port)
     logger.info("  REST API:  http://%s:%d/api/", host, rest_port)
     logger.info("  Auth token: %s", token)
+    logger.info("  Scheduler: %s", "enabled" if state.schedule_service is not None else "disabled")
     if announce is not None:
         announce("Artel server starting")
         announce(f"  WebSocket: ws://{host}:{port}")
         announce(f"  REST API:  http://{host}:{rest_port}/api/")
         announce(f"  Auth token: {token}")
+        announce(f"  Scheduler: {'enabled' if state.schedule_service is not None else 'disabled'}")
         if generated_token_path is not None:
             announce(f"  Saved auth token to: {generated_token_path}")
 
@@ -2227,8 +2987,18 @@ async def run_server(
         async with websockets.serve(ws_handler, host, port):  # type: ignore[attr-defined]
             await asyncio.Future()  # Run forever
     finally:
+        if state.schedule_service is not None:
+            with suppress(Exception):
+                await state.schedule_service.stop()
         for session in list(state.sessions.values()):
             with suppress(Exception):
                 await session.provider.close()
+            mcp_runtime = getattr(session, "mcp_runtime", None)
+            if mcp_runtime is not None:
+                with suppress(Exception):
+                    await mcp_runtime.close()
+        if state.mcp_runtime is not None:
+            with suppress(Exception):
+                await state.mcp_runtime.close()
         await rest_runner.cleanup()
         await store.close()

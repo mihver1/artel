@@ -6,21 +6,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from worker_core.cmux import CmuxPreflightResult, preflight_cmux
+from worker_core.cmux import CmuxPreflightResult
 from worker_core.migrations import check_and_migrate
-
-NON_INTERACTIVE_COMMANDS = {
-    "init",
-    "serve",
-    "web",
-    "connect",
-    "ext",
-    "config",
-    "rpc",
-    "acp",
-    "login",
-    "employee",
-}
 
 
 @dataclass(slots=True)
@@ -40,13 +27,9 @@ def command_requires_cmux(
     *,
     prompt: str | None = None,
 ) -> bool:
-    """Return True when the requested CLI path is the interactive Artel surface."""
-    if prompt:
-        return False
-    normalized = str(command_name or "").strip().lower()
-    if not normalized:
-        return True
-    return normalized not in NON_INTERACTIVE_COMMANDS
+    """cmux is no longer required for Artel startup."""
+    del command_name, prompt
+    return False
 
 
 def bootstrap_artel(
@@ -60,9 +43,8 @@ def bootstrap_artel(
     check_and_migrate(project_dir=resolved_project_dir)
 
     cmux_required = command_requires_cmux(command_name, prompt=prompt)
-    cmux_result = preflight_cmux() if cmux_required else None
     return ArtelBootstrapResult(
         project_dir=resolved_project_dir,
         cmux_required=cmux_required,
-        cmux_preflight=cmux_result,
+        cmux_preflight=None,
     )

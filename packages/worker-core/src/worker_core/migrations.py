@@ -144,6 +144,7 @@ def _copy_global_state() -> list[str]:
             config.LEGACY_SERVER_PROVIDER_OVERLAY_PATH,
             config.SERVER_PROVIDER_OVERLAY_PATH,
         ),
+        ("mcp.json", config.LEGACY_GLOBAL_MCP_PATH, config.GLOBAL_MCP_PATH),
         ("SYSTEM.md", config.LEGACY_GLOBAL_SYSTEM_OVERRIDE, config.GLOBAL_SYSTEM_OVERRIDE),
         ("APPEND_SYSTEM.md", config.LEGACY_GLOBAL_APPEND_SYSTEM, config.GLOBAL_APPEND_SYSTEM),
         ("AGENTS.md", config.LEGACY_GLOBAL_AGENTS_FILE, config.GLOBAL_AGENTS_FILE),

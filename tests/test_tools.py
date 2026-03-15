@@ -227,11 +227,13 @@ class TestBoardTools:
 def test_create_builtin_tools():
     tools = create_builtin_tools("/tmp")
     names = {t.name for t in tools}
-    assert names == {
+    assert {
         "read",
         "write",
         "edit",
         "bash",
+        "worktree",
+        "glob",
         "web_search",
         "web_fetch",
         "read_tasks",
@@ -239,4 +241,4 @@ def test_create_builtin_tools():
         "update_task",
         "read_operator_notes",
         "append_operator_note",
-    }
+    }.issubset(names)

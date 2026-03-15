@@ -168,6 +168,13 @@ async def _close_state(state: server_mod.ServerState) -> None:
     for session in list(state.sessions.values()):
         with server_mod.suppress(Exception):
             await session.provider.close()
+        mcp_runtime = getattr(session, "mcp_runtime", None)
+        if mcp_runtime is not None:
+            with server_mod.suppress(Exception):
+                await mcp_runtime.close()
+    if state.mcp_runtime is not None:
+        with server_mod.suppress(Exception):
+            await state.mcp_runtime.close()
     if state.store is not None:
         with server_mod.suppress(Exception):
             await state.store.close()

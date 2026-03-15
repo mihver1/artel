@@ -233,9 +233,8 @@ def preflight_cmux_management(
     """Validate that cmux workspace/surface management can run outside a cmux shell.
 
     Unlike :func:`preflight_cmux`, this check does not require ``CMUX_WORKSPACE_ID``
-    to be present. It is intended for employee lifecycle commands that may run from
-    an agent subshell or other process that can reach the cmux daemon but does not
-    inherit the current-surface environment variables.
+    to be present. It is intended for utility flows that can reach the cmux daemon
+    but do not inherit current-surface environment variables.
     """
     binary = _find_cmux()
     socket_path = cmux_socket_path()
@@ -245,10 +244,10 @@ def preflight_cmux_management(
         return CmuxPreflightResult(
             ok=False,
             code="binary_missing",
-            summary="Artel employee management requires cmux, but the cmux binary was not found.",
+            summary="Artel cmux management requires the cmux binary, but it was not found.",
             guidance=[
                 "Install cmux and make sure the `cmux` binary is on PATH.",
-                "If cmux is installed in a custom location, add it to PATH before running `artel employee create`.",
+                "If cmux is installed in a custom location, add it to PATH before running cmux-backed commands.",
             ],
         )
 
@@ -256,12 +255,12 @@ def preflight_cmux_management(
         return CmuxPreflightResult(
             ok=False,
             code="socket_unavailable",
-            summary="Artel found the cmux binary, but the cmux socket is unavailable for employee management.",
+            summary="Artel found the cmux binary, but the cmux socket is unavailable for cmux management.",
             details=[f"Expected socket: {socket_path}"],
             guidance=[
-                "Make sure the cmux daemon is running before creating employees.",
-                "If your cmux socket lives elsewhere, export CMUX_SOCKET_PATH before running `artel employee create`.",
-                "CMUX_WORKSPACE_ID is not required for employee creation, but a reachable cmux daemon is required.",
+                "Make sure the cmux daemon is running before using cmux-backed commands.",
+                "If your cmux socket lives elsewhere, export CMUX_SOCKET_PATH before running cmux-backed commands.",
+                "CMUX_WORKSPACE_ID is not required here, but a reachable cmux daemon is required.",
             ],
             binary_path=binary,
             workspace=workspace,
@@ -272,12 +271,12 @@ def preflight_cmux_management(
         return CmuxPreflightResult(
             ok=False,
             code="socket_unreachable",
-            summary="Artel found the cmux socket path, but could not reach the cmux daemon for employee management.",
+            summary="Artel found the cmux socket path, but could not reach the cmux daemon for cmux management.",
             details=[f"Socket: {socket_path}"],
             guidance=[
                 "Restart or reattach cmux so the socket accepts connections.",
-                "If your cmux socket changed, export CMUX_SOCKET_PATH before running `artel employee create`.",
-                "CMUX_WORKSPACE_ID is optional for employee creation; cmux daemon reachability is not.",
+                "If your cmux socket changed, export CMUX_SOCKET_PATH before running cmux-backed commands.",
+                "CMUX_WORKSPACE_ID is optional here; cmux daemon reachability is not.",
             ],
             binary_path=binary,
             workspace=workspace,
@@ -294,14 +293,14 @@ def preflight_cmux_management(
         return CmuxPreflightResult(
             ok=False,
             code="capabilities_missing",
-            summary="Artel found cmux, but the available cmux CLI capabilities are incomplete for employee management.",
+            summary="Artel found cmux, but the available cmux CLI capabilities are incomplete for cmux management.",
             details=[
                 f"Socket: {socket_path}",
                 f"Missing capabilities: {', '.join(missing_capabilities)}",
             ],
             guidance=[
                 "Upgrade cmux to a build that supports workspace and surface commands.",
-                "Re-run `artel employee create` after upgrading or connecting to a compatible cmux runtime.",
+                "Re-run your cmux-backed command after upgrading or connecting to a compatible cmux runtime.",
             ],
             binary_path=binary,
             workspace=workspace,

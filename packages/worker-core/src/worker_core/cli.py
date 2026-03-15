@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import click
 
-from worker_core.cmux import (
-    DEFAULT_ARTEL_DASHBOARD_SURFACE_TITLE,
-    DEFAULT_ARTEL_ORCHESTRATOR_SURFACE_TITLE,
-    bootstrap_artel_workspace,
-)
 from worker_core.config import (
     GLOBAL_CONFIG,
     effective_global_config_path,
@@ -27,6 +24,7 @@ from worker_core.config import (
     resolve_model,
 )
 from worker_core.rules import add_rule, delete_rule, get_rule, list_rules, move_rule, update_rule
+from worker_core.schedules import add_schedule, delete_schedule, load_schedules, serialize_schedule, update_schedule
 
 
 @click.group(invoke_without_command=True)
@@ -79,25 +77,11 @@ def cli(
         )
         return
     if ctx.invoked_subcommand is None:
-        preflight = bootstrap.cmux_preflight
-        if preflight is not None and not preflight.ok:
-            raise click.ClickException(preflight.format_message())
-
-        # Default: cmux-backed orchestrator surface with managed local server.
+        # Default: local TUI with managed local server.
         from worker_tui.app import run_tui
         from worker_tui.local_server import ensure_managed_local_server
 
-        workspace = asyncio.run(bootstrap_artel_workspace(cwd=project_dir))
         handle = asyncio.run(ensure_managed_local_server(project_dir))
-        if workspace.dashboard is not None:
-            click.echo(
-                f"Artel dashboard surface ready: {workspace.dashboard.title or DEFAULT_ARTEL_DASHBOARD_SURFACE_TITLE}"
-            )
-        if workspace.orchestrator is not None:
-            click.echo(
-                "Artel orchestrator surface ready: "
-                f"{workspace.orchestrator.title or DEFAULT_ARTEL_ORCHESTRATOR_SURFACE_TITLE}"
-            )
         run_tui(
             remote_url=handle.remote_url,
             auth_token=handle.auth_token,
@@ -204,6 +188,370 @@ def web(
         open_browser=not no_open_browser,
         project_dir=project_dir,
     )
+
+
+@cli.group()
+def mcp() -> None:
+    """Manage first-party MCP configuration."""
+
+
+@mcp.command("show")
+@click.option("--scope", type=click.Choice(["global", "project", "effective"]), default="effective")
+def mcp_show(scope: str) -> None:
+    """Show MCP configuration for one scope."""
+    from worker_core.mcp import MCPRegistry
+
+    registry = MCPRegistry()
+    if scope == "global":
+        config = registry.load_global_config()
+        click.echo(json.dumps({"servers": [asdict(server) for server in config.servers]}, indent=2, sort_keys=True))
+        return
+    if scope == "project":
+        config = registry.load_project_config(os.getcwd())
+        click.echo(json.dumps({"servers": [asdict(server) for server in config.servers]}, indent=2, sort_keys=True))
+        return
+    loaded = registry.load_merged_config(os.getcwd())
+    click.echo(
+        json.dumps(
+            {
+                "sources": [str(path) for path in loaded.sources],
+                "servers": {name: asdict(server) for name, server in loaded.servers.items()},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+@mcp.command("status")
+@click.option("--json-output", "json_output", is_flag=True, help="Print structured MCP state payload")
+def mcp_status(json_output: bool) -> None:
+    """Show current MCP runtime/config status."""
+    from worker_core.config import load_config
+    from worker_core.extensions import ExtensionContext
+    from worker_core.mcp_runtime import McpRuntimeManager
+
+    runtime = McpRuntimeManager()
+    try:
+        asyncio.run(
+            runtime.load(ExtensionContext(project_dir=os.getcwd(), runtime="local", config=load_config(os.getcwd())))
+        )
+        if json_output:
+            click.echo(json.dumps(runtime.status_payload(), indent=2, sort_keys=True))
+        else:
+            click.echo(runtime.status_text())
+    finally:
+        if runtime.available:
+            try:
+                asyncio.run(runtime.close())
+            except Exception:
+                pass
+
+
+@mcp.command("reload")
+@click.option("--json-output", "json_output", is_flag=True, help="Print structured MCP state payload")
+def mcp_reload(json_output: bool) -> None:
+    """Reload MCP runtime and print status."""
+    from worker_core.config import load_config
+    from worker_core.extensions import ExtensionContext
+    from worker_core.mcp_runtime import McpRuntimeManager
+
+    runtime = McpRuntimeManager()
+    try:
+        asyncio.run(
+            runtime.load(ExtensionContext(project_dir=os.getcwd(), runtime="local", config=load_config(os.getcwd())))
+        )
+        asyncio.run(runtime.reload())
+        if json_output:
+            click.echo(json.dumps(runtime.status_payload(), indent=2, sort_keys=True))
+        else:
+            click.echo(runtime.status_text())
+    finally:
+        if runtime.available:
+            try:
+                asyncio.run(runtime.close())
+            except Exception:
+                pass
+
+
+@mcp.command("set")
+@click.argument("name")
+@click.option("--scope", type=click.Choice(["global", "project"]), default="project")
+@click.option("--transport", default="stdio")
+@click.option("--command", default="")
+@click.option("--url", default="")
+@click.option("--arg", "args", multiple=True)
+@click.option("--tool-prefix", default="")
+def mcp_set(
+    name: str,
+    scope: str,
+    transport: str,
+    command: str,
+    url: str,
+    args: tuple[str, ...],
+    tool_prefix: str,
+) -> None:
+    """Create or update one MCP server entry in global or project scope."""
+    from worker_core.mcp import MCPConfig, MCPRegistry, MCPServerConfig
+
+    registry = MCPRegistry()
+    if scope == "global":
+        current = registry.load_global_config()
+    else:
+        current = registry.load_project_config(os.getcwd())
+    servers = {server.name: server for server in current.servers}
+    servers[name] = MCPServerConfig(
+        name=name,
+        transport=transport,
+        command=command,
+        url=url,
+        args=list(args),
+        tool_prefix=tool_prefix,
+    )
+    config = MCPConfig(servers=sorted(servers.values(), key=lambda item: item.name))
+    if scope == "global":
+        written = registry.write_global_config(config)
+    else:
+        written = registry.write_project_config(os.getcwd(), config)
+    click.echo(f"Saved MCP config: {written}")
+
+
+@mcp.command("remove")
+@click.argument("name")
+@click.option("--scope", type=click.Choice(["global", "project"]), default="project")
+def mcp_remove(name: str, scope: str) -> None:
+    """Remove one MCP server entry from global or project scope."""
+    from worker_core.mcp import MCPConfig, MCPRegistry
+
+    registry = MCPRegistry()
+    if scope == "global":
+        current = registry.load_global_config()
+        kept = [server for server in current.servers if server.name != name]
+        written = registry.write_global_config(MCPConfig(servers=kept))
+    else:
+        current = registry.load_project_config(os.getcwd())
+        kept = [server for server in current.servers if server.name != name]
+        written = registry.write_project_config(os.getcwd(), MCPConfig(servers=kept))
+    click.echo(f"Saved MCP config: {written}")
+
+
+@cli.group("schedule")
+def schedule_group() -> None:
+    """Manage scheduled prompts/tasks."""
+
+
+@schedule_group.command("list")
+def schedule_list_command() -> None:
+    """List configured schedules."""
+    schedules = load_schedules(os.getcwd())
+    if not schedules:
+        click.echo("No schedules configured.")
+        return
+    for record in schedules:
+        target = record.prompt_name or "<inline>"
+        trigger = f"every {record.every_seconds}s" if record.kind == "interval" else record.cron
+        click.echo(
+            f"{record.id} [{record.scope}] [{'enabled' if record.enabled else 'disabled'}] "
+            f"{record.kind}={trigger} prompt={target} mode={record.execution_mode}/{record.session_mode} "
+            f"run_missed={record.run_missed}"
+        )
+
+
+@schedule_group.command("add")
+@click.argument("schedule_id")
+@click.option("--scope", type=click.Choice(["project", "global"]), default="project")
+@click.option("--kind", type=click.Choice(["interval", "cron"]), default="interval")
+@click.option("--every", "every_seconds", type=int, default=0, help="Interval in seconds")
+@click.option("--cron", default="", help="Cron expression: minute hour day month weekday")
+@click.option("--timezone", default="UTC")
+@click.option("--prompt", default="", help="Inline prompt text")
+@click.option("--prompt-name", default="", help="Named prompt template")
+@click.option("--arg", default="", help="Prompt variables/input")
+@click.option("--project-dir", "target_project_dir", default="", help="Project directory for the run")
+@click.option("--model", default="", help="Override model (provider/model-id)")
+@click.option("--session-mode", type=click.Choice(["reuse", "new"]), default="reuse")
+@click.option("--execution-mode", type=click.Choice(["readonly", "inherit"]), default="readonly")
+@click.option("--overlap", "overlap_policy", type=click.Choice(["skip", "allow", "cancel_previous"]), default="skip")
+@click.option("--max-runtime", "max_runtime_seconds", type=int, default=0)
+@click.option("--run-missed", type=click.Choice(["none", "latest", "all"]), default="none")
+@click.option("--disabled", is_flag=True)
+def schedule_add_command(
+    schedule_id: str,
+    scope: str,
+    kind: str,
+    every_seconds: int,
+    cron: str,
+    timezone: str,
+    prompt: str,
+    prompt_name: str,
+    arg: str,
+    target_project_dir: str,
+    model: str,
+    session_mode: str,
+    execution_mode: str,
+    overlap_policy: str,
+    max_runtime_seconds: int,
+    run_missed: str,
+    disabled: bool,
+) -> None:
+    """Add a scheduled task."""
+    try:
+        record = add_schedule(
+            scope=scope,
+            schedule_id=schedule_id,
+            project_dir=os.getcwd(),
+            enabled=not disabled,
+            kind=kind,
+            every_seconds=every_seconds,
+            cron=cron,
+            timezone=timezone,
+            prompt=prompt,
+            prompt_name=prompt_name,
+            arg=arg,
+            target_project_dir=target_project_dir,
+            model=model,
+            session_mode=session_mode,
+            execution_mode=execution_mode,
+            overlap_policy=overlap_policy,
+            max_runtime_seconds=max_runtime_seconds,
+            run_missed=run_missed,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Schedule added: {record.id}")
+
+
+@schedule_group.command("edit")
+@click.argument("schedule_id")
+@click.option("--scope", type=click.Choice(["project", "global"]), default=None)
+@click.option("--enable/--disable", "enabled", default=None)
+@click.option("--kind", type=click.Choice(["interval", "cron"]), default=None)
+@click.option("--every", "every_seconds", type=int, default=None)
+@click.option("--cron", default=None)
+@click.option("--timezone", default=None)
+@click.option("--prompt", default=None)
+@click.option("--prompt-name", default=None)
+@click.option("--arg", default=None)
+@click.option("--project-dir", "target_project_dir", default=None)
+@click.option("--model", default=None)
+@click.option("--session-mode", type=click.Choice(["reuse", "new"]), default=None)
+@click.option("--execution-mode", type=click.Choice(["readonly", "inherit"]), default=None)
+@click.option("--overlap", "overlap_policy", type=click.Choice(["skip", "allow", "cancel_previous"]), default=None)
+@click.option("--max-runtime", "max_runtime_seconds", type=int, default=None)
+@click.option("--run-missed", type=click.Choice(["none", "latest", "all"]), default=None)
+def schedule_edit_command(
+    schedule_id: str,
+    scope: str | None,
+    enabled: bool | None,
+    kind: str | None,
+    every_seconds: int | None,
+    cron: str | None,
+    timezone: str | None,
+    prompt: str | None,
+    prompt_name: str | None,
+    arg: str | None,
+    target_project_dir: str | None,
+    model: str | None,
+    session_mode: str | None,
+    execution_mode: str | None,
+    overlap_policy: str | None,
+    max_runtime_seconds: int | None,
+    run_missed: str | None,
+) -> None:
+    """Edit a scheduled task."""
+    try:
+        record = update_schedule(
+            schedule_id,
+            project_dir=os.getcwd(),
+            scope=scope,
+            enabled=enabled,
+            kind=kind,
+            every_seconds=every_seconds,
+            cron=cron,
+            timezone=timezone,
+            prompt=prompt,
+            prompt_name=prompt_name,
+            arg=arg,
+            target_project_dir=target_project_dir,
+            model=model,
+            session_mode=session_mode,
+            execution_mode=execution_mode,
+            overlap_policy=overlap_policy,
+            max_runtime_seconds=max_runtime_seconds,
+            run_missed=run_missed,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Schedule updated: {record.id}")
+
+
+@schedule_group.command("delete")
+@click.argument("schedule_id")
+def schedule_delete_command(schedule_id: str) -> None:
+    """Delete a schedule."""
+    record = delete_schedule(schedule_id, os.getcwd())
+    if record is None:
+        raise click.ClickException(f"Schedule '{schedule_id}' not found")
+    click.echo(f"Schedule deleted: {record.id}")
+
+
+@schedule_group.command("show")
+@click.argument("schedule_id")
+def schedule_show_command(schedule_id: str) -> None:
+    """Show one schedule as JSON."""
+    schedules = {record.id: record for record in load_schedules(os.getcwd())}
+    record = schedules.get(schedule_id)
+    if record is None:
+        raise click.ClickException(f"Schedule '{schedule_id}' not found")
+    click.echo(json.dumps(serialize_schedule(record), indent=2, sort_keys=True))
+
+
+@schedule_group.command("enable")
+@click.argument("schedule_id")
+def schedule_enable_command(schedule_id: str) -> None:
+    """Enable a schedule."""
+    try:
+        record = update_schedule(schedule_id, project_dir=os.getcwd(), enabled=True)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Schedule enabled: {record.id}")
+
+
+@schedule_group.command("disable")
+@click.argument("schedule_id")
+def schedule_disable_command(schedule_id: str) -> None:
+    """Disable a schedule."""
+    try:
+        record = update_schedule(schedule_id, project_dir=os.getcwd(), enabled=False)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Schedule disabled: {record.id}")
+
+
+@schedule_group.command("run")
+@click.argument("schedule_id")
+@click.option("--remote-url", default="", help="Run schedule via remote Artel server")
+@click.option("--token", default="", help="Bearer auth token for --remote-url")
+def schedule_run_command(schedule_id: str, remote_url: str, token: str) -> None:
+    """Trigger a schedule immediately."""
+    from worker_core.control import RemoteWorkerControl
+
+    async def _run() -> dict[str, Any]:
+        resolved_remote_url = remote_url
+        resolved_token = token
+        if not resolved_remote_url:
+            from worker_tui.local_server import ensure_managed_local_server
+
+            handle = await ensure_managed_local_server(os.getcwd())
+            resolved_remote_url = handle.remote_url
+            resolved_token = handle.auth_token
+        return await RemoteWorkerControl(resolved_remote_url, resolved_token).run_schedule(schedule_id)
+
+    try:
+        payload = asyncio.run(_run())
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
 @cli.group()
@@ -552,91 +900,6 @@ def rule_move_command(rule_id: str, position: int | None, up: bool, down: bool) 
     click.echo(f"Rule moved: {rule.id} -> position {rule.order}")
 
 
-@cli.group()
-def employee() -> None:
-    """Manage Artel employee sessions."""
-
-
-@employee.command("create")
-@click.option("--id", "employee_id", default="", help="Employee identifier")
-@click.option("--name", "display_name", required=True, help="Employee display name")
-@click.option("--task", "assigned_task", required=True, help="Assigned task")
-@click.option("--project-dir", default=".", help="Project directory for worktree allocation")
-@click.option("--workspace", default="artel-main", help="cmux workspace name or id")
-@click.option("--command", default="artel", help="Command to run in the employee surface")
-@click.option(
-    "--prompt",
-    "initial_prompt",
-    default="",
-    help="Optional one-shot prompt to execute immediately in the employee surface",
-)
-@click.option(
-    "--no-create-worktree",
-    is_flag=True,
-    help="Plan the worktree path without running `git worktree add`",
-)
-def employee_create(
-    employee_id: str,
-    display_name: str,
-    assigned_task: str,
-    project_dir: str,
-    workspace: str,
-    command: str,
-    initial_prompt: str,
-    no_create_worktree: bool,
-) -> None:
-    """Create an Artel employee with a worktree and cmux surface."""
-    import re
-    import uuid
-
-    from worker_core.cmux import preflight_cmux_management
-    from worker_core.orchestration import OrchestratorRuntime
-
-    management_preflight = preflight_cmux_management()
-    if not management_preflight.ok:
-        raise click.ClickException(management_preflight.format_message())
-
-    resolved_project_dir = str(Path(project_dir).resolve(strict=False))
-    resolved_employee_id = employee_id.strip() or re.sub(
-        r"[^a-z0-9]+",
-        "-",
-        display_name.strip().lower(),
-    ).strip("-")
-    if not resolved_employee_id:
-        resolved_employee_id = f"emp-{uuid.uuid4().hex[:8]}"
-
-    runtime = OrchestratorRuntime()
-    try:
-        employee_record = runtime.create_employee_session_sync(
-            employee_id=resolved_employee_id,
-            display_name=display_name,
-            project_dir=resolved_project_dir,
-            assigned_task=assigned_task,
-            workspace=workspace,
-            command=command,
-            initial_prompt=initial_prompt,
-            create_worktree=not no_create_worktree,
-        )
-    except Exception as exc:
-        raise click.ClickException(str(exc)) from exc
-
-    if not employee_record.cmux_surface:
-        raise click.ClickException(
-            "Failed to create or locate a cmux surface for the employee session. "
-            "Make sure the cmux binary is installed, the daemon is reachable, and the target workspace is valid."
-        )
-
-    click.echo(f"Employee created: {employee_record.employee_id}")
-    click.echo(f"  Name: {employee_record.display_name}")
-    click.echo(f"  Task: {employee_record.assigned_task}")
-    click.echo(f"  Status: {employee_record.status}")
-    click.echo(f"  Project: {employee_record.project_path}")
-    click.echo(f"  Worktree: {employee_record.worktree_path}")
-    click.echo(f"  Branch: {employee_record.branch}")
-    if employee_record.cmux_surface:
-        click.echo(f"  Surface: {employee_record.cmux_surface}")
-
-
 # ── Print mode ────────────────────────────────────────────────────
 
 
@@ -725,6 +988,8 @@ async def _print_mode(
 
     await store.close()
     await runtime.provider.close()
+    if runtime.mcp_runtime is not None:
+        await runtime.mcp_runtime.close()
 
 
 

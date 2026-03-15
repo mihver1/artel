@@ -433,13 +433,12 @@ class TestCliConnect:
 
 
 class TestCliDefaultMode:
-    def test_worker_default_requires_cmux_ready_runtime(self, monkeypatch):
+    def test_worker_default_starts_local_tui_without_cmux_bootstrap(self, monkeypatch):
         import worker_tui.app as tui_app
         import worker_tui.local_server as local_server_mod
         from click.testing import CliRunner
         from worker_core import cli as cli_mod
         from worker_core.artel_bootstrap import ArtelBootstrapResult
-        from worker_core.cmux import ArtelWorkspaceBootstrap, CmuxPreflightResult, CmuxSurfaceRecord, CmuxWorkspaceRecord
 
         expected_project_dir = str(Path("/tmp/project").resolve())
 
@@ -448,20 +447,10 @@ class TestCliDefaultMode:
             "worker_core.artel_bootstrap.bootstrap_artel",
             lambda project_dir=None, command_name=None, prompt=None: ArtelBootstrapResult(
                 project_dir=expected_project_dir,
-                cmux_required=True,
-                cmux_preflight=CmuxPreflightResult(ok=True, summary="cmux preflight passed."),
+                cmux_required=False,
+                cmux_preflight=None,
             ),
         )
-
-        seen_bootstrap: list[str] = []
-
-        async def fake_bootstrap_artel_workspace(*, cwd: str = "", **kwargs):
-            seen_bootstrap.append(cwd)
-            return ArtelWorkspaceBootstrap(
-                workspace=CmuxWorkspaceRecord(id="ws-123", name="artel-main"),
-                dashboard=CmuxSurfaceRecord(id="sf-dashboard", title="dashboard", workspace="ws-123"),
-                orchestrator=CmuxSurfaceRecord(id="sf-orchestrator", title="orchestrator", workspace="ws-123"),
-            )
 
         async def fake_ensure_managed_local_server(project_dir: str):
             assert project_dir == expected_project_dir
@@ -484,7 +473,6 @@ class TestCliDefaultMode:
             finally:
                 loop.close()
 
-        monkeypatch.setattr(cli_mod, "bootstrap_artel_workspace", fake_bootstrap_artel_workspace)
         monkeypatch.setattr(
             local_server_mod,
             "ensure_managed_local_server",
@@ -500,43 +488,13 @@ class TestCliDefaultMode:
         )
 
         assert result.exit_code == 0
-        assert seen_bootstrap == [expected_project_dir]
-        assert "Artel dashboard surface ready: dashboard" in result.output
-        assert "Artel orchestrator surface ready: orchestrator" in result.output
+        assert "surface ready" not in result.output.lower()
         assert captured == {
             "remote_url": "ws://127.0.0.1:9011",
             "auth_token": "artel_local_token",
             "continue_session": True,
             "resume_id": "sess-123",
         }
-
-    def test_worker_default_fails_fast_outside_cmux(self, monkeypatch):
-        from click.testing import CliRunner
-        from worker_core import cli as cli_mod
-        from worker_core.artel_bootstrap import ArtelBootstrapResult
-        from worker_core.cmux import CmuxPreflightResult
-
-        monkeypatch.setattr(cli_mod.os, "getcwd", lambda: "/tmp/project")
-        monkeypatch.setattr(
-            "worker_core.artel_bootstrap.bootstrap_artel",
-            lambda project_dir=None, command_name=None, prompt=None: ArtelBootstrapResult(
-                project_dir=str(Path("/tmp/project").resolve()),
-                cmux_required=True,
-                cmux_preflight=CmuxPreflightResult(
-                    ok=False,
-                    code="unsupported_environment",
-                    summary="Artel interactive mode must be launched inside a cmux workspace.",
-                    guidance=["Start or attach to a cmux workspace, then launch `artel` from that terminal."],
-                ),
-            ),
-        )
-
-        runner = CliRunner()
-        result = runner.invoke(cli_mod.cli, [])
-
-        assert result.exit_code != 0
-        assert "must be launched inside a cmux workspace" in result.output
-        assert "Start or attach to a cmux workspace" in result.output
 
     def test_worker_prompt_mode_skips_cmux_preflight(self, monkeypatch):
         from click.testing import CliRunner
