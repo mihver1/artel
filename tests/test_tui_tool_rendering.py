@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 
 def test_rendered_write_tool_result_uses_diff_markdown():
     from worker_core.tool_display import build_file_diff_display, format_tool_result_display
@@ -35,3 +37,30 @@ def test_tool_card_set_result_accepts_status_variant():
     assert card._result_kind == "file_diff"
     assert card._result_status_badge == "+1  -0"
     assert card._result_status_variant == "success"
+
+
+@pytest.mark.asyncio
+async def test_tool_card_composes_result_row_with_status_variant():
+    from textual.app import App, ComposeResult
+
+    from worker_tui.app import ToolCard
+
+    class TestApp(App[None]):
+        def compose(self) -> ComposeResult:
+            yield ToolCard(
+                "⚙ write demo.py",
+                result_title="demo.py",
+                result_body="Created demo.py",
+                result_status_badge="+1  -0",
+                result_status_variant="success",
+            )
+
+    app = TestApp()
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        card = app.query_one(ToolCard)
+
+        assert card.query_one(".tool-message-result-row") is not None
+        assert card.query_one(".tool-message-result-title") is not None
+        assert card.query_one(".tool-message-badge-success") is not None

@@ -745,17 +745,16 @@ class ToolCard(Static):
         if self._call_body:
             yield Static(self._call_body, classes="tool-message-body")
         if self._result_title or self._result_status_badge:
-            row = Horizontal(classes="tool-message-result-row")
-            if self._result_title:
-                row.mount(Static(self._result_title, classes="tool-message-result-title"))
-            if self._result_status_badge:
-                badge_classes = "tool-message-badge"
-                if self._result_status_variant == "success":
-                    badge_classes += " tool-message-badge-success"
-                elif self._result_status_variant == "error":
-                    badge_classes += " tool-message-badge-error"
-                row.mount(Static(self._result_status_badge, classes=badge_classes))
-            yield row
+            with Horizontal(classes="tool-message-result-row"):
+                if self._result_title:
+                    yield Static(self._result_title, classes="tool-message-result-title")
+                if self._result_status_badge:
+                    badge_classes = "tool-message-badge"
+                    if self._result_status_variant == "success":
+                        badge_classes += " tool-message-badge-success"
+                    elif self._result_status_variant == "error":
+                        badge_classes += " tool-message-badge-error"
+                    yield Static(self._result_status_badge, classes=badge_classes)
         if self._result_kind == "file_diff":
             yield DiffWidget(
                 str(self._result_title or self._result_display.get("path", "") if isinstance(self._result_display, dict) else self._result_title),
