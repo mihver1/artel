@@ -98,6 +98,21 @@ def restore_all(*, cwd: str) -> str:
     return "Restored all unstaged changes."
 
 
+def restore_paths(*, cwd: str, paths: list[str]) -> str:
+    normalized = [str(path).strip() for path in paths if str(path).strip()]
+    if not normalized:
+        return "No files to restore."
+    proc = _run_git(["restore", "--", *normalized], cwd=cwd)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        return f"git restore failed: {detail or f'exit code {proc.returncode}'}"
+    if len(normalized) == 1:
+        return f"Restored: {normalized[0]}"
+    lines = [f"Restored {len(normalized)} files:"]
+    lines.extend(f"  - {path}" for path in normalized)
+    return "\n".join(lines)
+
+
 def render_git_help() -> str:
     return (
         "Git commands:\n"
@@ -115,5 +130,6 @@ __all__ = [
     "render_git_diff",
     "restore_all",
     "restore_path",
+    "restore_paths",
     "render_git_help",
 ]

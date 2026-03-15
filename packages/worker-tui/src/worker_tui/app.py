@@ -72,7 +72,8 @@ from worker_core.provider_resolver import (
     get_provider_config,
     get_provider_env_vars,
 )
-from worker_core.git_surface import render_git_diff, render_git_help, render_git_status, restore_all, restore_path
+from worker_core.git_surface import render_git_diff, render_git_help, render_git_status, restore_all, restore_path, restore_paths
+from worker_core.session_rewind import collect_last_ai_changed_paths
 from worker_core.rules import (
     SessionRuleOverrides,
     add_rule,
@@ -2817,6 +2818,8 @@ class WorkerApp(App):
                 "  /status             — alias for /git status\n"
                 "  /diff [path]        — alias for /git diff [path]\n"
                 "  /rollback <path>    — restore one file (or --all)\n"
+                "  /undo               — restore files changed by the latest AI edit cycle\n"
+                "  /rewind <index>     — fork+switch session to an earlier message index\n"
                 "  /wt [branch]        — manage git worktrees for the current repository\n"
                 "  /tasks              — show the shared task board\n"
                 "  /task-add <title>   — add a task to the shared task board\n"
@@ -2923,6 +2926,10 @@ class WorkerApp(App):
             await self._cmd_schedules(arg)
         elif cmd in {"/git", "/status", "/diff", "/rollback"}:
             await self._cmd_git(cmd, arg)
+        elif cmd == "/undo":
+            await self._cmd_undo()
+        elif cmd == "/rewind":
+            await self._cmd_rewind(arg)
         elif cmd == "/wt":
             await self._cmd_wt(arg)
         elif cmd == "/tasks":
@@ -5168,6 +5175,72 @@ class WorkerApp(App):
             self._add_message(message, role=role)
             return
         self._add_message(render_git_help(), role="tool")
+
+    async def _cmd_undo(self) -> None:
+        if self.remote_url:
+            try:
+                payload = await self._remote_control().get_session_messages(self._remote_session_id)
+            except Exception as exc:
+                self._add_message(f"Undo failed: {exc}", role="error")
+                return
+            messages = payload.get("messages", []) if isinstance(payload.get("messages", []), list) else []
+            paths = collect_last_ai_changed_paths(messages)
+            if not paths:
+                self._add_message("No recent AI file edits found to undo.", role="tool")
+                return
+            command = "git restore -- " + " ".join(paths)
+            try:
+                payload = await self._remote_control().run_bash(self._remote_session_id, command)
+            except Exception as exc:
+                self._add_message(f"Undo failed: {exc}", role="error")
+                return
+            if int(payload.get("exit_code", 0)) != 0:
+                self._add_message(str(payload.get("output", "") or "git restore failed"), role="error")
+                return
+            self._add_message(f"Undid latest AI file changes:\n" + "\n".join(f"- {path}" for path in paths), role="tool")
+            return
+
+        if not self._session:
+            self._add_message("No active session.", role="error")
+            return
+        paths = collect_last_ai_changed_paths(self._session.messages)
+        if not paths:
+            self._add_message("No recent AI file edits found to undo.", role="tool")
+            return
+        message = restore_paths(cwd=os.getcwd(), paths=paths)
+        role = "error" if message.startswith("git restore failed:") else "tool"
+        self._add_message(message if role == "error" else f"Undid latest AI file changes:\n" + "\n".join(f"- {path}" for path in paths), role=role)
+
+    async def _cmd_rewind(self, arg: str) -> None:
+        if not arg.isdigit():
+            self._add_message("Usage: /rewind <message_index>", role="error")
+            return
+        idx = int(arg)
+        if self.remote_url:
+            try:
+                payload = await self._remote_control().fork_session(self._remote_session_id, message_index=idx)
+            except Exception as exc:
+                self._add_message(f"Rewind failed: {exc}", role="error")
+                return
+            new_session = str(payload.get("session_id", "")).strip()
+            if not new_session:
+                self._add_message("Rewind failed: missing forked session id.", role="error")
+                return
+            await self._resume_remote_session(new_session)
+            self._add_message(f"Rewound session to message {idx}.", role="tool")
+            return
+
+        if not self._store or not self._session:
+            self._add_message("No active session.", role="error")
+            return
+        new_id = str(uuid.uuid4())
+        try:
+            await self._store.fork_session(self._session.session_id, new_id, up_to_message_idx=idx)
+            await self._resume_session(new_id)
+        except Exception as exc:
+            self._add_message(f"Rewind failed: {exc}", role="error")
+            return
+        self._add_message(f"Rewound session to message {idx}.", role="tool")
 
     async def _cmd_wt(self, arg: str) -> None:
         """Manage git worktrees for the current project."""
