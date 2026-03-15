@@ -258,6 +258,8 @@ def _agent_event_payload(event: Any, *, cwd: str | None = None) -> dict[str, Any
         payload["call_id"] = event.tool_call_id
         payload["output"] = event.content
         payload["is_error"] = event.is_error
+        if event.display is not None:
+            payload["display"] = event.display
     elif event.type == AgentEventType.DONE:
         if event.usage:
             payload["usage"] = {
@@ -1010,6 +1012,7 @@ def _serialize_message(message: Message) -> dict[str, Any]:
             "tool_call_id": message.tool_result.tool_call_id,
             "content": message.tool_result.content,
             "is_error": message.tool_result.is_error,
+            "display": message.tool_result.display,
         }
     if message.attachments:
         payload["attachments"] = [

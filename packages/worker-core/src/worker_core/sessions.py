@@ -179,6 +179,7 @@ class SessionStore:
                     "tool_call_id": message.tool_result.tool_call_id,
                     "content": message.tool_result.content,
                     "is_error": message.tool_result.is_error,
+                    "display": message.tool_result.display,
                 }
             )
             if message.tool_result
@@ -260,6 +261,7 @@ class SessionStore:
                     tool_call_id=raw["tool_call_id"],
                     content=raw["content"],
                     is_error=raw.get("is_error", False),
+                    display=raw.get("display"),
                 )
 
             attachments = None

@@ -3078,8 +3078,9 @@ class TestRemoteModeCommandRouting:
                         type=AgentEventType.TOOL_CALL,
                         tool_name="read",
                         tool_args={"path": "x"},
+                        tool_call_id="tc1",
                     ),
-                    AgentEvent(type=AgentEventType.TOOL_RESULT, content="ok"),
+                    AgentEvent(type=AgentEventType.TOOL_RESULT, content="ok", tool_name="read", tool_call_id="tc1"),
                     AgentEvent(type=AgentEventType.REASONING_DELTA, content="post-tool"),
                     AgentEvent(type=AgentEventType.TEXT_DELTA, content="done"),
                     AgentEvent(type=AgentEventType.DONE),
@@ -3093,7 +3094,8 @@ class TestRemoteModeCommandRouting:
 
         reasoning_blocks: list[str] = []
         assistant_messages: list[str] = []
-        tool_messages: list[str] = []
+        started_tool_cards: list[tuple[str, str, str]] = []
+        finished_tool_cards: list[tuple[str, str, str, bool]] = []
         log_calls: list[tuple[str, str, str]] = []
         notify_calls: list[tuple[str, str, str | None]] = []
 
@@ -3123,8 +3125,11 @@ class TestRemoteModeCommandRouting:
             return None
 
         app._add_message = _add_message  # type: ignore[method-assign]
-        app._add_tool_message = (  # type: ignore[method-assign]
-            lambda content: tool_messages.append(content)
+        app._start_tool_card = (  # type: ignore[method-assign]
+            lambda call_id, *, title, body="": started_tool_cards.append((call_id, title, body))
+        )
+        app._finish_tool_card = (  # type: ignore[method-assign]
+            lambda call_id, *, title, body, markdown=False, display=None, kind="text", status_badge="", status_variant="neutral": finished_tool_cards.append((call_id, title, body, markdown))
         )
         app.query_one = lambda selector, _cls=None: _Footer()  # type: ignore[method-assign]
         monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
@@ -3164,6 +3169,9 @@ class TestRemoteModeCommandRouting:
 
         assert reasoning_blocks == ["pre-tool ", "post-tool"]
         assert assistant_messages == ["done"]
+        assert started_tool_cards[0][1] == "⚙ read x"
+        assert finished_tool_cards[0][1].startswith("✓ read")
+        assert started_tool_cards[0][0] == finished_tool_cards[0][0]
         assert ("tool: read", "info", "artel") in log_calls
         assert (("context", "0"), {"icon": "database", "color": "#89dceb"}) in status_calls
         assert progress_calls == []
@@ -3223,8 +3231,8 @@ class TestRemoteModeCommandRouting:
         app._ws = _WebSocket(
             [
                 {"type": "reasoning_delta", "content": "pre-tool "},
-                {"type": "tool_call", "tool": "read", "args": {"path": "x"}},
-                {"type": "tool_result", "output": "ok"},
+                {"type": "tool_call", "tool": "read", "args": {"path": "x"}, "call_id": "tc1"},
+                {"type": "tool_result", "tool": "read", "output": "ok", "call_id": "tc1"},
                 {"type": "reasoning_delta", "content": "post-tool"},
                 {"type": "text_delta", "content": "done"},
                 {"type": "done"},
@@ -3233,7 +3241,8 @@ class TestRemoteModeCommandRouting:
 
         reasoning_blocks: list[str] = []
         assistant_messages: list[str] = []
-        tool_messages: list[str] = []
+        started_tool_cards: list[tuple[str, str, str]] = []
+        finished_tool_cards: list[tuple[str, str, str, bool]] = []
 
         class _StreamingWidget:
             def __init__(self, sink: list[str]):
@@ -3258,8 +3267,11 @@ class TestRemoteModeCommandRouting:
             return None
 
         app._add_message = _add_message  # type: ignore[method-assign]
-        app._add_tool_message = (  # type: ignore[method-assign]
-            lambda content: tool_messages.append(content)
+        app._start_tool_card = (  # type: ignore[method-assign]
+            lambda call_id, *, title, body="": started_tool_cards.append((call_id, title, body))
+        )
+        app._finish_tool_card = (  # type: ignore[method-assign]
+            lambda call_id, *, title, body, markdown=False, display=None, kind="text", status_badge="", status_variant="neutral": finished_tool_cards.append((call_id, title, body, markdown))
         )
         app.query_one = lambda selector, _cls=None: _Footer()  # type: ignore[method-assign]
         monkeypatch.setattr(app, "call_after_refresh", lambda callback: None)
@@ -3269,6 +3281,9 @@ class TestRemoteModeCommandRouting:
 
         assert reasoning_blocks == ["pre-tool ", "post-tool"]
         assert assistant_messages == ["done"]
+        assert started_tool_cards[0][1] == "⚙ read x"
+        assert finished_tool_cards[0][1].startswith("✓ read")
+        assert started_tool_cards[0][0] == finished_tool_cards[0][0]
 
     @pytest.mark.asyncio
     async def test_run_remote_refreshes_board_on_board_event(self, monkeypatch):

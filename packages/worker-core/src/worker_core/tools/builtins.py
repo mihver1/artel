@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from worker_core.tool_display import build_file_diff_display
+
 from worker_ai.models import ToolDef, ToolParam
 
 from worker_core.board import (
@@ -172,14 +174,31 @@ class WriteTool(Tool):
         content = kwargs["content"]
 
         full_path = Path(self.working_dir) / path if not os.path.isabs(path) else Path(path)
+        existed = full_path.exists()
+        previous = ""
+        if existed:
+            try:
+                previous = await _read_text(full_path, encoding="utf-8", errors="replace")
+            except OSError:
+                previous = ""
         try:
             full_path.parent.mkdir(parents=True, exist_ok=True)
             await _write_text(full_path, content, encoding="utf-8")
         except OSError as e:
             return f"Error writing file: {e}"
 
+        ctx = get_current_tool_execution_context()
+        if ctx is not None:
+            ctx.display_payload = build_file_diff_display(
+                tool_name="write",
+                path=path,
+                before=previous,
+                after=content,
+            )
+
         lines = content.count("\n") + 1
-        return f"Wrote {lines} lines to {full_path}"
+        action = "Created" if not existed else "Wrote"
+        return f"{action} {lines} lines to {full_path}"
 
     def definition(self) -> ToolDef:
         return ToolDef(
@@ -229,6 +248,15 @@ class EditTool(Tool):
             await _write_text(full_path, new_content, encoding="utf-8")
         except OSError as e:
             return f"Error writing file: {e}"
+
+        ctx = get_current_tool_execution_context()
+        if ctx is not None:
+            ctx.display_payload = build_file_diff_display(
+                tool_name="edit",
+                path=path,
+                before=content,
+                after=new_content,
+            )
 
         return f"Applied edit to {full_path}"
 

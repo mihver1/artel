@@ -723,6 +723,7 @@ async def run_acp() -> None:
                                     raw_output={
                                         "output": event.content,
                                         "is_error": event.is_error,
+                                        "display": event.display,
                                     },
                                 ),
                             )

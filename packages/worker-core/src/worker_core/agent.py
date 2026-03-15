@@ -77,6 +77,7 @@ class AgentEvent:
     usage: Usage | None = None
     error: str = ""
     is_error: bool = False
+    display: dict[str, Any] | None = None
 
 
 # ── Agent session ─────────────────────────────────────────────────
@@ -565,6 +566,7 @@ class AgentSession:
                 )
 
                 tool = self.tools.get(tc.name)
+                display_payload: dict[str, Any] | None = None
                 if not tool:
                     result = f"Error: Unknown tool '{tc.name}'"
                     is_error = True
@@ -595,8 +597,13 @@ class AgentSession:
                                         tool_call_id=tc.id,
                                         arguments=dict(exec_args),
                                     )
-                                ):
+                                ) as tool_ctx:
                                     result = await tool.execute(**exec_args)
+                                    display_payload = (
+                                        dict(tool_ctx.display_payload)
+                                        if tool_ctx.display_payload
+                                        else None
+                                    )
                                 is_error = False
                             except Exception as e:
                                 await self.hooks.fire("on_error", session=self, error=e)
@@ -611,8 +618,13 @@ class AgentSession:
                                     tool_call_id=tc.id,
                                     arguments=dict(exec_args),
                                 )
-                            ):
+                            ) as tool_ctx:
                                 result = await tool.execute(**exec_args)
+                                display_payload = (
+                                    dict(tool_ctx.display_payload)
+                                    if tool_ctx.display_payload
+                                    else None
+                                )
                             is_error = False
                         except Exception as e:
                             await self.hooks.fire("on_error", session=self, error=e)
@@ -625,6 +637,7 @@ class AgentSession:
                     tool_call_id=tc.id,
                     content=result,
                     is_error=is_error,
+                    display=display_payload,
                 )
 
                 await self._append_message(
@@ -634,6 +647,7 @@ class AgentSession:
                             tool_call_id=tc.id,
                             content=result,
                             is_error=is_error,
+                            display=display_payload,
                         ),
                     )
                 )

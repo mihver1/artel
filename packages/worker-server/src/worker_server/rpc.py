@@ -143,6 +143,8 @@ class RpcServer:
             elif event.type == AgentEventType.TOOL_RESULT:
                 evt["call_id"] = event.tool_call_id
                 evt["output"] = event.content
+                if event.display is not None:
+                    evt["display"] = event.display
             elif event.type == AgentEventType.DONE:
                 if event.usage:
                     evt["usage"] = {

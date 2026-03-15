@@ -88,6 +88,7 @@ from worker_core.rules import (
 )
 from worker_core.sessions import SessionStore
 from worker_core.skills import inject_skill, load_skills
+from worker_core.tool_display import format_tool_call_display, format_tool_result_display
 from worker_core.tools.builtins import create_builtin_tools
 
 from worker_tui.credential_forwarding import collect_forward_credentials
@@ -553,6 +554,37 @@ class MessageWidget(Static):
         color: $text-muted;
         text-style: italic;
     }
+    .tool-message-title {
+        text-style: bold;
+        color: $text;
+        margin-bottom: 1;
+    }
+    .tool-message-body {
+        color: $text;
+    }
+    .tool-message-result-row {
+        margin-top: 1;
+    }
+    .tool-message-result-title {
+        color: $success;
+        text-style: bold;
+    }
+    .tool-message-badge {
+        color: $warning;
+        text-style: bold;
+    }
+    .tool-message-badge-success {
+        color: $success;
+        text-style: bold;
+    }
+    .tool-message-badge-error {
+        color: $error;
+        text-style: bold;
+    }
+    .tool-diff-stats {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
     .error-message {
         background: $error 20%;
         color: $error;
@@ -635,6 +667,103 @@ class MessageWidget(Static):
             self._schedule_scroll()
         else:
             self.refresh(layout=True)
+
+
+class DiffWidget(Static):
+    """Compact diff widget with stat header and diff body."""
+
+    def __init__(self, path: str, stats: str, diff_text: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._path = path
+        self._stats = stats
+        self._diff_text = diff_text
+        self._markdown: MarkdownWidget | None = None
+        self.add_class("tool-message")
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._path, classes="tool-message-title")
+        if self._stats:
+            yield Static(self._stats, classes="tool-diff-stats")
+        if self._diff_text:
+            self._markdown = MarkdownWidget(f"```diff\n{self._diff_text}\n```")
+            yield self._markdown
+
+
+class ToolCard(Static):
+    """Single card representing a tool call and its eventual result."""
+
+    def __init__(
+        self,
+        call_title: str,
+        call_body: str = "",
+        *,
+        result_title: str = "",
+        result_body: str = "",
+        result_markdown: bool = False,
+        result_display: dict[str, Any] | None = None,
+        result_kind: str = "text",
+        result_status_badge: str = "",
+        result_status_variant: str = "neutral",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._call_title = call_title
+        self._call_body = call_body
+        self._result_title = result_title
+        self._result_body = result_body
+        self._result_markdown = result_markdown
+        self._result_display = result_display
+        self._result_kind = result_kind
+        self._result_status_badge = result_status_badge
+        self._result_status_variant = result_status_variant
+        self.add_class("tool-message")
+
+    def set_result(
+        self,
+        *,
+        title: str,
+        body: str,
+        markdown: bool = False,
+        display: dict[str, Any] | None = None,
+        kind: str = "text",
+        status_badge: str = "",
+    ) -> None:
+        self._result_title = title
+        self._result_body = body
+        self._result_markdown = markdown
+        self._result_display = display
+        self._result_kind = kind
+        self._result_status_badge = status_badge
+        self._result_status_variant = status_variant
+        self.refresh(layout=True, recompose=True)
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._call_title, classes="tool-message-title")
+        if self._call_body:
+            yield Static(self._call_body, classes="tool-message-body")
+        if self._result_title or self._result_status_badge:
+            row = Horizontal(classes="tool-message-result-row")
+            if self._result_title:
+                row.mount(Static(self._result_title, classes="tool-message-result-title"))
+            if self._result_status_badge:
+                badge_classes = "tool-message-badge"
+                if self._result_status_variant == "success":
+                    badge_classes += " tool-message-badge-success"
+                elif self._result_status_variant == "error":
+                    badge_classes += " tool-message-badge-error"
+                row.mount(Static(self._result_status_badge, classes=badge_classes))
+            yield row
+        if self._result_kind == "file_diff":
+            yield DiffWidget(
+                str(self._result_title or self._result_display.get("path", "") if isinstance(self._result_display, dict) else self._result_title),
+                self._result_status_badge,
+                self._result_body,
+            )
+        elif self._result_body:
+            if self._result_markdown:
+                yield MarkdownWidget(self._result_body)
+            else:
+                yield Static(self._result_body, classes="tool-message-body")
 
 
 class StatusFooter(Static):
@@ -1100,6 +1229,7 @@ class WorkerApp(App):
         self._remote_rule_overrides: dict[str, Any] = {}
         self._local_rule_overrides = SessionRuleOverrides.empty()
         self._tool_collapsibles: list[Collapsible] = []
+        self._active_tool_cards: dict[str, ToolCard] = {}
         self._input_price: float = 0.0  # per 1M tokens
         self._output_price: float = 0.0
         self._auto_approve_all: bool = False
@@ -2510,6 +2640,7 @@ class WorkerApp(App):
                     content=msg.content,
                     reasoning=msg.reasoning or "",
                     attachments=msg.attachments,
+                    tool_result=msg.tool_result.model_dump() if msg.tool_result is not None else None,
                 )
 
         self._provider_model = f"{provider_name}/{model_id}"
@@ -2955,9 +3086,8 @@ class WorkerApp(App):
                 elif event.type == AgentEventType.TOOL_CALL:
                     had_tool_calls = True
                     need_new_reasoning_block = True
-                    tool_args = ", ".join(f"{k}={v!r}" for k, v in event.tool_args.items())
-                    tool_label = f"⚙ {event.tool_name}({tool_args})"
-                    self._add_tool_message(tool_label)
+                    tool_display = format_tool_call_display(event.tool_name, event.tool_args)
+                    self._start_tool_card(event.tool_call_id or str(uuid.uuid4()), title=tool_display.title, body=tool_display.body)
                     self._set_run_activity(f"tool: {event.tool_name}", busy=True)
                     await cmux.set_status(
                         "state",
@@ -2968,8 +3098,22 @@ class WorkerApp(App):
                     await cmux.log(f"tool: {event.tool_name}", source="artel")
 
                 elif event.type == AgentEventType.TOOL_RESULT:
-                    output = event.content[:200] + "..." if len(event.content) > 200 else event.content
-                    self._add_tool_message(f"  → {output}")
+                    result_display = format_tool_result_display(
+                        tool_name=event.tool_name,
+                        content=event.content,
+                        is_error=event.is_error,
+                        display=event.display,
+                    )
+                    self._finish_tool_card(
+                        event.tool_call_id or str(uuid.uuid4()),
+                        title=result_display.title,
+                        body=result_display.body,
+                        markdown=result_display.markdown,
+                        display=event.display,
+                        kind=result_display.kind,
+                        status_badge=result_display.status_badge,
+                        status_variant=result_display.status_variant,
+                    )
                     self._set_run_activity("thinking", busy=True)
 
                 elif event.type == AgentEventType.ERROR:
@@ -3050,20 +3194,30 @@ class WorkerApp(App):
                     need_new_reasoning_block = True
                     tool_name = str(msg.get("tool", "")).strip()
                     tool_args = msg.get("args", {})
-                    if isinstance(tool_args, dict) and tool_args:
-                        rendered_args = ", ".join(
-                            f"{key}={value!r}" for key, value in tool_args.items()
-                        )
-                        tool_label = f"⚙ {tool_name}({rendered_args})"
-                    else:
-                        tool_label = f"⚙ {tool_name}"
-                    self._add_tool_message(tool_label)
+                    tool_display = format_tool_call_display(
+                        tool_name,
+                        tool_args if isinstance(tool_args, dict) else {},
+                    )
+                    self._start_tool_card(str(msg.get("call_id", "") or uuid.uuid4()), title=tool_display.title, body=tool_display.body)
                     self._set_run_activity(f"tool: {tool_name}", busy=True)
                 elif msg_type == "tool_result":
-                    output = msg.get("output", "")
-                    if len(output) > 200:
-                        output = output[:200] + "..."
-                    self._add_tool_message(f"  → {output}")
+                    output = str(msg.get("output", "") or "")
+                    result_display = format_tool_result_display(
+                        tool_name=str(msg.get("tool", "") or "tool"),
+                        content=output,
+                        is_error=bool(msg.get("is_error", False)),
+                        display=msg.get("display") if isinstance(msg.get("display"), dict) else None,
+                    )
+                    self._finish_tool_card(
+                        str(msg.get("call_id", "") or uuid.uuid4()),
+                        title=result_display.title,
+                        body=result_display.body,
+                        markdown=result_display.markdown,
+                        display=msg.get("display") if isinstance(msg.get("display"), dict) else None,
+                        kind=result_display.kind,
+                        status_badge=result_display.status_badge,
+                        status_variant=result_display.status_variant,
+                    )
                     self._set_run_activity("thinking", busy=True)
                 elif msg_type == "permission_request":
                     await self._handle_remote_permission_request(msg)
@@ -4072,6 +4226,7 @@ class WorkerApp(App):
                 content=content,
                 reasoning=reasoning,
                 attachments=attachments or None,
+                tool_result=message.get("tool_result") if isinstance(message.get("tool_result"), dict) else None,
             )
 
         title = str(session.get("title", "")).strip() or session_id[:8]
@@ -4143,6 +4298,7 @@ class WorkerApp(App):
         container = self.query_one("#chat-container", Vertical)
         container.remove_children()
         self._tool_collapsibles.clear()
+        self._active_tool_cards.clear()
 
         # Update session
         self._session.session_id = session_id
@@ -4159,6 +4315,7 @@ class WorkerApp(App):
                 content=msg.content,
                 reasoning=msg.reasoning or "",
                 attachments=msg.attachments,
+                tool_result=msg.tool_result.model_dump() if msg.tool_result is not None else None,
             )
 
         title = info.title if info else session_id[:8]
@@ -5081,15 +5238,57 @@ class WorkerApp(App):
         self._scroll_to_bottom()
         return widget
 
-    def _add_tool_message(self, content: str) -> Collapsible:
-        """Add a tool message wrapped in a collapsible container."""
+    def _start_tool_card(self, call_id: str, *, title: str, body: str = "") -> ToolCard:
         container = self.query_one("#chat-container", Vertical)
-        widget = MessageWidget(content, role="tool")
-        collapsible = Collapsible(widget, title="⚙ tool", collapsed=False)
+        widget = ToolCard(title, body)
+        collapsible = Collapsible(widget, title=title, collapsed=False)
+        container.mount(collapsible)
+        self._tool_collapsibles.append(collapsible)
+        self._active_tool_cards[call_id] = widget
+        self._scroll_to_bottom()
+        return widget
+
+    def _finish_tool_card(
+        self,
+        call_id: str,
+        *,
+        title: str,
+        body: str,
+        markdown: bool = False,
+        display: dict[str, Any] | None = None,
+        kind: str = "text",
+        status_badge: str = "",
+        status_variant: str = "neutral",
+    ) -> None:
+        card = self._active_tool_cards.pop(call_id, None)
+        if card is not None:
+            card.set_result(
+                title=title,
+                body=body,
+                markdown=markdown,
+                display=display,
+                kind=kind,
+                status_badge=status_badge,
+                status_variant=status_variant,
+            )
+            self._scroll_to_bottom()
+            return
+        container = self.query_one("#chat-container", Vertical)
+        widget = ToolCard(
+            "⚙ tool",
+            "",
+            result_title=title,
+            result_body=body,
+            result_markdown=markdown,
+            result_display=display,
+            result_kind=kind,
+            result_status_badge=status_badge,
+            result_status_variant=status_variant,
+        )
+        collapsible = Collapsible(widget, title=title, collapsed=False)
         container.mount(collapsible)
         self._tool_collapsibles.append(collapsible)
         self._scroll_to_bottom()
-        return collapsible
 
     def _render_restored_message(
         self,
@@ -5098,6 +5297,7 @@ class WorkerApp(App):
         content: str,
         reasoning: str = "",
         attachments: list[ImageAttachment] | None = None,
+        tool_result: dict[str, Any] | None = None,
     ) -> None:
         rendered = self._render_user_submission(content, attachments) if role == Role.USER.value else content
         if role == Role.USER.value:
@@ -5109,6 +5309,28 @@ class WorkerApp(App):
                 self._add_message(rendered, role="assistant")
         elif role == Role.SYSTEM.value and rendered:
             self._add_message("📋 [Restored session]", role="tool")
+        elif role == Role.TOOL.value:
+            if tool_result:
+                result_display = format_tool_result_display(
+                    tool_name="tool",
+                    content=str(tool_result.get("content", "") or content),
+                    is_error=bool(tool_result.get("is_error", False)),
+                    display=tool_result.get("display") if isinstance(tool_result.get("display"), dict) else None,
+                )
+                self._finish_tool_card(
+                    str(tool_result.get("tool_call_id", "") or uuid.uuid4()),
+                    title=result_display.title,
+                    body=result_display.body,
+                    markdown=result_display.markdown,
+                    display=tool_result.get("display") if isinstance(tool_result.get("display"), dict) else None,
+                    kind=result_display.kind,
+                    status_badge=result_display.status_badge,
+                    status_variant=result_display.status_variant,
+                )
+            elif rendered:
+                self._add_message(rendered, role="tool")
+        elif rendered:
+            self._add_message(rendered, role=role)
 
     def _last_assistant_message_text(self) -> str:
         for widget in reversed(self._assistant_message_history):
@@ -5217,6 +5439,7 @@ class WorkerApp(App):
         container = self.query_one("#chat-container", Vertical)
         container.remove_children()
         self._tool_collapsibles.clear()
+        self._active_tool_cards.clear()
         self._hide_command_menu()
         self._clear_pending_attachments()
         if self.remote_url:

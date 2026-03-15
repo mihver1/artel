@@ -31,6 +31,7 @@ class ToolResult(BaseModel):
     tool_call_id: str
     content: str
     is_error: bool = False
+    display: dict[str, Any] | None = None
 
 
 class ImageAttachment(BaseModel):

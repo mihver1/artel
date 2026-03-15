@@ -20,6 +20,7 @@ class ToolExecutionContext:
     tool_name: str
     tool_call_id: str
     arguments: dict[str, Any]
+    display_payload: dict[str, Any] | None = None
 
 
 _CURRENT_TOOL_EXECUTION: ContextVar[ToolExecutionContext | None] = ContextVar(
