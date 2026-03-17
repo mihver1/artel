@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from functools import lru_cache
+from itertools import groupby
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -45,6 +46,7 @@ from textual.widgets import (
     OptionList,
     Static,
     TextArea,
+    Tree,
 )
 from textual.widgets import (
     Markdown as MarkdownWidget,
@@ -111,6 +113,13 @@ from worker_core.tools.builtins import create_builtin_tools
 from worker_tui.credential_forwarding import collect_forward_credentials
 from worker_tui.local_server import restart_managed_local_server
 from worker_tui.remote_control import RemoteControlClient
+from worker_tui.server_registry import (
+    SavedArtelServer,
+    default_server_name,
+    load_saved_servers,
+    remove_saved_server,
+    upsert_saved_server,
+)
 
 _RU_QWERTY_KEY_ALIASES: dict[str, str] = {
     "q": "й",
@@ -149,6 +158,7 @@ _RU_QWERTY_KEY_ALIASES: dict[str, str] = {
 
 _DIFF_SYNTAX_THEME = "ansi_dark"
 _DIFF_PYGMENTS_STYLE = "monokai"
+_MAX_PASTED_IMAGE_REFERENCE_CHARS = 512
 
 
 def _layout_safe_binding_variants(key: str) -> list[str]:
@@ -483,12 +493,24 @@ class PendingPermissionRequest:
     future: asyncio.Future[str]
 
 
+@dataclass(frozen=True, slots=True)
+class ServerDockNodeData:
+    """Typed metadata stored in server dock tree nodes."""
+
+    kind: str
+    remote_url: str = ""
+    auth_token: str = ""
+    session_id: str = ""
+    project_dir: str = ""
+    name: str = ""
+
+
 BUILTIN_COMMAND_SUGGESTIONS: tuple[SlashCommandSuggestion, ...] = (
     SlashCommandSuggestion("/help", "show available commands"),
     SlashCommandSuggestion("/rules", "list configured rules"),
     SlashCommandSuggestion("/rule", "manage rules"),
-    SlashCommandSuggestion("/rule add", "add a rule via dialog"),
-    SlashCommandSuggestion("/rule edit", "edit a rule via dialog"),
+    SlashCommandSuggestion("/rule add", "add a rule via inline editor"),
+    SlashCommandSuggestion("/rule edit", "edit a rule via inline editor"),
     SlashCommandSuggestion("/rule delete", "delete a rule"),
     SlashCommandSuggestion("/rule enable", "enable a rule for this session"),
     SlashCommandSuggestion("/rule disable", "disable a rule for this session"),
@@ -519,6 +541,10 @@ BUILTIN_COMMAND_SUGGESTIONS: tuple[SlashCommandSuggestion, ...] = (
     SlashCommandSuggestion("/image-clear", "clear pending image attachments"),
     SlashCommandSuggestion("/image-remove", "remove a pending image attachment by index"),
     SlashCommandSuggestion("/copy", "copy the last assistant message"),
+    SlashCommandSuggestion("/server-add", "save an Artel server in the left dock"),
+    SlashCommandSuggestion("/server-remove", "remove a saved Artel server from the left dock"),
+    SlashCommandSuggestion("/server-select", "connect to a saved Artel server by name or URL"),
+    SlashCommandSuggestion("/server-dock", "toggle the left server/project/session dock"),
     SlashCommandSuggestion("/delegates", "show orchestrated delegated runs in the current window"),
     SlashCommandSuggestion("/agents", "legacy alias for /delegates"),
     SlashCommandSuggestion("/mcp", "show MCP config sources, connections, and errors"),
@@ -580,6 +606,203 @@ class PendingAttachmentsBar(Static):
         else:
             self.update("")
             self.remove_class("visible")
+
+
+class ServerDockTree(Tree[ServerDockNodeData]):
+    """Tree with a click target for per-node actions rendered as leading ⋮."""
+
+    ACTION_GUTTER_WIDTH = 4
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._suppress_next_select = False
+
+    def action_select_cursor(self) -> None:
+        if self._suppress_next_select:
+            self._suppress_next_select = False
+            return
+        super().action_select_cursor()
+
+    def render_label(self, node: Any, base_style: Style, style: Style) -> Text:
+        label = super().render_label(node, base_style, style)
+        prefix = Text("⋮ ", style=style + Style(dim=True))
+        prefix.stylize(Style(meta={"dock_action": True, "node": node._id}))
+        return Text.assemble(prefix, label)
+
+    async def _on_click(self, event: events.Click) -> None:
+        line = int(event.y) - self.gutter.top + int(self.scroll_offset.y)
+        if 0 <= line < len(self._tree_lines):
+            tree_line = self._tree_lines[line]
+            depth = max(0, len(tree_line.path) - 1)
+            action_x_start = self.gutter.left + max(2, self.guide_depth) * depth
+            relative_x = int(event.x)
+            if action_x_start <= relative_x < action_x_start + self.ACTION_GUTTER_WIDTH:
+                node = self.get_node_at_line(line)
+                if node is not None and isinstance(node.data, ServerDockNodeData):
+                    self._suppress_next_select = True
+                    self.cursor_line = line
+                    self.post_message(ServerDockActionRequested(node))
+                    event.stop()
+                    return
+        await super()._on_click(event)
+
+
+class ServerDockActionRequested(events.Message):
+    """Posted when user clicks the leading ⋮ action gutter for a dock node."""
+
+    def __init__(self, node: Any) -> None:
+        super().__init__()
+        self.node = node
+
+
+class DockActionInvoked(events.Message):
+    """Posted when the inline dock action panel requests an action."""
+
+    def __init__(self, action: str) -> None:
+        super().__init__()
+        self.action = action
+
+
+class DockActionConfirmed(events.Message):
+    """Posted when the inline dock action panel confirms a destructive action."""
+
+    def __init__(self, action: str) -> None:
+        super().__init__()
+        self.action = action
+
+
+class DockActionClosed(events.Message):
+    """Posted when the inline dock action panel is closed."""
+
+
+class DockInputSubmitted(events.Message):
+    """Posted when the inline dock input panel submits a value."""
+
+    def __init__(self, mode: str, value: str) -> None:
+        super().__init__()
+        self.mode = mode
+        self.value = value
+
+
+class DockInputClosed(events.Message):
+    """Posted when the inline dock input panel is closed."""
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+
+
+class InlineInputSubmitted(events.Message):
+    """Posted when the main inline input panel submits a value."""
+
+    def __init__(self, mode: str, value: str) -> None:
+        super().__init__()
+        self.mode = mode
+        self.value = value
+
+
+class InlineInputClosed(events.Message):
+    """Posted when the main inline input panel is closed."""
+
+    def __init__(self, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+
+
+class RuleEditorSubmitted(events.Message):
+    """Posted when the inline rule editor submits a payload."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__()
+        self.payload = payload
+
+
+class RuleEditorClosed(events.Message):
+    """Posted when the inline rule editor is closed."""
+
+
+class ServerDockSidebar(Static):
+    """Left dock with saved Artel servers grouped into projects and sessions."""
+
+    DEFAULT_CSS = """
+    ServerDockSidebar {
+        width: 36;
+        min-width: 28;
+        max-width: 52;
+        height: 1fr;
+        margin: 0 0 0 1;
+        padding: 0 1;
+        background: $surface;
+        border-right: tall $primary 30%;
+    }
+    ServerDockSidebar.hidden {
+        display: none;
+    }
+    #server-dock-title {
+        text-style: bold;
+        margin-top: 1;
+    }
+    #server-dock-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #server-dock-actions {
+        height: 3;
+        margin-bottom: 1;
+    }
+    #server-dock-actions Button {
+        margin-right: 1;
+        min-width: 8;
+    }
+    #server-dock-tree {
+        height: 1fr;
+        min-height: 12;
+        border: round $primary 20%;
+        padding: 0 1;
+    }
+    #server-dock-status {
+        color: $text-muted;
+        margin: 1 0 0 0;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("Servers", id="server-dock-title")
+        yield Static(
+            "Saved Artel servers grouped as server → project → session",
+            id="server-dock-help",
+        )
+        with Horizontal(id="server-dock-actions"):
+            yield Button("Add", id="server-dock-add", variant="primary")
+            yield Button("Refresh", id="server-dock-refresh")
+            yield Button("Hide", id="server-dock-hide")
+        yield ServerDockTree("Servers", id="server-dock-tree")
+        yield DockInputPanel(id="server-dock-input-panel")
+        yield DockActionPanel(id="server-dock-action-panel")
+        yield Static("", id="server-dock-status")
+
+    def on_mount(self) -> None:
+        tree = self.query_one("#server-dock-tree", Tree)
+        tree.show_root = False
+        tree.root.expand()
+
+    def set_visible(self, visible: bool) -> None:
+        if visible:
+            self.remove_class("hidden")
+        else:
+            self.add_class("hidden")
+
+    def tree(self) -> Tree[ServerDockNodeData]:
+        return self.query_one("#server-dock-tree", Tree)
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#server-dock-status", Static).update(text)
+
+    def input_panel(self) -> DockInputPanel:
+        return self.query_one("#server-dock-input-panel", DockInputPanel)
+
+    def action_panel(self) -> DockActionPanel:
+        return self.query_one("#server-dock-action-panel", DockActionPanel)
 
 
 class BoardSidebar(Static):
@@ -1168,100 +1391,307 @@ class PermissionPanel(Static):
         self._submit("deny")
 
 
-class TextInputScreen(ModalScreen[str | None]):
-    """Modal dialog asking the user to paste or type a short value."""
+class DockInputPanel(Static):
+    """Inline input panel for dock flows such as add server."""
 
-    CSS = """
-    TextInputScreen {
-        align: center middle;
-    }
-    #text-input-dialog {
-        width: 80;
-        max-height: 18;
-        padding: 1 2;
+    DEFAULT_CSS = """
+    DockInputPanel {
+        dock: bottom;
+        height: auto;
+        margin-top: 1;
+        padding: 1 1;
         background: $surface;
-        border: thick $primary;
+        border: round $primary 40%;
+        display: none;
     }
-    #text-input-title {
+    DockInputPanel.visible {
+        display: block;
+    }
+    #dock-input-title {
         text-style: bold;
         margin-bottom: 1;
     }
-    #text-input-detail {
-        margin-bottom: 1;
+    #dock-input-detail {
         color: $text-muted;
-    }
-    #text-input-field {
         margin-bottom: 1;
     }
-    #text-input-buttons {
-        height: 3;
-        align: center middle;
+    #dock-input-field {
+        margin-bottom: 1;
     }
-    #text-input-buttons Button {
-        margin: 0 1;
+    #dock-input-buttons {
+        height: 3;
+        align: right middle;
+    }
+    #dock-input-buttons Button {
+        margin-left: 1;
     }
     """
 
-    BINDINGS = [
-        Binding("escape", "cancel", "Cancel", show=False),
-    ]
-
-    def __init__(
-        self,
-        title: str,
-        detail: str,
-        *,
-        placeholder: str = "",
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._title = title
-        self._detail = detail
-        self._placeholder = placeholder
+        self._mode: str = ""
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="text-input-dialog"):
-            yield Static(self._title, id="text-input-title")
-            yield Static(self._detail, id="text-input-detail")
-            yield Input(placeholder=self._placeholder, id="text-input-field")
-            with Horizontal(id="text-input-buttons"):
-                yield Button("Submit", id="btn-submit", variant="primary")
-                yield Button("Cancel", id="btn-cancel", variant="error")
+        yield Static("", id="dock-input-title")
+        yield Static("", id="dock-input-detail")
+        yield Input(placeholder="", id="dock-input-field")
+        with Horizontal(id="dock-input-buttons"):
+            yield Button("Submit", id="dock-input-submit", variant="primary")
+            yield Button("Cancel", id="dock-input-cancel")
 
     def on_mount(self) -> None:
-        self.query_one("#text-input-field", Input).focus()
+        self.close()
+
+    def open(self, *, mode: str, title: str, detail: str, placeholder: str = "") -> None:
+        self._mode = mode
+        self.query_one("#dock-input-title", Static).update(title)
+        self.query_one("#dock-input-detail", Static).update(detail)
+        field = self.query_one("#dock-input-field", Input)
+        field.placeholder = placeholder
+        field.value = ""
+        self.add_class("visible")
+        field.focus()
+
+    def close(self) -> None:
+        self._mode = ""
+        self.remove_class("visible")
+
+    def is_open(self) -> bool:
+        return self.has_class("visible")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "btn-submit":
+        if event.button.id == "dock-input-submit":
             self._submit()
-        else:
-            self.dismiss(None)
+            return
+        self.post_message(DockInputClosed(self._mode))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "text-input-field":
+        if event.input.id == "dock-input-field":
             self._submit()
 
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+    def _submit(self) -> None:
+        value = self.query_one("#dock-input-field", Input).value.strip()
+        self.post_message(DockInputSubmitted(self._mode, value))
+
+
+class DockActionPanel(Static):
+    """Inline action panel for the server dock that does not hide the rest of the UI."""
+
+    DEFAULT_CSS = """
+    DockActionPanel {
+        dock: bottom;
+        height: auto;
+        max-height: 16;
+        margin-top: 1;
+        padding: 1 1;
+        background: $surface;
+        border: round $primary 40%;
+        display: none;
+    }
+    DockActionPanel.visible {
+        display: block;
+    }
+    #dock-action-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #dock-action-help {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #dock-action-confirm {
+        color: $warning;
+        margin-bottom: 1;
+        display: none;
+    }
+    DockActionPanel.confirming #dock-action-confirm {
+        display: block;
+    }
+    #dock-action-options {
+        height: auto;
+        max-height: 8;
+        margin-bottom: 1;
+    }
+    #dock-action-buttons {
+        height: 3;
+        align: right middle;
+    }
+    #dock-action-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._confirm_action: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("Actions", id="dock-action-title")
+        yield Static("Choose an action for the selected tree item.", id="dock-action-help")
+        yield Static("", id="dock-action-confirm")
+        yield OptionList(id="dock-action-options")
+        with Horizontal(id="dock-action-buttons"):
+            yield Button("Run", id="dock-action-run", variant="primary")
+            yield Button("Close", id="dock-action-close")
+
+    def on_mount(self) -> None:
+        self.close()
+
+    def open(self, title: str, actions: list[tuple[str, str]]) -> None:
+        self._confirm_action = None
+        self.remove_class("confirming")
+        self.query_one("#dock-action-title", Static).update(title)
+        self.query_one("#dock-action-help", Static).update(
+            "Choose an action for the selected tree item."
+        )
+        self.query_one("#dock-action-confirm", Static).update("")
+        self.query_one("#dock-action-run", Button).label = "Run"
+        options = self.query_one("#dock-action-options", OptionList)
+        options.clear_options()
+        options.add_options([Option(label, id=value) for value, label in actions])
+        options.highlighted = 0 if actions else None
+        self.add_class("visible")
+        options.focus()
+
+    def close(self) -> None:
+        self._confirm_action = None
+        self.remove_class("visible")
+        self.remove_class("confirming")
+
+    def is_open(self) -> bool:
+        return self.has_class("visible")
+
+    def selected_action(self) -> str | None:
+        options = self.query_one("#dock-action-options", OptionList)
+        if options.highlighted is None:
+            return None
+        return options.get_option_at_index(options.highlighted).id
+
+    def request_confirmation(self, action: str, prompt: str) -> None:
+        self._confirm_action = action
+        self.add_class("confirming")
+        self.query_one("#dock-action-help", Static).update("Destructive action requires confirmation.")
+        self.query_one("#dock-action-confirm", Static).update(prompt)
+        self.query_one("#dock-action-run", Button).label = "Confirm"
+        self.query_one("#dock-action-run", Button).variant = "error"
+        self.query_one("#dock-action-close", Button).label = "Cancel"
+        self.query_one("#dock-action-run", Button).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "dock-action-options":
+            return
+        action = event.option.id
+        if action:
+            self.post_message(DockActionInvoked(str(action)))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "dock-action-run":
+            if self._confirm_action:
+                self.post_message(DockActionConfirmed(self._confirm_action))
+                return
+            action = self.selected_action()
+            if action:
+                self.post_message(DockActionInvoked(str(action)))
+            return
+        self.post_message(DockActionClosed())
+
+
+class InlineInputPanel(Static):
+    """Inline input panel for non-dock flows such as remote OAuth code paste."""
+
+    DEFAULT_CSS = """
+    InlineInputPanel {
+        display: none;
+        height: auto;
+        margin: 0 1 1 1;
+        padding: 1 1;
+        background: $surface;
+        border: round $primary 40%;
+    }
+    InlineInputPanel.visible {
+        display: block;
+    }
+    #inline-input-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #inline-input-detail {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #inline-input-field {
+        margin-bottom: 1;
+    }
+    #inline-input-buttons {
+        height: 3;
+        align: right middle;
+    }
+    #inline-input-buttons Button {
+        margin-left: 1;
+    }
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._mode: str = ""
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="inline-input-title")
+        yield Static("", id="inline-input-detail")
+        yield Input(placeholder="", id="inline-input-field")
+        with Horizontal(id="inline-input-buttons"):
+            yield Button("Submit", id="inline-input-submit", variant="primary")
+            yield Button("Cancel", id="inline-input-cancel")
+
+    def on_mount(self) -> None:
+        self.close()
+
+    def open(self, *, mode: str, title: str, detail: str, placeholder: str = "") -> None:
+        self._mode = mode
+        self.query_one("#inline-input-title", Static).update(title)
+        self.query_one("#inline-input-detail", Static).update(detail)
+        field = self.query_one("#inline-input-field", Input)
+        field.placeholder = placeholder
+        field.value = ""
+        self.add_class("visible")
+        field.focus()
+
+    def close(self) -> None:
+        self._mode = ""
+        self.remove_class("visible")
+
+    def is_open(self) -> bool:
+        return self.has_class("visible")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "inline-input-submit":
+            self._submit()
+            return
+        self.post_message(InlineInputClosed(self._mode))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "inline-input-field":
+            self._submit()
 
     def _submit(self) -> None:
-        value = self.query_one("#text-input-field", Input).value.strip()
-        self.dismiss(value or None)
+        value = self.query_one("#inline-input-field", Input).value.strip()
+        self.post_message(InlineInputSubmitted(self._mode, value))
 
 
-class RuleEditorScreen(ModalScreen[dict[str, Any] | None]):
-    """Modal dialog for adding/editing a rule."""
+class InlineRuleEditorPanel(Static):
+    """Inline rule editor panel replacing fullscreen modal rule dialogs."""
 
-    CSS = """
-    RuleEditorScreen {
-        align: center middle;
-    }
-    #rule-editor-dialog {
-        width: 90;
-        height: 24;
-        padding: 1 2;
+    DEFAULT_CSS = """
+    InlineRuleEditorPanel {
+        display: none;
+        height: auto;
+        margin: 0 1 1 1;
+        padding: 1 1;
         background: $surface;
-        border: thick $primary;
+        border: round $primary 40%;
+    }
+    InlineRuleEditorPanel.visible {
+        display: block;
     }
     #rule-editor-title {
         text-style: bold;
@@ -1281,56 +1711,47 @@ class RuleEditorScreen(ModalScreen[dict[str, Any] | None]):
     }
     #rule-editor-buttons {
         height: 3;
-        align: center middle;
+        align: right middle;
     }
     #rule-editor-buttons Button {
-        margin: 0 1;
+        margin-left: 1;
     }
     """
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
-
-    def __init__(
-        self,
-        *,
-        title: str,
-        text: str = "",
-        scope: str = "project",
-        enabled: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(**kwargs)
-        self._title = title
-        self._text = text
-        self._scope = scope if scope in {"project", "global"} else "project"
-        self._enabled = enabled
-
     def compose(self) -> ComposeResult:
-        with Vertical(id="rule-editor-dialog"):
-            yield Static(self._title, id="rule-editor-title")
-            yield Static("Set scope, enter rule text, then save.", id="rule-editor-help")
-            yield Input(value=self._scope, placeholder="project or global", id="rule-editor-scope")
-            yield Input(
-                value="true" if self._enabled else "false",
-                placeholder="true or false",
-                id="rule-editor-enabled",
-            )
-            yield TextArea(self._text, id="rule-editor-text")
-            with Horizontal(id="rule-editor-buttons"):
-                yield Button("Save", id="btn-save-rule", variant="primary")
-                yield Button("Cancel", id="btn-cancel-rule", variant="error")
+        yield Static("", id="rule-editor-title")
+        yield Static("Set scope, enter rule text, then save.", id="rule-editor-help")
+        yield Input(value="project", placeholder="project or global", id="rule-editor-scope")
+        yield Input(value="true", placeholder="true or false", id="rule-editor-enabled")
+        yield TextArea("", id="rule-editor-text")
+        with Horizontal(id="rule-editor-buttons"):
+            yield Button("Save", id="btn-save-rule", variant="primary")
+            yield Button("Cancel", id="btn-cancel-rule")
 
     def on_mount(self) -> None:
+        self.close()
+
+    def open(self, *, title: str, text: str = "", scope: str = "project", enabled: bool = True) -> None:
+        self.query_one("#rule-editor-title", Static).update(title)
+        self.query_one("#rule-editor-scope", Input).value = (
+            scope if scope in {"project", "global"} else "project"
+        )
+        self.query_one("#rule-editor-enabled", Input).value = "true" if enabled else "false"
+        self.query_one("#rule-editor-text", TextArea).load_text(text)
+        self.add_class("visible")
         self.query_one("#rule-editor-text", TextArea).focus()
+
+    def close(self) -> None:
+        self.remove_class("visible")
+
+    def is_open(self) -> bool:
+        return self.has_class("visible")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-save-rule":
             self._submit()
-        else:
-            self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+            return
+        self.post_message(RuleEditorClosed())
 
     def _submit(self) -> None:
         scope = self.query_one("#rule-editor-scope", Input).value.strip().lower()
@@ -1339,7 +1760,7 @@ class RuleEditorScreen(ModalScreen[dict[str, Any] | None]):
         if scope not in {"project", "global"}:
             scope = "project"
         enabled = enabled_raw not in {"false", "0", "no", "off", "disabled"}
-        self.dismiss({"scope": scope, "enabled": enabled, "text": text})
+        self.post_message(RuleEditorSubmitted({"scope": scope, "enabled": enabled, "text": text}))
 
 
 # ── Main App ──────────────────────────────────────────────────
@@ -1353,6 +1774,9 @@ class WorkerApp(App):
     CSS = """
     #app-body {
         height: 1fr;
+    }
+    #server-dock-sidebar {
+        width: 36;
     }
     #main-content {
         height: 1fr;
@@ -1391,6 +1815,10 @@ class WorkerApp(App):
         Binding("ctrl+д", "clear", "Clear", show=False),
         Binding("ctrl+o", "toggle_tools", "Toggle tools"),
         Binding("ctrl+щ", "toggle_tools", "Toggle tools", show=False),
+        Binding("ctrl+x", "server_dock_actions", "Server dock actions", show=False),
+        Binding("ctrl+ч", "server_dock_actions", "Server dock actions", show=False),
+        Binding("ctrl+g", "toggle_server_dock", "Toggle server dock", show=False),
+        Binding("ctrl+п", "toggle_server_dock", "Toggle server dock", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Toggle board"),
         Binding("ctrl+и", "toggle_sidebar", "Toggle board", show=False),
         Binding("ctrl+t", "focus_tasks", "Focus tasks", show=False),
@@ -1455,6 +1883,10 @@ class WorkerApp(App):
         self._run_busy: bool = False
         self._assistant_message_history: list[MessageWidget] = []
         self._pending_attachments: list[ImageAttachment] = []
+        self._server_dock_visible: bool = True
+        self._saved_servers: list[SavedArtelServer] = []
+        self._pending_remote_oauth: dict[str, str] | None = None
+        self._pending_rule_editor_existing: Any = None
         self._sidebar_visible: bool = False
         self._suspend_board_editor_events: bool = False
         self._tasks_save_task: asyncio.Task[None] | None = None
@@ -1468,6 +1900,7 @@ class WorkerApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="app-body"):
+            yield ServerDockSidebar(id="server-dock-sidebar")
             with Vertical(id="main-content"):
                 yield PermissionPanel(
                     self._resolve_permission_panel_decision, id="permission-panel"
@@ -1475,6 +1908,8 @@ class WorkerApp(App):
                 with VerticalScroll(id="chat-scroll"):
                     yield Vertical(id="chat-container")
                 yield OptionList(id="command-suggestions", compact=True)
+                yield InlineInputPanel(id="inline-input-panel")
+                yield InlineRuleEditorPanel(id="inline-rule-editor-panel")
                 yield PendingAttachmentsBar(id="pending-attachments")
                 yield ComposerTextArea(
                     "",
@@ -1515,8 +1950,11 @@ class WorkerApp(App):
             if self._forward_credentials_spec:
                 await self._forward_remote_credentials(config)
 
+        self._saved_servers = load_saved_servers()
+        self._auto_collapse_server_dock_for_size()
         self._sync_pending_attachments_bar()
         await self._load_board_state()
+        await self._refresh_server_dock()
         self._start_delegation_events()
         self.call_after_refresh(self._focus_input)
 
@@ -1564,12 +2002,338 @@ class WorkerApp(App):
             get_registry().unsubscribe(queue)
             raise
 
+    def _server_dock(self) -> ServerDockSidebar:
+        return self.query_one("#server-dock-sidebar", ServerDockSidebar)
+
     def _board_sidebar(self) -> BoardSidebar:
         return self.query_one("#board-sidebar", BoardSidebar)
+
+    def _inline_input_panel(self) -> InlineInputPanel:
+        return self.query_one("#inline-input-panel", InlineInputPanel)
+
+    def _inline_rule_editor_panel(self) -> InlineRuleEditorPanel:
+        return self.query_one("#inline-rule-editor-panel", InlineRuleEditorPanel)
+
+    def _set_server_dock_status(self, text: str) -> None:
+        with suppress(Exception):
+            self._server_dock().set_status(text)
+
+    def _server_dock_input_panel(self) -> DockInputPanel:
+        return self._server_dock().input_panel()
+
+    def _server_dock_action_panel(self) -> DockActionPanel:
+        return self._server_dock().action_panel()
+
+    def _open_server_dock_input(
+        self,
+        *,
+        mode: str,
+        title: str,
+        detail: str,
+        placeholder: str = "",
+    ) -> None:
+        self._close_server_dock_actions()
+        self._server_dock_input_panel().open(
+            mode=mode,
+            title=title,
+            detail=detail,
+            placeholder=placeholder,
+        )
+        self._set_server_dock_status("Enter a value and press Enter or Submit")
+
+    def _close_server_dock_input(self) -> None:
+        with suppress(Exception):
+            self._server_dock_input_panel().close()
+
+    def _close_server_dock_actions(self) -> None:
+        with suppress(Exception):
+            self._server_dock_action_panel().close()
+
+    def _server_dock_selected_data(self) -> ServerDockNodeData | None:
+        with suppress(Exception):
+            node = self._server_dock().tree().cursor_node
+            if node is not None and isinstance(node.data, ServerDockNodeData):
+                return node.data
+        return None
+
+    def _server_dock_actions_for(self, data: ServerDockNodeData) -> list[tuple[str, str]]:
+        if data.kind == "server":
+            return [
+                ("connect", "Connect"),
+                ("refresh", "Refresh sessions"),
+                ("remove", "Remove server"),
+            ]
+        if data.kind == "project":
+            return [
+                ("open_project", "Switch to project"),
+                ("delete_project_sessions", "Delete all project sessions"),
+                ("refresh", "Refresh server"),
+            ]
+        if data.kind == "session":
+            return [
+                ("resume", "Resume session"),
+                ("open_project", "Switch to session project"),
+                ("delete_session", "Delete session"),
+                ("refresh", "Refresh server"),
+            ]
+        return []
+
+    async def _run_server_dock_action(self, data: ServerDockNodeData, action: str) -> None:
+        if action == "connect" and data.remote_url:
+            await self._connect_to_server(data.remote_url, auth_token=data.auth_token, save=False)
+            return
+        if action == "open_project" and data.remote_url and data.project_dir:
+            await self._connect_to_server(
+                data.remote_url,
+                auth_token=data.auth_token,
+                save=False,
+                project_dir=data.project_dir,
+            )
+            return
+        if action == "resume" and data.remote_url and data.session_id:
+            await self._connect_to_server(
+                data.remote_url,
+                auth_token=data.auth_token,
+                save=False,
+                resume_session_id=data.session_id,
+            )
+            return
+        if action == "refresh" and data.remote_url:
+            await self._refresh_server_dock()
+            self._set_server_dock_status(f"Refreshed {data.name or data.remote_url}")
+            return
+        if action == "remove" and data.remote_url:
+            self._saved_servers = remove_saved_server(data.remote_url)
+            await self._refresh_server_dock()
+            self._add_message(f"Removed server: {data.name or data.remote_url}", role="tool")
+            return
+        if action == "delete_session" and data.remote_url and data.session_id:
+            try:
+                await RemoteControlClient(data.remote_url, auth_token=data.auth_token).request(
+                    "DELETE",
+                    f"/api/sessions/{data.session_id}",
+                )
+            except Exception as exc:
+                self._add_message(f"Failed to delete session: {exc}", role="error")
+                return
+            await self._refresh_server_dock()
+            self._add_message(f"Deleted session: {data.name or data.session_id}", role="tool")
+            return
+        if action == "delete_project_sessions" and data.remote_url and data.project_dir:
+            try:
+                payload = await RemoteControlClient(
+                    data.remote_url,
+                    auth_token=data.auth_token,
+                ).list_sessions()
+                raw_sessions = payload.get("sessions", [])
+                sessions = [item for item in raw_sessions if isinstance(item, dict)]
+                project_sessions = [
+                    item
+                    for item in sessions
+                    if str(item.get("project_dir", "") or "").strip() == data.project_dir
+                ]
+                deleted_ids: list[str] = []
+                for item in project_sessions:
+                    session_id = str(item.get("id", "")).strip()
+                    if not session_id:
+                        continue
+                    await RemoteControlClient(data.remote_url, auth_token=data.auth_token).request(
+                        "DELETE",
+                        f"/api/sessions/{session_id}",
+                    )
+                    deleted_ids.append(session_id)
+                    if self.remote_url == data.remote_url and self._remote_session_id == session_id:
+                        self._remote_session_id = str(uuid.uuid4())
+                        self._remote_project_dir = ""
+                if not deleted_ids:
+                    self._add_message(
+                        f"No sessions found for project: {data.name or data.project_dir}",
+                        role="tool",
+                    )
+                    return
+            except Exception as exc:
+                self._add_message(f"Failed to delete project sessions: {exc}", role="error")
+                return
+            await self._refresh_server_dock()
+            if self.remote_url == data.remote_url:
+                with suppress(Exception):
+                    await self._sync_remote_session_state()
+                with suppress(Exception):
+                    await self._load_board_state()
+            self._add_message(
+                f"Deleted {len(deleted_ids)} session(s) for project: {data.name or data.project_dir}",
+                role="tool",
+            )
+            return
+
+    async def _open_server_dock_actions(self, data: ServerDockNodeData) -> None:
+        actions = self._server_dock_actions_for(data)
+        if not actions:
+            self._close_server_dock_actions()
+            self._set_server_dock_status("No actions for this item")
+            return
+        title = f"Actions: {data.name or data.kind}"
+        self._server_dock_action_panel().open(title, actions)
+        self._set_server_dock_status("Choose an action and press Enter or Run")
+
+    def _server_dock_confirmation_prompt(self, data: ServerDockNodeData, action: str) -> str:
+        if action == "delete_project_sessions":
+            return (
+                "Delete all sessions for project "
+                f"{data.name or data.project_dir}? This cannot be undone."
+            )
+        if action == "delete_session":
+            return f"Delete session {data.name or data.session_id}? This cannot be undone."
+        if action == "remove":
+            return f"Remove saved server {data.name or data.remote_url} from the dock?"
+        return "Are you sure?"
+
+    def _server_dock_action_requires_confirmation(self, action: str) -> bool:
+        return action in {"delete_session", "delete_project_sessions", "remove"}
 
     def _set_board_status(self, text: str) -> None:
         with suppress(Exception):
             self._board_sidebar().set_status(text)
+
+    async def _refresh_server_dock(self) -> None:
+        dock = self._server_dock()
+        dock.set_visible(self._server_dock_visible)
+        tree = dock.tree()
+        tree.clear()
+        root = tree.root
+        root.expand()
+
+        if self.remote_url:
+            active_name = default_server_name(self.remote_url)
+            active_token = self.auth_token
+            if not any(server.remote_url == self.remote_url for server in self._saved_servers):
+                self._saved_servers = upsert_saved_server(
+                    SavedArtelServer(
+                        name=active_name, remote_url=self.remote_url, auth_token=active_token
+                    )
+                )
+
+        if not self._saved_servers:
+            root.add_leaf(
+                "No saved servers. Use /server-add or the Add button.",
+                data=ServerDockNodeData(kind="info", name="empty"),
+            )
+            dock.set_status("No saved Artel servers")
+            return
+
+        active_remote_url = self.remote_url.strip()
+        active_session_id = self._remote_session_id.strip() if self.remote_url else ""
+
+        for server in self._saved_servers:
+            server_label = server.name
+            if server.remote_url == active_remote_url:
+                server_label = f"● {server_label}"
+            server_node = root.add(
+                server_label,
+                data=ServerDockNodeData(
+                    kind="server",
+                    remote_url=server.remote_url,
+                    auth_token=server.auth_token,
+                    name=server.name,
+                ),
+                expand=server.remote_url == active_remote_url,
+            )
+            sessions: list[dict[str, Any]] = []
+            error_text = ""
+            try:
+                payload = await RemoteControlClient(
+                    server.remote_url,
+                    auth_token=server.auth_token,
+                ).list_sessions()
+                raw_sessions = payload.get("sessions", [])
+                if isinstance(raw_sessions, list):
+                    sessions = [item for item in raw_sessions if isinstance(item, dict)]
+            except Exception as exc:
+                error_text = str(exc)
+
+            if error_text:
+                server_node.add_leaf(
+                    f"Connection failed: {error_text}",
+                    data=ServerDockNodeData(
+                        kind="server_error",
+                        remote_url=server.remote_url,
+                        auth_token=server.auth_token,
+                        name=server.name,
+                    ),
+                )
+                continue
+
+            normalized = sorted(
+                sessions,
+                key=lambda item: (
+                    str(item.get("project_dir", "") or "").lower(),
+                    str(item.get("updated_at", "") or ""),
+                ),
+                reverse=True,
+            )
+            if not normalized:
+                server_node.add_leaf(
+                    "No sessions",
+                    data=ServerDockNodeData(
+                        kind="info",
+                        remote_url=server.remote_url,
+                        auth_token=server.auth_token,
+                        name="no-sessions",
+                    ),
+                )
+                continue
+
+            normalized.sort(key=lambda item: str(item.get("project_dir", "") or ""))
+            for project_dir, project_items_iter in groupby(
+                normalized, key=lambda item: str(item.get("project_dir", "") or "")
+            ):
+                project_items = list(project_items_iter)
+                project_name = Path(project_dir).name if project_dir else "(default project)"
+                project_label = f"📁 {project_name}"
+                if (
+                    server.remote_url == active_remote_url
+                    and project_dir
+                    and project_dir == self._remote_project_dir
+                ):
+                    project_label = f"● {project_label}"
+                project_node = server_node.add(
+                    project_label,
+                    data=ServerDockNodeData(
+                        kind="project",
+                        remote_url=server.remote_url,
+                        auth_token=server.auth_token,
+                        project_dir=project_dir,
+                        name=project_name,
+                    ),
+                    expand=server.remote_url == active_remote_url
+                    and project_dir == self._remote_project_dir,
+                )
+                for session in sorted(
+                    project_items,
+                    key=lambda item: str(item.get("updated_at", "") or ""),
+                    reverse=True,
+                ):
+                    session_id = str(session.get("id", "")).strip()
+                    title = str(session.get("title", "")).strip() or "(untitled)"
+                    session_label = title
+                    if (
+                        session_id
+                        and server.remote_url == active_remote_url
+                        and session_id == active_session_id
+                    ):
+                        session_label = f"● {session_label}"
+                    project_node.add_leaf(
+                        session_label,
+                        data=ServerDockNodeData(
+                            kind="session",
+                            remote_url=server.remote_url,
+                            auth_token=server.auth_token,
+                            session_id=session_id,
+                            project_dir=project_dir,
+                            name=title,
+                        ),
+                    )
+        dock.set_status("Enter on project/session to switch")
 
     def _board_poll_interval_seconds(self) -> float:
         return 1.0 if self._sidebar_visible else 3.0
@@ -1865,16 +2629,20 @@ class WorkerApp(App):
                 candidate = urllib.parse.unquote(urllib.parse.urlparse(candidate).path)
             if not candidate:
                 continue
+            if len(candidate) > _MAX_PASTED_IMAGE_REFERENCE_CHARS:
+                continue
+            if not is_supported_image_path(candidate):
+                continue
             try:
                 resolved = str(Path(candidate).expanduser().resolve())
             except Exception:
                 continue
-            if (
-                Path(resolved).exists()
-                and Path(resolved).is_file()
-                and is_supported_image_path(resolved)
-            ):
-                paths.append(resolved)
+            path = Path(resolved)
+            try:
+                if path.exists() and path.is_file() and is_supported_image_path(resolved):
+                    paths.append(resolved)
+            except OSError:
+                continue
         return paths
 
     async def _maybe_handle_pasted_image_reference(self, text: str) -> bool:
@@ -2916,6 +3684,222 @@ class WorkerApp(App):
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         await self._submit_text(event.value, clear_widget=False)
 
+    async def on_tree_node_selected(self, event: Tree.NodeSelected[ServerDockNodeData]) -> None:
+        if event.node.tree.id != "server-dock-tree":
+            return
+        data = event.node.data
+        if not isinstance(data, ServerDockNodeData):
+            return
+        await self._handle_server_dock_selection(data)
+
+    async def on_server_dock_action_requested(self, message: ServerDockActionRequested) -> None:
+        node = message.node
+        data = getattr(node, "data", None)
+        if not isinstance(data, ServerDockNodeData):
+            return
+        tree = self._server_dock().tree()
+        tree.move_cursor(node)
+        await self._open_server_dock_actions(data)
+
+    async def on_dock_action_invoked(self, message: DockActionInvoked) -> None:
+        data = self._server_dock_selected_data()
+        if data is None:
+            self._close_server_dock_actions()
+            self._set_server_dock_status("Select a server, project, or session first")
+            return
+        if self._server_dock_action_requires_confirmation(message.action):
+            self._server_dock_action_panel().request_confirmation(
+                message.action,
+                self._server_dock_confirmation_prompt(data, message.action),
+            )
+            self._set_server_dock_status("Confirm destructive action or cancel")
+            return
+        self._close_server_dock_actions()
+        await self._run_server_dock_action(data, message.action)
+
+    async def on_dock_action_confirmed(self, message: DockActionConfirmed) -> None:
+        data = self._server_dock_selected_data()
+        if data is None:
+            self._close_server_dock_actions()
+            self._set_server_dock_status("Select a server, project, or session first")
+            return
+        self._close_server_dock_actions()
+        await self._run_server_dock_action(data, message.action)
+
+    def on_dock_action_closed(self, _: DockActionClosed) -> None:
+        self._close_server_dock_actions()
+        self._focus_input()
+
+    async def on_dock_input_submitted(self, message: DockInputSubmitted) -> None:
+        self._close_server_dock_input()
+        value = message.value.strip()
+        if message.mode == "add_server":
+            if not value:
+                self._add_message("Server add cancelled.", role="tool")
+                return
+            await self._connect_to_server(
+                value,
+                auth_token=self.auth_token if self.remote_url == value else "",
+                save=True,
+            )
+            return
+
+    def on_dock_input_closed(self, _: DockInputClosed) -> None:
+        self._close_server_dock_input()
+        self._focus_input()
+
+    async def on_inline_input_submitted(self, message: InlineInputSubmitted) -> None:
+        self._close_inline_input()
+        value = message.value.strip()
+        if message.mode == "remote_oauth_code":
+            pending = self._pending_remote_oauth or {}
+            self._pending_remote_oauth = None
+            if not value:
+                self._add_message("Remote login cancelled.", role="tool")
+                return
+            try:
+                await self._remote_control().complete_oauth(
+                    str(pending.get("login_id", "")),
+                    {"code": value},
+                )
+            except Exception as exc:
+                self._add_message(f"Remote login failed: {exc}", role="error")
+                return
+            provider_name = str(pending.get("provider_name", "")).strip() or "Provider"
+            self._add_message(
+                f"{provider_name.capitalize()} authorized on the remote server!",
+                role="tool",
+            )
+
+    def on_inline_input_closed(self, message: InlineInputClosed) -> None:
+        self._close_inline_input()
+        if message.mode == "remote_oauth_code":
+            self._pending_remote_oauth = None
+            self._add_message("Remote login cancelled.", role="tool")
+            return
+        self._focus_input()
+
+    async def on_rule_editor_submitted(self, message: RuleEditorSubmitted) -> None:
+        payload = message.payload
+        existing = self._pending_rule_editor_existing
+        self._pending_rule_editor_existing = None
+        self._close_inline_rule_editor()
+        if not payload:
+            self._add_message("Rule edit cancelled.", role="tool")
+            return
+        try:
+            if self.remote_url:
+                if existing is None:
+                    response = await self._remote_control().add_rule(
+                        scope=str(payload.get("scope", "project")),
+                        text=str(payload.get("text", "")),
+                        project_dir=self._current_rules_project_dir(),
+                        enabled=bool(payload.get("enabled", True)),
+                    )
+                    rule_id_value = str(response.get("rule", {}).get("id", ""))
+                    self._add_message(f"Added rule {rule_id_value}.", role="tool")
+                else:
+                    existing_id = (
+                        str(existing.get("id", "")) if isinstance(existing, dict) else existing.id
+                    )
+                    response = await self._remote_control().edit_rule(
+                        existing_id,
+                        project_dir=self._current_rules_project_dir(),
+                        text=str(payload.get("text", "")),
+                        scope=str(payload.get("scope", "project")),
+                        enabled=bool(payload.get("enabled", True)),
+                    )
+                    rule_id_value = str(response.get("rule", {}).get("id", existing_id))
+                    self._add_message(f"Updated rule {rule_id_value}.", role="tool")
+                return
+            if existing is None:
+                rule = add_rule(
+                    scope=str(payload.get("scope", "project")),
+                    text=str(payload.get("text", "")),
+                    project_dir=self._current_rules_project_dir(),
+                    enabled=bool(payload.get("enabled", True)),
+                )
+                self._add_message(f"Added rule {rule.id}.", role="tool")
+            else:
+                existing_id = existing.id
+                rule = update_rule(
+                    existing_id,
+                    project_dir=self._current_rules_project_dir(),
+                    text=str(payload.get("text", "")),
+                    scope=str(payload.get("scope", existing.scope)),
+                    enabled=bool(payload.get("enabled", existing.enabled)),
+                )
+                self._add_message(f"Updated rule {rule.id}.", role="tool")
+            if self._session is not None:
+                self._session.refresh_system_prompt()
+        except Exception as exc:
+            self._add_message(f"Failed to save rule: {exc}", role="error")
+
+    def on_rule_editor_closed(self, _: RuleEditorClosed) -> None:
+        self._pending_rule_editor_existing = None
+        self._close_inline_rule_editor()
+        self._add_message("Rule edit cancelled.", role="tool")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "server-dock-add":
+            event.stop()
+            self._open_server_dock_input(
+                mode="add_server",
+                title="Add Artel server",
+                detail="Enter ws:// or wss:// URL. The active auth token will be reused if available.",
+                placeholder="ws://host:7432",
+            )
+            return
+        if button_id == "server-dock-refresh":
+            event.stop()
+            await self._refresh_server_dock()
+            return
+        if button_id == "server-dock-hide":
+            event.stop()
+            self.action_toggle_server_dock()
+            return
+
+    def _open_inline_input(
+        self,
+        *,
+        mode: str,
+        title: str,
+        detail: str,
+        placeholder: str = "",
+    ) -> None:
+        self._inline_rule_editor_panel().close()
+        self._inline_input_panel().open(
+            mode=mode,
+            title=title,
+            detail=detail,
+            placeholder=placeholder,
+        )
+
+    def _close_inline_input(self) -> None:
+        with suppress(Exception):
+            self._inline_input_panel().close()
+
+    def _open_inline_rule_editor(
+        self,
+        *,
+        title: str,
+        text: str = "",
+        scope: str = "project",
+        enabled: bool = True,
+    ) -> None:
+        self._close_inline_input()
+        self._inline_rule_editor_panel().open(
+            title=title,
+            text=text,
+            scope=scope,
+            enabled=enabled,
+        )
+
+    def _close_inline_rule_editor(self) -> None:
+        with suppress(Exception):
+            self._inline_rule_editor_panel().close()
+
     async def _submit_text(self, raw_text: str, *, clear_widget: bool) -> None:
         text = raw_text.strip()
         attachments = self._consume_pending_attachments()
@@ -3042,8 +4026,8 @@ class WorkerApp(App):
                 "  /providers          — list supported providers and setup hints\n"
                 "  /connect <provider> — login to a provider\n"
                 "  /rules              — list configured rules\n"
-                "  /rule add           — add a rule via dialog\n"
-                "  /rule edit <id>     — edit a rule via dialog\n"
+                "  /rule add           — add a rule via inline editor\n"
+                "  /rule edit <id>     — edit a rule via inline editor\n"
                 "  /rule delete <id>   — delete a rule\n"
                 "  /rule enable <id>   — enable a rule for this session\n"
                 "  /rule disable <id>  — disable a rule for this session\n"
@@ -3071,6 +4055,10 @@ class WorkerApp(App):
                 "  /image-clear        — clear pending image attachments\n"
                 "  /image-remove <n>   — remove one pending image attachment\n"
                 "  /copy               — copy the last assistant message\n"
+                "  /server-add         — add a server via inline dialog\n"
+                "  /server-remove [x]  — remove a saved server by name/url\n"
+                "  /server-select <x>  — connect to a saved server\n"
+                "  /server-dock        — toggle the left server/project/session dock\n"
                 "  /delegates [subcmd] — inspect delegated orchestration runs\n"
                 "  /agents [subcmd]    — alias for /delegates\n"
                 "  /mcp [reload]       — show MCP status or reload MCP connections\n"
@@ -3097,6 +4085,9 @@ class WorkerApp(App):
                 "  ! <command>         — run cmd on the active host & send output to LLM\n"
                 "  !! <command>        — run cmd on the active host\n"
                 "  Ctrl+O              — toggle tool output\n"
+                "  Ctrl+X              — open actions for selected server-dock item\n"
+                "  Click the left ⋮    — open actions for a tree item\n"
+                "  Ctrl+G              — toggle the left server dock\n"
                 "  Ctrl+B              — toggle task board / notes sidebar\n"
                 "  Ctrl+T              — focus tasks editor\n"
                 "  Ctrl+N              — focus notes editor\n"
@@ -3179,6 +4170,14 @@ class WorkerApp(App):
             self._cmd_image_remove(arg)
         elif cmd == "/copy":
             self.action_copy_last_assistant_message()
+        elif cmd == "/server-add":
+            await self._cmd_server_add(arg)
+        elif cmd == "/server-remove":
+            await self._cmd_server_remove(arg)
+        elif cmd == "/server-select":
+            await self._cmd_server_select(arg)
+        elif cmd == "/server-dock":
+            self.action_toggle_server_dock()
         elif cmd in {"/agents", "/delegates"}:
             await self._cmd_agents(arg)
         elif cmd == "/mcp":
@@ -3560,6 +4559,14 @@ class WorkerApp(App):
             self._set_run_activity("idle", busy=False)
             self._scroll_to_bottom()
 
+    def _auto_collapse_server_dock_for_size(self) -> None:
+        with suppress(Exception):
+            width = int(self.size.width)
+        if width and width < 100 and self._server_dock_visible:
+            self._server_dock_visible = False
+            self._server_dock().set_visible(False)
+            self._set_server_dock_status("Hidden automatically on narrow screens")
+
     async def _handle_remote_permission_request(self, payload: dict[str, Any]) -> None:
         request_id = str(payload.get("request_id", "")).strip()
         if not request_id or self._ws is None:
@@ -3894,23 +4901,15 @@ class WorkerApp(App):
                 )
                 with suppress(Exception):
                     webbrowser.open(authorize_url)
-            code = await self.push_screen_wait(
-                TextInputScreen(
-                    f"{provider_name.capitalize()} authorization",
-                    "Paste the authorization code from the browser.",
-                    placeholder="authorization code",
-                )
-            )
-            if not code:
-                self._add_message("Remote login cancelled.", role="tool")
-                return
-            await self._remote_control().complete_oauth(
-                str(payload.get("login_id", "")),
-                {"code": code},
-            )
-            self._add_message(
-                f"{provider_name.capitalize()} authorized on the remote server!",
-                role="tool",
+            self._pending_remote_oauth = {
+                "provider_name": provider_name,
+                "login_id": str(payload.get("login_id", "")),
+            }
+            self._open_inline_input(
+                mode="remote_oauth_code",
+                title=f"{provider_name.capitalize()} authorization",
+                detail="Paste the authorization code from the browser.",
+                placeholder="authorization code",
             )
         except Exception as exc:
             self._add_message(f"Remote login failed: {exc}", role="error")
@@ -4053,6 +5052,7 @@ class WorkerApp(App):
         session = payload.get("session", {})
         self._apply_remote_session_state(session)
         await self._load_board_state()
+        await self._refresh_server_dock()
         project_dir = str(session.get("project_dir", "")).strip() or arg
         self._add_message(f"Switched remote project to: {project_dir}", role="tool")
 
@@ -4360,76 +5360,23 @@ class WorkerApp(App):
             if existing is None:
                 self._add_message(f"Rule '{rule_id}' not found.", role="error")
                 return
-        payload = await self.push_screen_wait(
-            RuleEditorScreen(
-                title="Edit rule" if existing is not None else "Add rule",
-                text=(existing.get("text", "") if isinstance(existing, dict) else existing.text)
-                if existing is not None
-                else "",
-                scope=(
-                    existing.get("scope", "project")
-                    if isinstance(existing, dict)
-                    else existing.scope
-                )
-                if existing is not None
-                else "project",
-                enabled=(
-                    bool(existing.get("enabled", True))
-                    if isinstance(existing, dict)
-                    else existing.enabled
-                )
-                if existing is not None
-                else True,
+        self._pending_rule_editor_existing = existing
+        self._open_inline_rule_editor(
+            title="Edit rule" if existing is not None else "Add rule",
+            text=(existing.get("text", "") if isinstance(existing, dict) else existing.text)
+            if existing is not None
+            else "",
+            scope=(
+                existing.get("scope", "project") if isinstance(existing, dict) else existing.scope
             )
+            if existing is not None
+            else "project",
+            enabled=(
+                bool(existing.get("enabled", True)) if isinstance(existing, dict) else existing.enabled
+            )
+            if existing is not None
+            else True,
         )
-        if not payload:
-            self._add_message("Rule edit cancelled.", role="tool")
-            return
-        try:
-            if self.remote_url:
-                if existing is None:
-                    response = await self._remote_control().add_rule(
-                        scope=str(payload.get("scope", "project")),
-                        text=str(payload.get("text", "")),
-                        project_dir=self._current_rules_project_dir(),
-                        enabled=bool(payload.get("enabled", True)),
-                    )
-                    rule_id_value = str(response.get("rule", {}).get("id", ""))
-                    self._add_message(f"Added rule {rule_id_value}.", role="tool")
-                else:
-                    existing_id = (
-                        str(existing.get("id", "")) if isinstance(existing, dict) else existing.id
-                    )
-                    response = await self._remote_control().edit_rule(
-                        existing_id,
-                        project_dir=self._current_rules_project_dir(),
-                        text=str(payload.get("text", "")),
-                        scope=str(payload.get("scope", "project")),
-                        enabled=bool(payload.get("enabled", True)),
-                    )
-                    rule_id_value = str(response.get("rule", {}).get("id", existing_id))
-                    self._add_message(f"Updated rule {rule_id_value}.", role="tool")
-                return
-            if existing is None:
-                rule = add_rule(
-                    scope=str(payload.get("scope", "project")),
-                    text=str(payload.get("text", "")),
-                    project_dir=self._current_rules_project_dir(),
-                    enabled=bool(payload.get("enabled", True)),
-                )
-                self._add_message(f"Added rule {rule.id}.", role="tool")
-            else:
-                existing_id = existing.id
-                rule = update_rule(
-                    existing_id,
-                    project_dir=self._current_rules_project_dir(),
-                    text=str(payload.get("text", "")),
-                    scope=str(payload.get("scope", existing.scope)),
-                    enabled=bool(payload.get("enabled", existing.enabled)),
-                )
-                self._add_message(f"Updated rule {rule.id}.", role="tool")
-        except Exception as exc:
-            self._add_message(f"Rule save failed: {exc}", role="error")
 
     async def _cmd_tasks(self) -> None:
         await self._load_board_state()
@@ -4487,6 +5434,26 @@ class WorkerApp(App):
             self._add_message("Operator notes are empty.", role="tool")
             return
         self._add_message(render_numbered_text(content), role="tool")
+
+    async def _handle_server_dock_selection(self, data: ServerDockNodeData) -> None:
+        if data.kind == "session" and data.session_id:
+            await self._connect_to_server(
+                data.remote_url,
+                auth_token=data.auth_token,
+                save=False,
+                resume_session_id=data.session_id,
+            )
+            return
+        if data.kind == "project" and data.project_dir:
+            await self._connect_to_server(
+                data.remote_url,
+                auth_token=data.auth_token,
+                save=False,
+                project_dir=data.project_dir,
+            )
+            return
+        if data.kind == "server" and data.remote_url:
+            await self._connect_to_server(data.remote_url, auth_token=data.auth_token, save=False)
 
     async def _cmd_resume_remote(self, arg: str) -> None:
         """List or resume server-backed remote sessions."""
@@ -4574,8 +5541,67 @@ class WorkerApp(App):
                 else None,
             )
 
+        await self._refresh_server_dock()
         title = str(session.get("title", "")).strip() or session_id[:8]
         self._add_message(f"Resumed remote session: {title}", role="tool")
+
+    async def _connect_to_server(
+        self,
+        remote_url: str,
+        *,
+        auth_token: str = "",
+        save: bool = True,
+        project_dir: str = "",
+        resume_session_id: str = "",
+    ) -> None:
+        normalized_url = remote_url.strip()
+        if not normalized_url:
+            self._add_message("Missing remote URL.", role="error")
+            return
+        self.remote_url = normalized_url
+        self.auth_token = auth_token
+        self._remote_control_client = None
+        self._remote_extension_commands = set()
+        self._remote_project_dir = ""
+        self._remote_rule_overrides = {}
+        self._remote_session_id = str(uuid.uuid4())
+        if self._ws:
+            with suppress(Exception):
+                await self._ws.close()
+            self._ws = None
+        self.sub_title = f"remote: {self.remote_url}"
+        if save:
+            self._saved_servers = upsert_saved_server(
+                SavedArtelServer(
+                    name=default_server_name(self.remote_url),
+                    remote_url=self.remote_url,
+                    auth_token=self.auth_token,
+                )
+            )
+        if resume_session_id:
+            await self._resume_remote_session(resume_session_id)
+        else:
+            await self._sync_remote_session_state()
+            if project_dir:
+                try:
+                    payload = await self._remote_control().set_session_project(
+                        self._remote_session_id,
+                        project_dir,
+                    )
+                except Exception as exc:
+                    self._add_message(f"Failed to switch remote project: {exc}", role="error")
+                else:
+                    session = payload.get("session", {})
+                    if isinstance(session, dict):
+                        self._apply_remote_session_state(session)
+                        await self._load_board_state()
+            await self._sync_remote_extension_commands()
+            await self._refresh_server_dock()
+            label = default_server_name(self.remote_url)
+            if project_dir:
+                self._add_message(f"Connected to {label}; project: {project_dir}", role="tool")
+            else:
+                self._add_message(f"Connected to {label}", role="tool")
 
     async def _cmd_resume(self, arg: str) -> None:
         """List sessions or resume by number/ID."""
@@ -5695,6 +6721,57 @@ class WorkerApp(App):
         output = await asyncio.to_thread(run_worktree_command, project_dir, arg)
         self._add_message(output or "(no output)", role="tool")
 
+    def _find_saved_server(self, needle: str) -> SavedArtelServer | None:
+        normalized = needle.strip().lower()
+        if not normalized:
+            return None
+        for server in self._saved_servers:
+            if server.remote_url.lower() == normalized or server.name.lower() == normalized:
+                return server
+        return None
+
+    async def _cmd_server_add(self, arg: str) -> None:
+        if arg.strip():
+            self._add_message(
+                "/server-add no longer accepts inline arguments. Use the inline dialog in the left dock.",
+                role="error",
+            )
+            return
+        self._open_server_dock_input(
+            mode="add_server",
+            title="Add Artel server",
+            detail="Enter ws:// or wss:// URL for the server to show in the left dock.",
+            placeholder="ws://host:7432",
+        )
+
+    async def _cmd_server_remove(self, arg: str) -> None:
+        target = arg.strip() or self.remote_url.strip()
+        if not target:
+            self._add_message("Usage: /server-remove <name-or-url>", role="error")
+            return
+        server = self._find_saved_server(target)
+        if server is None:
+            self._add_message(f"Saved server not found: {target}", role="error")
+            return
+        self._saved_servers = remove_saved_server(server.remote_url)
+        await self._refresh_server_dock()
+        self._add_message(f"Removed server: {server.name}", role="tool")
+
+    async def _cmd_server_select(self, arg: str) -> None:
+        target = arg.strip()
+        if not target:
+            self._add_message("Usage: /server-select <name-or-url>", role="error")
+            return
+        server = self._find_saved_server(target)
+        if server is None:
+            self._add_message(f"Saved server not found: {target}", role="error")
+            return
+        await self._connect_to_server(
+            server.remote_url,
+            auth_token=server.auth_token,
+            save=False,
+        )
+
     async def _cmd_server_restart(self) -> None:
         """Restart the managed local Artel server for this project."""
         if not self.remote_url:
@@ -5719,8 +6796,16 @@ class WorkerApp(App):
         self.remote_url = handle.remote_url
         self.auth_token = handle.auth_token
         self._remote_control_client = None
+        self._saved_servers = upsert_saved_server(
+            SavedArtelServer(
+                name=default_server_name(handle.remote_url),
+                remote_url=handle.remote_url,
+                auth_token=handle.auth_token,
+            )
+        )
         self._add_message(f"Managed local Artel server restarted: {handle.remote_url}", role="tool")
         await self._sync_remote_session_state()
+        await self._refresh_server_dock()
 
     # ── Auto-title ───────────────────────────────────────
 
@@ -6009,6 +7094,20 @@ class WorkerApp(App):
         for c in self._tool_collapsibles:
             c.collapsed = not c.collapsed
 
+    def action_server_dock_actions(self) -> None:
+        data = self._server_dock_selected_data()
+        if data is None:
+            self._set_server_dock_status("Select a server, project, or session first")
+            return
+        self.run_worker(self._open_server_dock_actions(data), exclusive=False, thread=False)
+
+    def action_toggle_server_dock(self) -> None:
+        self._server_dock_visible = not self._server_dock_visible
+        self._server_dock().set_visible(self._server_dock_visible)
+        self._set_server_dock_status(
+            "Server dock visible" if self._server_dock_visible else "Server dock hidden"
+        )
+
     def action_toggle_sidebar(self) -> None:
         self._sidebar_visible = not self._sidebar_visible
         self._board_sidebar().set_visible(self._sidebar_visible)
@@ -6083,6 +7182,7 @@ class WorkerApp(App):
             self._session.messages = self._session.messages[:1]
             self._set_footer_thinking_level(str(self._session.thinking_level))
         await self._load_board_state()
+        await self._refresh_server_dock()
         self.call_after_refresh(self._focus_input)
 
 

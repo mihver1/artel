@@ -1514,6 +1514,81 @@ class TestPromptAndSkillHints:
 
 class TestBoardSidebar:
     @pytest.mark.asyncio
+    async def test_server_dock_shows_saved_servers_and_tree_structure(self, monkeypatch, tmp_path):
+        import worker_tui.app as tui_app
+        from worker_tui.app import ServerDockSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(
+            tui_app,
+            "load_saved_servers",
+            lambda: [
+                tui_app.SavedArtelServer(
+                    name="Local",
+                    remote_url="ws://one:7432",
+                    auth_token="tok1",
+                ),
+                tui_app.SavedArtelServer(
+                    name="Prod",
+                    remote_url="ws://two:7432",
+                    auth_token="tok2",
+                ),
+            ],
+        )
+
+        class _Control:
+            def __init__(self, remote_url: str, auth_token: str = "") -> None:
+                self.remote_url = remote_url
+                self.auth_token = auth_token
+
+            async def list_sessions(self):
+                if self.remote_url == "ws://one:7432":
+                    return {
+                        "sessions": [
+                            {
+                                "id": "s1",
+                                "title": "Debug auth",
+                                "project_dir": "/work/app-a",
+                                "updated_at": "2025-01-02 10:00:00",
+                            },
+                            {
+                                "id": "s2",
+                                "title": "Fix tests",
+                                "project_dir": "/work/app-a",
+                                "updated_at": "2025-01-02 11:00:00",
+                            },
+                        ]
+                    }
+                return {
+                    "sessions": [
+                        {
+                            "id": "s3",
+                            "title": "Release prep",
+                            "project_dir": "/work/app-b",
+                            "updated_at": "2025-01-03 09:00:00",
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(tui_app, "RemoteControlClient", _Control)
+
+        app = WorkerApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dock = app.query_one("#server-dock-sidebar", ServerDockSidebar)
+            tree = dock.tree()
+            labels = [str(node.label) for node in tree.root.children]
+            assert any("Local" in label for label in labels)
+            assert any("Prod" in label for label in labels)
+            local_node = next(node for node in tree.root.children if "Local" in str(node.label))
+            assert any("app-a" in str(node.label) for node in local_node.children)
+            project_node = next(node for node in local_node.children if "app-a" in str(node.label))
+            assert any("Fix tests" in str(node.label) for node in project_node.children)
+
+    @pytest.mark.asyncio
     async def test_sidebar_toggle_and_board_commands(self, monkeypatch, tmp_path):
         from worker_tui.app import BoardSidebar, WorkerApp
 
@@ -1548,6 +1623,300 @@ class TestBoardSidebar:
             assert "- [ ] New task" in rendered
 
     @pytest.mark.asyncio
+    async def test_server_dock_add_button_opens_inline_input(self, monkeypatch, tmp_path):
+        import worker_tui.app as tui_app
+        from worker_tui.app import ServerDockSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(tui_app, "load_saved_servers", lambda: [])
+
+        app = WorkerApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            dock = app.query_one("#server-dock-sidebar", ServerDockSidebar)
+            await pilot.click("#server-dock-add")
+            await pilot.pause()
+            assert dock.input_panel().is_open() is True
+
+    @pytest.mark.asyncio
+    async def test_clicking_action_gutter_opens_context_actions(self, monkeypatch, tmp_path):
+        import worker_tui.app as tui_app
+        from worker_tui.app import ServerDockSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(
+            tui_app,
+            "load_saved_servers",
+            lambda: [
+                tui_app.SavedArtelServer(name="Prod", remote_url="ws://prod:7432", auth_token="tok")
+            ],
+        )
+
+        class _Control:
+            def __init__(self, remote_url: str, auth_token: str = "") -> None:
+                self.remote_url = remote_url
+                self.auth_token = auth_token
+
+            async def list_sessions(self):
+                return {"sessions": []}
+
+        monkeypatch.setattr(tui_app, "RemoteControlClient", _Control)
+
+        app = WorkerApp()
+        seen: list[tuple[str, str]] = []
+
+        async def fake_open(data):
+            seen.append((data.kind, data.remote_url))
+
+        app._open_server_dock_actions = fake_open  # type: ignore[method-assign]
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            dock = app.query_one("#server-dock-sidebar", ServerDockSidebar)
+            tree = dock.tree()
+            await pilot.click("#server-dock-tree", offset=(2, 1))
+            await pilot.pause()
+
+        assert seen == [("server", "ws://prod:7432")]
+
+    @pytest.mark.asyncio
+    async def test_clicking_left_label_area_opens_actions_not_session(self, monkeypatch, tmp_path):
+        import worker_tui.app as tui_app
+        from worker_tui.app import ServerDockSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(
+            tui_app,
+            "load_saved_servers",
+            lambda: [
+                tui_app.SavedArtelServer(name="Prod", remote_url="ws://prod:7432", auth_token="tok")
+            ],
+        )
+
+        class _Control:
+            def __init__(self, remote_url: str, auth_token: str = "") -> None:
+                self.remote_url = remote_url
+                self.auth_token = auth_token
+
+            async def list_sessions(self):
+                return {
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "title": "Release prep",
+                            "project_dir": "/srv/proj",
+                            "updated_at": "2025-01-03 09:00:00",
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(tui_app, "RemoteControlClient", _Control)
+
+        app = WorkerApp()
+        opened_actions: list[tuple[str, str]] = []
+        opened_sessions: list[tuple[str, str, str]] = []
+
+        async def fake_open(data):
+            opened_actions.append((data.kind, data.name))
+
+        async def fake_connect(remote_url: str, *, auth_token: str = "", save: bool = True, project_dir: str = "", resume_session_id: str = "") -> None:
+            opened_sessions.append((remote_url, project_dir, resume_session_id))
+
+        app._open_server_dock_actions = fake_open  # type: ignore[method-assign]
+        app._connect_to_server = fake_connect  # type: ignore[method-assign]
+        app._handle_server_dock_selection = AsyncMock()  # type: ignore[method-assign]
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            dock = app.query_one("#server-dock-sidebar", ServerDockSidebar)
+            tree = dock.tree()
+            tree.root.children[0].expand()
+            await pilot.pause()
+            await pilot.click("#server-dock-tree", offset=(6, 2))
+            await pilot.pause()
+
+        assert opened_actions == [("project", "proj")]
+        assert opened_sessions == []
+        app._handle_server_dock_selection.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_project_actions_include_delete_all_sessions(self, monkeypatch, tmp_path):
+        import worker_tui.app as tui_app
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(
+            tui_app,
+            "load_saved_servers",
+            lambda: [
+                tui_app.SavedArtelServer(name="Prod", remote_url="ws://prod:7432", auth_token="tok")
+            ],
+        )
+
+        class _Control:
+            def __init__(self, remote_url: str, auth_token: str = "") -> None:
+                self.remote_url = remote_url
+                self.auth_token = auth_token
+
+            async def list_sessions(self):
+                return {
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "title": "Release prep",
+                            "project_dir": "/srv/worker-alice-smith",
+                            "updated_at": "2025-01-03 09:00:00",
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(tui_app, "RemoteControlClient", _Control)
+
+        app = WorkerApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            project = app._server_dock().tree().root.children[0].children[0].data
+            actions = app._server_dock_actions_for(project)
+            await app._open_server_dock_actions(project)
+            await pilot.pause()
+            panel = app._server_dock_action_panel()
+            assert ("delete_project_sessions", "Delete all project sessions") in actions
+            assert panel.is_open() is True
+
+    @pytest.mark.asyncio
+    async def test_dock_delete_project_sessions_requires_confirmation(self, monkeypatch, tmp_path):
+        import worker_tui.app as tui_app
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(
+            tui_app,
+            "load_saved_servers",
+            lambda: [
+                tui_app.SavedArtelServer(name="Prod", remote_url="ws://prod:7432", auth_token="tok")
+            ],
+        )
+
+        class _Control:
+            def __init__(self, remote_url: str, auth_token: str = "") -> None:
+                self.remote_url = remote_url
+                self.auth_token = auth_token
+
+            async def list_sessions(self):
+                return {
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "title": "Release prep",
+                            "project_dir": "/srv/worker-alice-smith",
+                            "updated_at": "2025-01-03 09:00:00",
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(tui_app, "RemoteControlClient", _Control)
+
+        app = WorkerApp()
+        app._run_server_dock_action = AsyncMock()  # type: ignore[method-assign]
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            project = app._server_dock().tree().root.children[0].children[0].data
+            app._server_dock_selected_data = lambda: project  # type: ignore[method-assign]
+            await app._open_server_dock_actions(project)
+            await app.on_dock_action_invoked(tui_app.DockActionInvoked("delete_project_sessions"))
+            await pilot.pause()
+            panel = app._server_dock_action_panel()
+            assert panel.has_class("confirming")
+            app._run_server_dock_action.assert_not_awaited()
+            await app.on_dock_action_confirmed(tui_app.DockActionConfirmed("delete_project_sessions"))
+            await pilot.pause()
+            app._run_server_dock_action.assert_awaited_once_with(project, "delete_project_sessions")
+
+    @pytest.mark.asyncio
+    async def test_selecting_project_or_session_in_server_dock_connects(
+        self, monkeypatch, tmp_path
+    ):
+        import worker_tui.app as tui_app
+        from textual.widgets import Tree
+        from worker_tui.app import ServerDockSidebar, WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".artel").mkdir()
+        monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
+        monkeypatch.setattr(
+            tui_app,
+            "load_saved_servers",
+            lambda: [
+                tui_app.SavedArtelServer(name="Prod", remote_url="ws://prod:7432", auth_token="tok")
+            ],
+        )
+
+        class _Control:
+            def __init__(self, remote_url: str, auth_token: str = "") -> None:
+                self.remote_url = remote_url
+                self.auth_token = auth_token
+
+            async def list_sessions(self):
+                return {
+                    "sessions": [
+                        {
+                            "id": "sess-1",
+                            "title": "Release prep",
+                            "project_dir": "/srv/proj",
+                            "updated_at": "2025-01-03 09:00:00",
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(tui_app, "RemoteControlClient", _Control)
+
+        app = WorkerApp()
+        seen: list[tuple[str, str, str]] = []
+
+        async def fake_connect(
+            remote_url: str,
+            *,
+            auth_token: str = "",
+            save: bool = True,
+            project_dir: str = "",
+            resume_session_id: str = "",
+        ) -> None:
+            seen.append((remote_url, project_dir, resume_session_id))
+
+        app._connect_to_server = fake_connect  # type: ignore[method-assign]
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            dock = app.query_one("#server-dock-sidebar", ServerDockSidebar)
+            tree = dock.tree()
+            server_node = tree.root.children[0]
+            project_node = server_node.children[0]
+            await app.on_tree_node_selected(Tree.NodeSelected(project_node))
+            await app.on_tree_node_selected(Tree.NodeSelected(project_node.children[0]))
+            await pilot.pause()
+
+        assert seen == [
+            ("ws://prod:7432", "/srv/proj", ""),
+            ("ws://prod:7432", "", "sess-1"),
+        ]
+
+    @pytest.mark.asyncio
     async def test_cyrillic_ctrl_shortcuts_trigger_critical_actions(self, monkeypatch, tmp_path):
         from worker_tui.app import WorkerApp
 
@@ -1569,9 +1938,14 @@ class TestBoardSidebar:
             await pilot.pause()
             assert palette_calls == ["palette"]
 
-            await pilot.press("ctrl+д")
+            initial_server_dock = app._server_dock_visible
+            app.action_toggle_server_dock()
             await pilot.pause()
-            assert len(app.query_one("#chat-container").children) == 0
+            assert app._server_dock_visible is not initial_server_dock
+
+            app.action_toggle_server_dock()
+            await pilot.pause()
+            assert app._server_dock_visible is initial_server_dock
 
             await pilot.press("ctrl+и")
             await pilot.pause()
@@ -3994,6 +4368,29 @@ class TestRemoteModeCommandRouting:
         assert len(app._pending_attachments) == 1
         assert app._pending_attachments[0].name == "drop.png"
         assert ("Attached pasted image reference(s): drop.png", "tool") in seen_messages
+
+    @pytest.mark.asyncio
+    async def test_large_traceback_paste_is_not_treated_as_image_path(self, monkeypatch):
+        from worker_tui.app import WorkerApp
+
+        _patch_tui_test_context(monkeypatch)
+
+        app = WorkerApp()
+
+        traceback_blob = (
+            "m.verhovyh@m-verhovyh worker % artel -c\n"
+            "Traceback (most recent call last):\n"
+            + (
+                "self._add_message(/server-add no longer accepts inline arguments. "
+                "Use the modal dialog.) "
+            )
+            * 40
+        )
+
+        handled = await app._maybe_handle_pasted_image_reference(traceback_blob)
+
+        assert handled is False
+        assert app._pending_attachments == []
 
     @pytest.mark.asyncio
     async def test_regular_paste_inserts_text_once(self, monkeypatch):

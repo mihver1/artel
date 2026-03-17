@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from worker_tui.app import RuleEditorSubmitted
 
 
 @pytest.mark.asyncio
@@ -15,12 +16,6 @@ async def test_rule_add_opens_dialog_and_saves(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".artel").mkdir()
     monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
-    monkeypatch.setattr(
-        WorkerApp,
-        "push_screen_wait",
-        AsyncMock(return_value={"scope": "project", "enabled": True, "text": "Do not use bash."}),
-    )
-
     app = WorkerApp()
     seen: list[tuple[str, str]] = []
     app._add_message = lambda content, role="assistant": seen.append((content, role))  # type: ignore[method-assign]
@@ -29,6 +24,12 @@ async def test_rule_add_opens_dialog_and_saves(monkeypatch, tmp_path):
         await pilot.pause()
         await app._handle_command("/rule add")
         await pilot.pause()
+        assert app._inline_rule_editor_panel().is_open() is True
+        await app.on_rule_editor_submitted(
+            RuleEditorSubmitted(
+                {"scope": "project", "enabled": True, "text": "Do not use bash."}
+            )
+        )
         await pilot.pause()
 
     assert any("Added rule" in message for message, _ in seen)
@@ -46,12 +47,6 @@ async def test_rule_edit_opens_dialog_for_existing_rule(monkeypatch, tmp_path):
     (tmp_path / ".artel").mkdir()
     rule = add_rule(scope="project", text="Original rule", project_dir=str(tmp_path))
     monkeypatch.setattr("worker_tui.app.WorkerApp._init_local_session", AsyncMock())
-    monkeypatch.setattr(
-        WorkerApp,
-        "push_screen_wait",
-        AsyncMock(return_value={"scope": "project", "enabled": False, "text": "Updated rule"}),
-    )
-
     app = WorkerApp()
     seen: list[tuple[str, str]] = []
     app._add_message = lambda content, role="assistant": seen.append((content, role))  # type: ignore[method-assign]
@@ -60,6 +55,12 @@ async def test_rule_edit_opens_dialog_for_existing_rule(monkeypatch, tmp_path):
         await pilot.pause()
         await app._handle_command(f"/rule edit {rule.id}")
         await pilot.pause()
+        assert app._inline_rule_editor_panel().is_open() is True
+        await app.on_rule_editor_submitted(
+            RuleEditorSubmitted(
+                {"scope": "project", "enabled": False, "text": "Updated rule"}
+            )
+        )
         await pilot.pause()
 
     rules = list_rules(str(tmp_path))
