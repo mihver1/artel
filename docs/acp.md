@@ -72,6 +72,32 @@ During a prompt, Artel streams:
 
 This lets ACP clients render an experience close to the built-in Artel UI while still keeping the agent in a separate process.
 
+## ACP slash commands
+
+Artel now advertises a small set of built-in slash commands over ACP via `available_commands_update`.
+ACP clients can surface these as quick commands, and they still execute through normal `session/prompt` requests by sending text such as `/wt list` or `/rewind 12`.
+
+Currently exposed ACP slash commands:
+
+- `/wt`
+- `/status`
+- `/diff`
+- `/rollback`
+- `/undo`
+- `/rewind`
+- `/mcp`
+- `/schedules`
+- `/delegates`
+- `/agents` (alias for `/delegates`)
+- `/git`
+- `/tasks`
+- `/task-add`
+- `/task-done`
+- `/notes`
+- `/note-add`
+
+These commands are intentionally limited to non-UI session/server workflows. TUI-only surfaces such as dock toggles or clipboard/image helpers are not advertised over ACP.
+
 ## Example: connect Artel to Zed
 
 Zed can run custom ACP agents from its `settings.json` file. Add Artel under `agent_servers`:

@@ -236,6 +236,222 @@ async def test_artel_acp_setters_emit_valid_session_update_notifications(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_artel_acp_slash_command_rewind_returns_result(tmp_path):
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "project"
+    db_path = home_dir / ".config" / "artel" / "sessions.db"
+    home_dir.mkdir()
+    project_dir.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [entry for entry in sys.path if entry] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+
+    store = SessionStore(str(db_path))
+    await store.open()
+    try:
+        await store.create_session(
+            "sess-rewind",
+            "anthropic/claude-sonnet-4-20250514",
+            project_dir=str(project_dir),
+        )
+        await store.add_message("sess-rewind", Message(role=Role.USER, content="one"))
+        await store.add_message("sess-rewind", Message(role=Role.ASSISTANT, content="two"))
+    finally:
+        await store.close()
+
+    proc = await _start_acp_subprocess(cwd=str(project_dir), env=env)
+    try:
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"fs": {"readTextFile": True}},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            },
+        )
+        init_messages = await _read_json_messages_until(proc, response_id=0)
+        assert init_messages[-1]["result"]["protocolVersion"] == 1
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/load",
+                "params": {
+                    "cwd": str(project_dir),
+                    "sessionId": "sess-rewind",
+                    "mcpServers": [],
+                },
+            },
+        )
+        load_messages = await _read_json_messages_until(proc, response_id=1)
+        assert "error" not in load_messages[-1]
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": "sess-rewind",
+                    "prompt": [{"type": "text", "text": "/rewind 1"}],
+                },
+            },
+        )
+        prompt_messages = await _read_json_messages_until(proc, response_id=2)
+        prompt_response = prompt_messages[-1]
+        assert "error" not in prompt_response
+        updates = _session_updates(prompt_messages)
+        assert any(
+            update.get("sessionUpdate") == "agent_message_chunk"
+            and "Created rewound session fork at message 1." in update.get("content", {}).get("text", "")
+            and "New session id:" in update.get("content", {}).get("text", "")
+            for update in updates
+        )
+    finally:
+        await _terminate_process(proc)
+
+
+@pytest.mark.asyncio
+async def test_artel_acp_tasks_and_notes_commands(tmp_path):
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "project"
+    home_dir.mkdir()
+    project_dir.mkdir()
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [entry for entry in sys.path if entry] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    )
+
+    proc = await _start_acp_subprocess(cwd=str(project_dir), env=env)
+    try:
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"fs": {"readTextFile": True}},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            },
+        )
+        init_messages = await _read_json_messages_until(proc, response_id=0)
+        assert init_messages[-1]["result"]["protocolVersion"] == 1
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(project_dir),
+                    "mcpServers": [],
+                },
+            },
+        )
+        new_messages = await _read_json_messages_until(proc, response_id=1)
+        session_id = new_messages[-1]["result"]["sessionId"]
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "/task-add first task"}],
+                },
+            },
+        )
+        add_task_messages = await _read_json_messages_until(proc, response_id=2)
+        add_task_updates = _session_updates(add_task_messages)
+        assert any(
+            update.get("sessionUpdate") == "agent_message_chunk"
+            and "Added task #1: first task" in update.get("content", {}).get("text", "")
+            for update in add_task_updates
+        )
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "/tasks"}],
+                },
+            },
+        )
+        tasks_messages = await _read_json_messages_until(proc, response_id=3)
+        tasks_updates = _session_updates(tasks_messages)
+        assert any(
+            update.get("sessionUpdate") == "agent_message_chunk"
+            and "1|- [ ] first task" in update.get("content", {}).get("text", "")
+            for update in tasks_updates
+        )
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "/note-add remember this"}],
+                },
+            },
+        )
+        note_add_messages = await _read_json_messages_until(proc, response_id=4)
+        note_add_updates = _session_updates(note_add_messages)
+        assert any(
+            update.get("sessionUpdate") == "agent_message_chunk"
+            and "Appended operator note." in update.get("content", {}).get("text", "")
+            for update in note_add_updates
+        )
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "/notes"}],
+                },
+            },
+        )
+        notes_messages = await _read_json_messages_until(proc, response_id=5)
+        notes_updates = _session_updates(notes_messages)
+        assert any(
+            update.get("sessionUpdate") == "agent_message_chunk"
+            and "1|remember this" in update.get("content", {}).get("text", "")
+            for update in notes_updates
+        )
+    finally:
+        await _terminate_process(proc)
+
+
+@pytest.mark.asyncio
 async def test_artel_acp_file_tool_calls_publish_absolute_locations(tmp_path):
     home_dir = tmp_path / "home"
     project_dir = tmp_path / "project"

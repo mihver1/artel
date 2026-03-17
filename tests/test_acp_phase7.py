@@ -186,6 +186,9 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
     def update_agent_thought_text(text: str) -> dict[str, str]:
         return {"kind": "thought_text", "text": text}
 
+    def update_available_commands(commands: list[Any]) -> dict[str, Any]:
+        return {"kind": "available_commands", "available_commands": commands}
+
     def text_block(text: str) -> dict[str, str]:
         return {"text": text}
 
@@ -199,6 +202,7 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
     acp_mod.tool_content = tool_content
     acp_mod.update_agent_message_text = update_agent_message_text
     acp_mod.update_agent_thought_text = update_agent_thought_text
+    acp_mod.update_available_commands = update_available_commands
     acp_mod.update_tool_call = update_tool_call
     acp_mod.update_user_message_text = update_user_message_text
 
@@ -209,6 +213,8 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
     for name in (
         "AgentCapabilities",
         "AuthenticateResponse",
+        "AvailableCommand",
+        "AvailableCommandInput",
         "ConfigOptionUpdate",
         "CurrentModeUpdate",
         "ForkSessionResponse",
@@ -647,6 +653,71 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
         getattr(update, "session_update", "") == "usage_update"
         and getattr(update, "used", None) == 12
         and getattr(update, "size", None) == 100
+        for update in updates
+        if not isinstance(update, dict)
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_acp_slash_command_executes_and_streams_result(monkeypatch, tmp_path):
+    import artel_server.acp as acp_mod
+
+    captured: dict[str, Any] = {}
+    titles: dict[str, str] = {}
+    state = ServerState(config=ArtelConfig(), default_project_dir=str(tmp_path))
+
+    async def fake_run_agent(agent: Any, **kwargs: Any) -> None:
+        assert kwargs == {"use_unstable_protocol": True}
+        conn = _FakeConn()
+        captured["conn"] = conn
+        agent.on_connect(conn)
+        new_session = await agent.new_session(cwd=".")
+        session_id = new_session.session_id
+        captured["session_id"] = session_id
+        captured["response"] = await agent.prompt(
+            prompt=[SimpleNamespace(text="/rewind 3")],
+            session_id=session_id,
+        )
+        captured["notes_response"] = await agent.prompt(
+            prompt=[SimpleNamespace(text="/note-add hello note")],
+            session_id=session_id,
+        )
+
+    async def fake_fork_server_session(
+        state_obj: ServerState,
+        session_id: str,
+        up_to_message_idx: int | None = None,
+    ) -> dict[str, Any]:
+        assert state_obj is state
+        assert up_to_message_idx == 3
+        return {"session_id": "forked-session"}
+
+    _install_fake_acp(monkeypatch, run_agent=fake_run_agent)
+    _patch_acp_server_state(monkeypatch, acp_mod, state, titles)
+    monkeypatch.setattr(acp_mod.server_mod, "_fork_server_session", fake_fork_server_session)
+
+    await acp_mod.run_acp()
+
+    response = captured["response"]
+    notes_response = captured["notes_response"]
+    assert response.stop_reason == "end_turn"
+    assert notes_response.stop_reason == "end_turn"
+    updates = [update for _, update in captured["conn"].updates]
+    assert any(
+        isinstance(update, dict)
+        and update.get("kind") == "message_text"
+        and "Created rewound session fork at message 3." in update.get("text", "")
+        and "New session id: forked-session" in update.get("text", "")
+        for update in updates
+    )
+    assert any(
+        isinstance(update, dict)
+        and update.get("kind") == "message_text"
+        and update.get("text") == "Appended operator note."
+        for update in updates
+    )
+    assert any(
+        getattr(update, "session_update", "") == "session_info_update"
         for update in updates
         if not isinstance(update, dict)
     )

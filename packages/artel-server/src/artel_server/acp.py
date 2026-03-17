@@ -13,6 +13,7 @@ from artel_core.config import load_config
 from artel_core.sessions import SessionStore
 
 from artel_server import server as server_mod
+from artel_server.acp_commands import available_acp_commands, maybe_handle_slash_command
 from artel_server.provider_overlay import load_provider_overlay, merge_provider_overlay
 
 _THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh")
@@ -641,6 +642,24 @@ async def run_acp() -> None:
             if not content.strip():
                 return PromptResponse(stop_reason="end_turn")
 
+            slash_result = await maybe_handle_slash_command(state, session_id, content)
+            if slash_result is not None:
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=update_agent_message_text(slash_result.output),
+                )
+                session_info = await server_mod._serialize_session(state, session_id)
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=SessionInfoUpdate(
+                        session_update="session_info_update",
+                        updated_at=_iso_timestamp(
+                            str(session_info.get("updated_at", "")).strip() or None
+                        ),
+                    ),
+                )
+                return PromptResponse(stop_reason="end_turn")
+
             session = state.sessions.get(session_id)
             if session is None:
                 session = await server_mod._create_server_session(state, session_id)
@@ -725,7 +744,7 @@ async def run_acp() -> None:
                                     raw_output={
                                         "output": event.content,
                                         "is_error": event.is_error,
-                                        "display": event.display,
+                                        "display": getattr(event, "display", None),
                                     },
                                 ),
                             )
