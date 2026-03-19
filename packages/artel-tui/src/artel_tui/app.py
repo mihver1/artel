@@ -4184,7 +4184,7 @@ class ArtelApp(App):
         elif cmd in ("/resume", "/sessions"):
             await self._cmd_resume(arg)
         elif cmd == "/compact":
-            await self._cmd_compact(arg)
+            self._cmd_compact(arg)
         elif cmd == "/name":
             if not arg:
                 self._add_message("Usage: /name <title>", role="error")
