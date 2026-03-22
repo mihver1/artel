@@ -288,6 +288,15 @@ class TestOpenAICompatProviderOAuth:
         assert "chatgpt.com" in provider._base_url
         assert provider._account_id == "acct-test"
 
+    def test_oauth_accepts_explicit_account_id(self):
+        provider = OpenAIProvider(
+            api_key="opaque-access-token",
+            auth_type="oauth",
+            account_id="acct-from-store",
+        )
+        assert provider._auth_type == "oauth"
+        assert provider._account_id == "acct-from-store"
+
     def test_api_key_mode_default(self):
         provider = OpenAIProvider(api_key="sk-test")
         assert provider._auth_type == "api"
@@ -364,6 +373,21 @@ class TestOpenAIProviderSplit:
         assert body["reasoning"] == {"effort": "none", "summary": "auto"}
 
         await provider.close()
+
+    def test_oauth_responses_request_uses_chatgpt_account_header(self):
+        provider = OpenAIProvider(
+            api_key="opaque-access-token",
+            auth_type="oauth",
+            account_id="acct-from-store",
+        )
+
+        _, _, headers = provider._build_responses_request(
+            "gpt-5.3-codex",
+            [Message(role=Role.USER, content="Hi")],
+        )
+
+        assert headers["ChatGPT-Account-Id"] == "acct-from-store"
+        assert "openai-organization" not in headers
 
 
 # ── _stream_codex SSE parsing ─────────────────────────────────────
