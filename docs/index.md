@@ -35,6 +35,7 @@ artel connect ws://host:7432
 - [Providers](providers.md) summarizes how to configure hosted, cloud, and local models.
 - [Extensions](extensions.md) shows how to install, update, and manage extension registries.
 - [CLI reference](cli.md) gives you a concise command-by-command reference.
+- [RFC: Plan Graph](rfc/plan-graph.md) describes a proposed spec-driven planning artifact model for future implementation work.
 
 ## Best place to start
 

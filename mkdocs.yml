@@ -73,3 +73,4 @@ nav:
       - Artel TUI refresh inspired by Toad: rfc/artel-tui-refresh-inspired-by-toad.md
       - Artel TUI refresh backlog: rfc/artel-tui-refresh-backlog.md
       - True multi-session TUI window model: rfc/true-multisession-tui-window-model.md
+      - Plan Graph: rfc/plan-graph.md

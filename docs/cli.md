@@ -48,7 +48,7 @@ Options:
 
 ### `artel web`
 
-Reserved compatibility command for the web surface. The current checkout does not include the full web UI implementation, so this command is unavailable at runtime and exits with an explanatory error.
+Starts the experimental NiceGUI-based Artel web UI.
 
 Options:
 
@@ -127,6 +127,7 @@ artel --continue
 artel --resume 7f1f7f80-0000-0000-0000-000000000000
 artel serve --host 0.0.0.0 --port 7432
 artel connect ws://example.com:7432 --token artel_example
+artel web --port 8843
 artel config print
 artel ext search git
 ```

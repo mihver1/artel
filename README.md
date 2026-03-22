@@ -50,6 +50,9 @@ artel -p "explain this codebase"
 # Interactive TUI (local mode; no cmux required)
 artel
 
+# Experimental web cockpit
+artel web
+
 # Resume the last session
 artel --continue
 
@@ -91,6 +94,7 @@ Supported now:
 - continue/resume session flow
 - headless server (`artel serve`)
 - remote TUI (`artel connect`)
+- experimental NiceGUI web UI (`artel web`)
 - JSON-RPC (`artel rpc`)
 - ACP (`artel acp`)
 - rules and rule enforcement
@@ -101,10 +105,7 @@ Supported now:
 - orchestration/delegation tools
 - Python-native extensions
 
-Unavailable in this checkout:
-- full web UI runtime behind `artel web`
-
-The `artel web` command remains present as a compatibility/placeholder surface, but the full web UI source is not included in this checkout.
+`artel web` is currently an experimental surface: it provides a polished follow-first cockpit for parallel sessions, live agent streaming, task/notes editing, and server control-plane visibility, but it does not yet match the TUI feature-for-feature.
 
 ## Configuration
 
@@ -298,4 +299,12 @@ artel ext remove artel-ext-foo
 
 ## Web UI status
 
-`artel web` is still exposed in the CLI, but the current checkout does not include the full web UI implementation. Running it will raise a runtime error explaining that the web surface is unavailable in this checkout.
+`artel web` now starts an experimental NiceGUI-based Artel cockpit oriented around a follow-first coding workflow. It currently emphasizes:
+
+- parallel sessions with fast switching
+- live WebSocket streaming from the server runtime
+- follow panels for task, file focus, diff, terminal, and tool activity
+- built-in access to schedules, rules, prompts, skills, delegates, tasks, and notes
+- a more opinionated, engineering-focused visual language than the TUI
+
+It should be treated as experimental: the core flow works, but feature parity and deeper interaction polish are still in progress.

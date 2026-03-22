@@ -89,6 +89,9 @@ ACP clients can surface these as quick commands, and they still execute through 
 Currently exposed ACP slash commands:
 
 - `/wt`
+- `/image`
+- `/image-clear`
+- `/image-remove`
 - `/status`
 - `/diff`
 - `/rollback`
@@ -105,7 +108,12 @@ Currently exposed ACP slash commands:
 - `/notes`
 - `/note-add`
 
-These commands are intentionally limited to non-UI session/server workflows. TUI-only surfaces such as dock toggles or clipboard/image helpers are not advertised over ACP.
+ACP now supports image input in two ways:
+
+- inline ACP image/resource blocks are converted into Artel image attachments for the prompt
+- `/image <path>` queues a local image file for the next non-slash ACP prompt
+
+`/image-clear` and `/image-remove <index>` manage the queued ACP image attachments.
 
 ## Example: connect Artel to Zed
 

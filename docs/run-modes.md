@@ -99,6 +99,12 @@ artel acp
 This mode is intended for editors, IDEs, and other frontends that speak the Agent Client Protocol.
 See [ACP integration](acp.md) for the supported session lifecycle, permission modes, and per-session configuration options.
 
-## Unavailable web surface in this checkout
+## Experimental web mode
 
-The CLI still exposes `artel web`, but the current repository checkout does not include the full web UI runtime. Treat it as a reserved compatibility command rather than a supported run mode.
+Artel also exposes an experimental web surface:
+
+```bash
+artel web
+```
+
+This starts a NiceGUI-based cockpit connected to the same Artel server/control-plane foundation used by the remote TUI. Today it is best suited for follow-first coding, session orchestration, and operational visibility rather than full parity with the TUI.

@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import shlex
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
+from artel_ai.attachments import is_supported_image_path, normalize_image_attachment
 from artel_core.board import (
     add_task_to_markdown,
     append_project_board_file,
@@ -47,17 +50,56 @@ class AcpSlashResult:
 
 
 AVAILABLE_ACP_COMMANDS: tuple[AcpAvailableCommandSpec, ...] = (
-    AcpAvailableCommandSpec("wt", "Manage git worktrees for the current repository", "list | <branch> | rm <path> | finish <path>"),
+    AcpAvailableCommandSpec(
+        "wt",
+        "Manage git worktrees for the current repository",
+        "list | <branch> | rm <path> | finish <path>",
+    ),
+    AcpAvailableCommandSpec(
+        "image",
+        "Queue an image attachment for the next ACP prompt",
+        "<path-to-image>",
+    ),
+    AcpAvailableCommandSpec("image-clear", "Clear queued ACP image attachments"),
+    AcpAvailableCommandSpec(
+        "image-remove",
+        "Remove a queued ACP image attachment by index",
+        "<index>",
+    ),
     AcpAvailableCommandSpec("status", "Show git status for the current project"),
     AcpAvailableCommandSpec("diff", "Show unstaged git diff", "[path]"),
-    AcpAvailableCommandSpec("rollback", "Restore one path or all unstaged changes", "<path> | --all"),
+    AcpAvailableCommandSpec(
+        "rollback",
+        "Restore one path or all unstaged changes",
+        "<path> | --all",
+    ),
     AcpAvailableCommandSpec("undo", "Undo the latest AI file edits in this session"),
-    AcpAvailableCommandSpec("rewind", "Create a forked session rewound to an earlier message", "<message_index>"),
+    AcpAvailableCommandSpec(
+        "rewind",
+        "Create a forked session rewound to an earlier message",
+        "<message_index>",
+    ),
     AcpAvailableCommandSpec("mcp", "Show or reload MCP runtime state", "[reload]"),
-    AcpAvailableCommandSpec("schedules", "List, show, run, or reload scheduled tasks", "[list|show <id>|run <id>|reload]"),
-    AcpAvailableCommandSpec("delegates", "Inspect orchestration runs", "[list|show <id>|tail <id>|cancel <id>]"),
-    AcpAvailableCommandSpec("agents", "Alias for /delegates", "[list|show <id>|tail <id>|cancel <id>]"),
-    AcpAvailableCommandSpec("git", "Git command group alias", "status | diff [path] | rollback <path>|--all | help"),
+    AcpAvailableCommandSpec(
+        "schedules",
+        "List, show, run, or reload scheduled tasks",
+        "[list|show <id>|run <id>|reload]",
+    ),
+    AcpAvailableCommandSpec(
+        "delegates",
+        "Inspect orchestration runs",
+        "[list|show <id>|tail <id>|cancel <id>]",
+    ),
+    AcpAvailableCommandSpec(
+        "agents",
+        "Alias for /delegates",
+        "[list|show <id>|tail <id>|cancel <id>]",
+    ),
+    AcpAvailableCommandSpec(
+        "git",
+        "Git command group alias",
+        "status | diff [path] | rollback <path>|--all | help",
+    ),
     AcpAvailableCommandSpec("tasks", "Read the shared task board"),
     AcpAvailableCommandSpec("task-add", "Add a task to the shared task board", "<title>"),
     AcpAvailableCommandSpec("task-done", "Mark a task as done", "<task-id>"),
@@ -88,7 +130,15 @@ async def maybe_handle_slash_command(
     arg = tail.strip()
 
     if command == "wt":
-        return AcpSlashResult(output=run_worktree_command(_project_dir(state, session_id), arg))
+        return AcpSlashResult(
+            output=run_worktree_command(_project_dir(state, session_id), arg)
+        )
+    if command == "image":
+        return await _handle_image(state, session_id, arg)
+    if command == "image-clear":
+        return await _handle_image_clear(state, session_id)
+    if command == "image-remove":
+        return await _handle_image_remove(state, session_id, arg)
     if command in {"status", "diff", "rollback", "git"}:
         return await _handle_git_command(state, session_id, command, arg)
     if command == "undo":
@@ -118,6 +168,88 @@ def _project_dir(state: server_mod.ServerState, session_id: str) -> str:
     return server_mod._session_project_dir(state, session_id, state.sessions.get(session_id))
 
 
+def _pending_attachments(state: server_mod.ServerState, session_id: str) -> list[Any]:
+    runtime = getattr(state, "acp_session_runtimes", {}).get(session_id)
+    if runtime is None:
+        return []
+    return runtime.pending_attachments
+
+
+def _format_pending_attachment_lines(attachments: list[Any]) -> str:
+    if not attachments:
+        return "No pending image attachments."
+    lines: list[str] = []
+    for index, attachment in enumerate(attachments, start=1):
+        name = attachment.name or Path(attachment.path).name
+        lines.append(f"{index}. {name} ({attachment.mime_type})")
+    return "Pending image attachments:\n" + "\n".join(lines)
+
+
+async def _handle_image(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
+    image_path = arg.strip()
+    if not image_path:
+        return AcpSlashResult(output="Usage: /image <path-to-image>", is_error=True)
+    try:
+        attachment = normalize_image_attachment(image_path)
+    except Exception as exc:
+        return AcpSlashResult(output=f"Failed to attach image: {exc}", is_error=True)
+    path = Path(attachment.path)
+    if not path.exists():
+        return AcpSlashResult(output=f"Image not found: {attachment.path}", is_error=True)
+    if not path.is_file():
+        return AcpSlashResult(output=f"Not a file: {attachment.path}", is_error=True)
+    if not is_supported_image_path(attachment.path):
+        return AcpSlashResult(output="Only image files are supported for /image.", is_error=True)
+    pending = _pending_attachments(state, session_id)
+    pending.append(attachment)
+    return AcpSlashResult(
+        output=(
+            f"Attached image: {attachment.name or path.name}\n"
+            f"{_format_pending_attachment_lines(pending)}"
+        )
+    )
+
+
+async def _handle_image_clear(
+    state: server_mod.ServerState,
+    session_id: str,
+) -> AcpSlashResult:
+    pending = _pending_attachments(state, session_id)
+    count = len(pending)
+    pending.clear()
+    if count:
+        return AcpSlashResult(output=f"Cleared {count} pending image attachment(s).")
+    return AcpSlashResult(output="No pending image attachments.")
+
+
+async def _handle_image_remove(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
+    if not arg.strip():
+        return AcpSlashResult(output="Usage: /image-remove <index>", is_error=True)
+    try:
+        index = int(arg)
+    except ValueError:
+        return AcpSlashResult(output="Usage: /image-remove <index>", is_error=True)
+    pending = _pending_attachments(state, session_id)
+    if index < 1 or index > len(pending):
+        return AcpSlashResult(
+            output=f"No pending image attachment at index {index}.",
+            is_error=True,
+        )
+    removed = pending.pop(index - 1)
+    name = removed.name or Path(removed.path).name
+    return AcpSlashResult(
+        output=f"Removed pending image: {name}\n{_format_pending_attachment_lines(pending)}"
+    )
+
+
 async def _handle_git_command(
     state: server_mod.ServerState,
     session_id: str,
@@ -144,7 +276,10 @@ async def _handle_git_command(
     if action == "rollback":
         if rest == "--all":
             message = restore_all(cwd=cwd)
-            return AcpSlashResult(output=message, is_error=message.startswith("git restore failed:"))
+            return AcpSlashResult(
+                output=message,
+                is_error=message.startswith("git restore failed:"),
+            )
         message = restore_path(cwd=cwd, pathspec=rest)
         return AcpSlashResult(
             output=message,
@@ -168,7 +303,11 @@ async def _handle_undo(state: server_mod.ServerState, session_id: str) -> AcpSla
     )
 
 
-async def _handle_rewind(state: server_mod.ServerState, session_id: str, arg: str) -> AcpSlashResult:
+async def _handle_rewind(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
     if not arg.isdigit():
         return AcpSlashResult(output="Usage: /rewind <message_index>", is_error=True)
     idx = int(arg)
@@ -203,7 +342,11 @@ async def _handle_mcp(state: server_mod.ServerState, session_id: str, arg: str) 
         await runtime.close()
 
 
-async def _handle_schedules(state: server_mod.ServerState, session_id: str, arg: str) -> AcpSlashResult:
+async def _handle_schedules(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
     command = arg.strip()
     try:
         parts = shlex.split(command) if command else []
@@ -222,11 +365,13 @@ async def _handle_schedules(state: server_mod.ServerState, session_id: str, arg:
             return AcpSlashResult(output=_render_schedule_list(snapshot))
         if parts[0] == "reload" and len(parts) == 1:
             snapshot = await service.reload()
-            return AcpSlashResult(output=f"Reloaded schedules: {snapshot.get('count', 0)} configured")
+            count = snapshot.get("count", 0)
+            return AcpSlashResult(output=f"Reloaded schedules: {count} configured")
         if parts[0] == "run" and len(parts) == 2:
             snapshot = await service.run_now(parts[1])
+            next_run = snapshot.get("next_run_at", "") or "-"
             return AcpSlashResult(
-                output=f"Triggered schedule: {parts[1]}\nnext={snapshot.get('next_run_at', '') or '-'}"
+                output=f"Triggered schedule: {parts[1]}\nnext={next_run}"
             )
         if parts[0] == "show" and len(parts) == 2:
             snapshot = service.snapshot()
@@ -252,7 +397,11 @@ async def _handle_schedules(state: server_mod.ServerState, session_id: str, arg:
                 await service.stop()
 
 
-async def _handle_delegates(state: server_mod.ServerState, session_id: str, arg: str) -> AcpSlashResult:
+async def _handle_delegates(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
     try:
         parts = shlex.split(arg) if arg.strip() else []
     except ValueError as exc:
@@ -269,7 +418,10 @@ async def _handle_delegates(state: server_mod.ServerState, session_id: str, arg:
     if parts[0] == "show" and len(parts) == 2:
         run = registry.get_session_run(session_id, parts[1])
         if run is None:
-            return AcpSlashResult(output=f"delegates error: Unknown orchestration run: {parts[1]}", is_error=True)
+            return AcpSlashResult(
+                output=f"delegates error: Unknown orchestration run: {parts[1]}",
+                is_error=True,
+            )
         rendered = format_run_detail(run)
         if rendered.startswith("Delegate:"):
             rendered = rendered.replace("Delegate:", "Orchestration run:", 1)
@@ -277,7 +429,10 @@ async def _handle_delegates(state: server_mod.ServerState, session_id: str, arg:
     if parts[0] == "tail" and len(parts) == 2:
         run = registry.get_session_run(session_id, parts[1])
         if run is None:
-            return AcpSlashResult(output=f"delegates error: Unknown orchestration run: {parts[1]}", is_error=True)
+            return AcpSlashResult(
+                output=f"delegates error: Unknown orchestration run: {parts[1]}",
+                is_error=True,
+            )
         lines = [f"Tail for orchestration run {parts[1]}:"]
         lines.extend(f"- {item}" for item in run.events[-10:])
         if run.latest_update:
@@ -286,10 +441,16 @@ async def _handle_delegates(state: server_mod.ServerState, session_id: str, arg:
     if parts[0] == "cancel" and len(parts) == 2:
         run = registry.get_session_run(session_id, parts[1])
         if run is None:
-            return AcpSlashResult(output=f"delegates error: Unknown orchestration run: {parts[1]}", is_error=True)
+            return AcpSlashResult(
+                output=f"delegates error: Unknown orchestration run: {parts[1]}",
+                is_error=True,
+            )
         cancelled = registry.cancel(run.id)
         if not cancelled:
-            return AcpSlashResult(output=f"Failed to cancel orchestration run: {parts[1]}", is_error=True)
+            return AcpSlashResult(
+                output=f"Failed to cancel orchestration run: {parts[1]}",
+                is_error=True,
+            )
         return AcpSlashResult(output=f"Cancelled orchestration run: {parts[1]}")
     return AcpSlashResult(
         output=(
@@ -312,7 +473,11 @@ async def _handle_tasks(state: server_mod.ServerState, session_id: str) -> AcpSl
     return AcpSlashResult(output=render_numbered_text(content))
 
 
-async def _handle_task_add(state: server_mod.ServerState, session_id: str, arg: str) -> AcpSlashResult:
+async def _handle_task_add(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
     title = arg.strip()
     if not title:
         return AcpSlashResult(output="Usage: /task-add <title>", is_error=True)
@@ -327,7 +492,11 @@ async def _handle_task_add(state: server_mod.ServerState, session_id: str, arg: 
     return AcpSlashResult(output=f"Added task #{task_id}: {title}")
 
 
-async def _handle_task_done(state: server_mod.ServerState, session_id: str, arg: str) -> AcpSlashResult:
+async def _handle_task_done(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
     if not arg:
         return AcpSlashResult(output="Usage: /task-done <task-id>", is_error=True)
     try:
@@ -352,7 +521,11 @@ async def _handle_notes(state: server_mod.ServerState, session_id: str) -> AcpSl
     return AcpSlashResult(output=render_numbered_text(content))
 
 
-async def _handle_note_add(state: server_mod.ServerState, session_id: str, arg: str) -> AcpSlashResult:
+async def _handle_note_add(
+    state: server_mod.ServerState,
+    session_id: str,
+    arg: str,
+) -> AcpSlashResult:
     text = arg.strip()
     if not text:
         return AcpSlashResult(output="Usage: /note-add <text>", is_error=True)

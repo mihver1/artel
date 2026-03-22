@@ -1,14 +1,25 @@
-# Web status
+# Artel Web
 
-`artel web` remains exposed as a compatibility command surface.
+`artel web` starts an experimental NiceGUI-based Artel cockpit.
 
-The current checkout does not include the full web UI runtime, so the command is unavailable at runtime and exits with an explanatory error.
+Current focus areas:
 
-Use these supported surfaces instead:
+- follow-first coding workflow instead of generic chat-only layout
+- parallel sessions with quick switching
+- live WebSocket streaming from the Artel server
+- control-plane visibility for providers, schedules, prompts, skills, rules, and delegates
+- editable shared task board and operator notes alongside the active session
 
-- local TUI via `artel`
-- one-shot mode via `artel -p`
-- headless server via `artel serve`
-- remote TUI via `artel connect`
-- ACP via `artel acp`
-- JSON-RPC via `artel rpc`
+Example:
+
+```bash
+artel web
+artel web --port 8843
+artel web --remote-url ws://host:7432 --token <bearer-token>
+```
+
+Current limitations:
+
+- experimental quality; expect iteration
+- not yet at feature parity with the TUI
+- optimized for server-backed operation and orchestration visibility first

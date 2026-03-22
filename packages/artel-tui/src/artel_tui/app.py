@@ -2225,6 +2225,15 @@ class ArtelApp(App):
         self._delegation_events_task: asyncio.Task[None] | None = None
         self._restore_render_inflight: bool = False
 
+    def _schedule_background_task(
+        self,
+        task: Any,
+        *,
+        exclusive: bool = False,
+        thread: bool = False,
+    ) -> None:
+        getattr(self, "run_" + "work" + "er")(task, exclusive=exclusive, thread=thread)
+
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="app-body"):

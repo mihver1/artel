@@ -157,8 +157,8 @@ def connect(url: str, token: str, forward_credentials: str) -> None:
 
 
 @cli.command(
-    help="Run the reserved web command (web UI unavailable in this checkout).",
-    short_help="Reserved web command; unavailable in this checkout.",
+    help="Run the experimental NiceGUI-based Artel web UI.",
+    short_help="Start the experimental Artel web UI.",
 )
 @click.option("--host", default="127.0.0.1", help="Bind address for the web UI")
 @click.option("--port", default=8743, type=int, help="Bind port for the web UI")
@@ -170,6 +170,11 @@ def connect(url: str, token: str, forward_credentials: str) -> None:
     is_flag=True,
     help="Do not open the browser automatically",
 )
+@click.option(
+    "--project-dir",
+    default="",
+    help="Override the project directory used by the web UI session bootstrap",
+)
 def web(
     host: str,
     port: int,
@@ -177,12 +182,13 @@ def web(
     token: str,
     native: bool,
     no_open_browser: bool,
+    project_dir: str,
 ) -> None:
-    """Run the reserved web command (web UI unavailable in this checkout)."""
+    """Run the experimental NiceGUI-based Artel web UI."""
     from artel_tui.local_server import ensure_managed_local_server
     from artel_web.app import run_web
 
-    project_dir = os.getcwd()
+    project_dir = os.path.realpath(project_dir or os.getcwd())
     resolved_remote_url = remote_url
     resolved_auth_token = token
     if not resolved_remote_url:

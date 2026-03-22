@@ -21,7 +21,7 @@ This document is the canonical source of truth for which Artel surfaces are supp
 ## Experimental / partial
 
 - macOS server-tray companion flow (`artel server-tray`)
-- documentation and control surfaces may mention `artel web`, but the full web runtime is not shipped in this checkout
+- NiceGUI-based `artel web` surface for follow-first orchestration, parallel sessions, and control-plane visibility; functional but not yet at TUI parity
 
 ## Out of current scope
 
@@ -32,5 +32,5 @@ This document is the canonical source of truth for which Artel surfaces are supp
 
 ## Notes
 
-- `artel web` remains present as a compatibility command surface, but running it in this checkout raises an explanatory runtime error.
+- `artel web` is available as an experimental surface built on NiceGUI and the existing Artel server control plane.
 - This document should stay aligned with README, CLI help, and the docs site.

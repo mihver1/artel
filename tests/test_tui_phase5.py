@@ -3542,6 +3542,23 @@ class TestRemoteModeCommandRouting:
         app._resume_remote_session.assert_awaited_once_with("remote-latest")
         app._sync_remote_session_state.assert_not_awaited()
 
+    def test_artel_app_schedule_background_task_delegates_to_run_worker(self):
+        from artel_tui.app import ArtelApp
+
+        app = ArtelApp(remote_url="ws://localhost:7432")
+        calls: list[tuple[object, bool, bool]] = []
+        task = object()
+
+        app.run_worker = (  # type: ignore[method-assign]
+            lambda task_arg, *, exclusive=False, thread=False: calls.append(
+                (task_arg, exclusive, thread)
+            )
+        )
+
+        app._schedule_background_task(task, exclusive=True, thread=False)
+
+        assert calls == [(task, True, False)]
+
     @pytest.mark.asyncio
     async def test_resume_command_lists_remote_sessions(self):
         from artel_tui.app import ArtelApp

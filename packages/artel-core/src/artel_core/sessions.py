@@ -6,9 +6,17 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 from artel_ai.models import ImageAttachment, Message, Role, ToolCall, ToolResult
+from artel_core.plans import (
+    PlanRecord,
+    PlanRelationRecord,
+    PlanStepRecord,
+    SessionPlanStateRecord,
+    SessionPlanSummary,
+)
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS sessions (

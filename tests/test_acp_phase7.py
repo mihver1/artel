@@ -216,6 +216,7 @@ def _install_fake_acp(monkeypatch: pytest.MonkeyPatch, *, run_agent: Any) -> Non
         "AvailableCommand",
         "AvailableCommandInput",
         "AvailableCommandsUpdate",
+        "_AvailableCommandsUpdate",
         "ConfigOptionUpdate",
         "CurrentModeUpdate",
         "ForkSessionResponse",
@@ -612,6 +613,21 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
     ]
     updates = [update for _, update in captured["conn"].updates]
     assert any(
+        (
+            getattr(update, "session_update", "") == "available_commands_update"
+            or getattr(update, "sessionUpdate", "") == "available_commands_update"
+        )
+        and any(
+            getattr(command, "name", "") == "image"
+            for command in (
+                getattr(update, "availableCommands", None)
+                or getattr(update, "available_commands", [])
+            )
+        )
+        for update in updates
+        if not isinstance(update, dict)
+    )
+    assert any(
         isinstance(update, dict)
         and update.get("kind") == "thought_text"
         and update.get("text") == "thinking"
@@ -664,6 +680,99 @@ async def test_run_acp_prompt_streams_updates_and_permission_requests(
         and getattr(update, "size", None) == 100
         for update in updates
         if not isinstance(update, dict)
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_acp_image_commands_and_inline_attachments(monkeypatch, tmp_path):
+    import artel_server.acp as acp_mod
+    import artel_server.server as server_mod
+
+    captured: dict[str, Any] = {}
+    titles: dict[str, str] = {}
+    state = ServerState(config=ArtelConfig(), default_project_dir=str(tmp_path))
+    image_path = tmp_path / "shot.png"
+    image_path.write_bytes(b"png-data")
+
+    class _FakeSession:
+        context_window = 100
+        project_dir = str(tmp_path)
+
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+            self.attachments_seen: list[Any] = []
+
+        async def run(self, content: str, *, attachments=None):
+            captured["content"] = content
+            captured["attachments"] = list(attachments or [])
+            yield _event(server_mod.AgentEventType.DONE, usage=None)
+
+        async def generate_title(self, content: str) -> str:
+            return ""
+
+        def _estimate_tokens(self) -> int:
+            return 1
+
+    async def fake_create_server_session(state_obj: ServerState, session_id: str) -> Any:
+        session = _FakeSession(session_id)
+        state_obj.sessions[session_id] = session
+        return session
+
+    async def fake_run_agent(agent: Any, **kwargs: Any) -> None:
+        assert kwargs == {"use_unstable_protocol": True}
+        conn = _FakeConn()
+        captured["conn"] = conn
+        agent.on_connect(conn)
+        new_session = await agent.new_session(cwd=".")
+        session_id = new_session.session_id
+        captured["session_id"] = session_id
+        captured["image_response"] = await agent.prompt(
+            prompt=[SimpleNamespace(text=f"/image {image_path}")],
+            session_id=session_id,
+        )
+        captured["remove_response"] = await agent.prompt(
+            prompt=[SimpleNamespace(text="/image-remove 1")],
+            session_id=session_id,
+        )
+        await agent.prompt(
+            prompt=[SimpleNamespace(text=f"/image {image_path}")],
+            session_id=session_id,
+        )
+        captured["prompt_response"] = await agent.prompt(
+            prompt=[SimpleNamespace(text="describe this screenshot")],
+            session_id=session_id,
+        )
+
+    _install_fake_acp(monkeypatch, run_agent=fake_run_agent)
+    _patch_acp_server_state(monkeypatch, acp_mod, state, titles)
+    monkeypatch.setattr(
+        acp_mod.server_mod,
+        "_create_server_session",
+        fake_create_server_session,
+    )
+
+    await acp_mod.run_acp()
+
+    assert captured["image_response"].stop_reason == "end_turn"
+    assert captured["remove_response"].stop_reason == "end_turn"
+    assert captured["prompt_response"].stop_reason == "end_turn"
+    attachments = captured["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0].name == "shot.png"
+    assert attachments[0].mime_type == "image/png"
+    updates = [update for _, update in captured["conn"].updates]
+    assert any(
+        isinstance(update, dict)
+        and update.get("kind") == "message_text"
+        and "Attached image: shot.png" in update.get("text", "")
+        for update in updates
+    )
+    assert any(
+        isinstance(update, dict)
+        and update.get("kind") == "user_message_text"
+        and "Using image attachment(s):" in update.get("text", "")
+        and "shot.png" in update.get("text", "")
+        for update in updates
     )
 
 

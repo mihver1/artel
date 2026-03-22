@@ -259,8 +259,9 @@ async def test_artel_acp_slash_command_rewind_returns_result(tmp_path):
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
     env["PYTHONUNBUFFERED"] = "1"
+    extra_pythonpath = [env["PYTHONPATH"]] if env.get("PYTHONPATH") else []
     env["PYTHONPATH"] = os.pathsep.join(
-        [entry for entry in sys.path if entry] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        [entry for entry in sys.path if entry] + extra_pythonpath
     )
 
     store = SessionStore(str(db_path))
@@ -328,7 +329,8 @@ async def test_artel_acp_slash_command_rewind_returns_result(tmp_path):
         updates = _session_updates(prompt_messages)
         assert any(
             update.get("sessionUpdate") == "agent_message_chunk"
-            and "Created rewound session fork at message 1." in update.get("content", {}).get("text", "")
+            and "Created rewound session fork at message 1."
+            in update.get("content", {}).get("text", "")
             and "New session id:" in update.get("content", {}).get("text", "")
             for update in updates
         )
@@ -345,8 +347,9 @@ async def test_artel_acp_tasks_and_notes_commands(tmp_path):
     env = os.environ.copy()
     env["HOME"] = str(home_dir)
     env["PYTHONUNBUFFERED"] = "1"
+    extra_pythonpath = [env["PYTHONPATH"]] if env.get("PYTHONPATH") else []
     env["PYTHONPATH"] = os.pathsep.join(
-        [entry for entry in sys.path if entry] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+        [entry for entry in sys.path if entry] + extra_pythonpath
     )
 
     proc = await _start_acp_subprocess(cwd=str(project_dir), env=env)
@@ -381,6 +384,16 @@ async def test_artel_acp_tasks_and_notes_commands(tmp_path):
         )
         new_messages = await _read_json_messages_until(proc, response_id=1)
         session_id = new_messages[-1]["result"]["sessionId"]
+
+        session_updates = _session_updates(new_messages)
+        assert any(
+            update.get("sessionUpdate") == "available_commands_update"
+            and any(
+                command.get("name") == "image"
+                for command in update.get("availableCommands", [])
+            )
+            for update in session_updates
+        )
 
         await _send_json(
             proc,
@@ -460,6 +473,99 @@ async def test_artel_acp_tasks_and_notes_commands(tmp_path):
             update.get("sessionUpdate") == "agent_message_chunk"
             and "1|remember this" in update.get("content", {}).get("text", "")
             for update in notes_updates
+        )
+    finally:
+        await _terminate_process(proc)
+
+
+@pytest.mark.asyncio
+async def test_artel_acp_image_commands_and_inline_images(tmp_path):
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "project"
+    home_dir.mkdir()
+    project_dir.mkdir()
+    image_path = project_dir / "shot.png"
+    image_path.write_bytes(b"png-data")
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["PYTHONUNBUFFERED"] = "1"
+    extra_pythonpath = [env["PYTHONPATH"]] if env.get("PYTHONPATH") else []
+    env["PYTHONPATH"] = os.pathsep.join(
+        [entry for entry in sys.path if entry] + extra_pythonpath
+    )
+
+    proc = await _start_acp_subprocess(cwd=str(project_dir), env=env)
+    try:
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"fs": {"readTextFile": True}},
+                    "clientInfo": {"name": "pytest", "version": "0"},
+                },
+            },
+        )
+        init_messages = await _read_json_messages_until(proc, response_id=0)
+        assert init_messages[-1]["result"]["protocolVersion"] == 1
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {
+                    "cwd": str(project_dir),
+                    "mcpServers": [],
+                },
+            },
+        )
+        new_messages = await _read_json_messages_until(proc, response_id=1)
+        session_id = new_messages[-1]["result"]["sessionId"]
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": f"/image {image_path}"}],
+                },
+            },
+        )
+        image_messages = await _read_json_messages_until(proc, response_id=2)
+        image_updates = _session_updates(image_messages)
+        assert any(
+            update.get("sessionUpdate") == "agent_message_chunk"
+            and "Attached image: shot.png" in update.get("content", {}).get("text", "")
+            for update in image_updates
+        )
+
+        await _send_json(
+            proc,
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "describe this image"}],
+                },
+            },
+        )
+        prompt_messages = await _read_json_messages_until(proc, response_id=3)
+        prompt_updates = _session_updates(prompt_messages)
+        assert any(
+            update.get("sessionUpdate") == "user_message_chunk"
+            and "Using image attachment(s):" in update.get("content", {}).get("text", "")
+            and "shot.png" in update.get("content", {}).get("text", "")
+            for update in prompt_updates
         )
     finally:
         await _terminate_process(proc)

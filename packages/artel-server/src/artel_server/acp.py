@@ -32,6 +32,7 @@ class _AcpSessionRuntime:
     prompt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     permission_broker: Any | None = None
     tracker: Any | None = None
+    pending_attachments: list[ImageAttachment] = field(default_factory=list)
 
 
 def _resolve_cwd(default_project_dir: str, cwd: str | None) -> str:
@@ -139,7 +140,7 @@ def _image_attachment_from_block(
             name=resolved.name,
         )
 
-    raw_data = _get_block_attr(block, "data")
+    raw_data = _get_block_attr(block, "data", "blob")
     if not isinstance(raw_data, str) or not raw_data.strip():
         raise RuntimeError("ACP image blocks must include image data or a file:// URI.")
     try:
@@ -173,10 +174,53 @@ def _prompt_to_text_and_attachments(
         if block_type == "image":
             attachments.append(_image_attachment_from_block(block, state=state, session_id=session_id))
             continue
+        resource = _get_block_attr(block, "resource")
+        resource_mime = str(_get_block_attr(resource, "mime_type", "mimeType") or "").strip().lower()
+        resource_uri = str(_get_block_attr(resource, "uri") or "").strip()
+        resource_blob = _get_block_attr(resource, "blob")
+        if resource is not None and (
+            resource_mime.startswith("image/")
+            or isinstance(resource_blob, str)
+            or bool(_file_uri_to_path(resource_uri))
+        ):
+            attachments.append(_image_attachment_from_block(resource, state=state, session_id=session_id))
+            continue
         part = _extract_block_text(block).strip()
         if part:
             parts.append(part)
     return "\n\n".join(parts), attachments
+
+
+def _pending_attachment_lines(attachments: list[ImageAttachment]) -> list[str]:
+    if not attachments:
+        return []
+    lines: list[str] = []
+    for index, attachment in enumerate(attachments, start=1):
+        name = attachment.name or Path(attachment.path).name
+        lines.append(f"{index}. {name} ({attachment.mime_type})")
+    return lines
+
+
+def _consume_prompt_payload(
+    runtime: _AcpSessionRuntime,
+    prompt: list[Any],
+    *,
+    state: server_mod.ServerState,
+    session_id: str,
+) -> tuple[str, list[ImageAttachment], bool]:
+    content, inline_attachments = _prompt_to_text_and_attachments(
+        prompt,
+        state=state,
+        session_id=session_id,
+    )
+    if inline_attachments:
+        return content, inline_attachments, False
+    stripped = content.strip()
+    if stripped.startswith("/"):
+        return content, [], False
+    attachments = list(runtime.pending_attachments)
+    runtime.pending_attachments.clear()
+    return content, attachments, bool(attachments)
 
 
 def _text_chunks(text: str, *, chunk_size: int = 4096) -> list[str]:
@@ -348,6 +392,7 @@ async def run_acp() -> None:
             if runtime is None:
                 runtime = _AcpSessionRuntime()
                 self._session_runtimes[session_id] = runtime
+                state.acp_session_runtimes = self._session_runtimes  # type: ignore[attr-defined]
 
                 async def _callback(tool_name: str, args: dict[str, Any]) -> bool:
                     if runtime.allow_all:
@@ -640,6 +685,7 @@ async def run_acp() -> None:
                 project_dir=project_dir,
                 thinking_level=state.config.agent.thinking,
             )
+            await self._announce_available_commands(session_id)
             return NewSessionResponse(
                 session_id=session_id,
                 **(await self._session_response_payload(session_id)),
@@ -774,11 +820,20 @@ async def run_acp() -> None:
             del kwargs
             serialized = await self._ensure_session_known(session_id, create_if_missing=False)
             runtime = self._runtime(session_id)
-            content, attachments = _prompt_to_text_and_attachments(
+            content, attachments, used_pending_attachments = _consume_prompt_payload(
+                runtime,
                 prompt,
                 state=state,
                 session_id=session_id,
             )
+            if attachments:
+                attachment_notice = "Using image attachment(s):\n" + "\n".join(
+                    _pending_attachment_lines(attachments)
+                )
+                await self._conn.session_update(
+                    session_id=session_id,
+                    update=update_user_message_text(attachment_notice),
+                )
             if not content.strip() and not attachments:
                 return PromptResponse(stop_reason="end_turn")
             if attachments and not await self._session_supports_vision(session_id):
@@ -788,6 +843,8 @@ async def run_acp() -> None:
             if not attachments:
                 slash_result = await maybe_handle_slash_command(state, session_id, content)
             if slash_result is not None:
+                if used_pending_attachments and attachments:
+                    runtime.pending_attachments = attachments + runtime.pending_attachments
                 await self._conn.session_update(
                     session_id=session_id,
                     update=update_agent_message_text(slash_result.output),
@@ -836,8 +893,11 @@ async def run_acp() -> None:
                 initial_title = str(serialized.get("title", "")).strip()
 
                 try:
-                    run_iter = session.run(content, attachments=attachments) if attachments else session.run(content)
-                    async for event in run_iter:
+                    if attachments:
+                        event_stream = session.run(content, attachments=attachments)
+                    else:
+                        event_stream = session.run(content)
+                    async for event in event_stream:
                         if event.type == server_mod.AgentEventType.TEXT_DELTA:
                             await self._conn.session_update(
                                 session_id=session_id,
