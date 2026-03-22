@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from artel_ai.oauth import OAuthToken, TokenStore
 from artel_core.config import ArtelConfig, ProviderConfig, ProviderModelConfig
 
 
@@ -74,5 +75,39 @@ class TestRuntimeBootstrapNewProviders:
         assert runtime.provider.api_key == "zhipu_env_token"
         assert runtime.provider._base_url == "https://api.z.ai/api/paas/v4"
         assert runtime.context_window == 128000
+
+        await runtime.provider.close()
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_runtime_passes_openai_oauth_account_id(self, tmp_path, monkeypatch):
+        import artel_ai.oauth as oauth_mod
+        from artel_ai.providers.openai_compat import OpenAIProvider
+        from artel_core.bootstrap import bootstrap_runtime
+        from artel_core.cli import _resolve_api_key
+
+        auth_path = tmp_path / "auth.json"
+        TokenStore(path=auth_path).save(
+            OAuthToken(
+                access_token="opaque-access-token",
+                provider="openai",
+                account_id="acct-from-store",
+                expires_at=9999999999.0,
+            )
+        )
+        monkeypatch.setattr(oauth_mod, "_DEFAULT_AUTH_PATH", auth_path)
+
+        runtime = await bootstrap_runtime(
+            ArtelConfig(),
+            "openai",
+            "gpt-5.3-codex",
+            project_dir=str(tmp_path),
+            resolve_api_key=_resolve_api_key,
+            include_extensions=False,
+            runtime="local",
+        )
+
+        assert isinstance(runtime.provider, OpenAIProvider)
+        assert runtime.provider._auth_type == "oauth"
+        assert runtime.provider._account_id == "acct-from-store"
 
         await runtime.provider.close()

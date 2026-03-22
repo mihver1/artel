@@ -772,6 +772,8 @@ class OpenAICompatibleProvider(Provider):
             {"authorization": f"Bearer {self.api_key}"} if self.api_key else None,
             self.headers,
         )
+        if getattr(self, "_auth_type", "") == "oauth" and getattr(self, "_account_id", ""):
+            headers["ChatGPT-Account-Id"] = self._account_id
         try:
             response = await self._client.get("/models", headers=headers, timeout=5.0)
             if response.status_code != 200:
@@ -801,6 +803,7 @@ class OpenAIProvider(OpenAICompatibleProvider):
         **kwargs: Any,
     ):
         auth_type = str(kwargs.get("auth_type", "api") or "api")
+        explicit_account_id = str(kwargs.get("account_id", "") or "").strip()
         runtime_base_url = _CODEX_BASE_URL if auth_type == "oauth" else base_url
         super().__init__(
             api_key=api_key,
@@ -811,7 +814,7 @@ class OpenAIProvider(OpenAICompatibleProvider):
         self._auth_type = auth_type
         self._api_type = str(kwargs.get("api_type", "chat") or "chat")
         if self._auth_type == "oauth":
-            self._account_id = self._extract_account_id(api_key or "")
+            self._account_id = explicit_account_id or self._extract_account_id(api_key or "")
         else:
             self._account_id = ""
 
@@ -849,8 +852,8 @@ class OpenAIProvider(OpenAICompatibleProvider):
             {"authorization": f"Bearer {self.api_key}"} if self.api_key else None,
             self.headers,
         )
-        if self._account_id:
-            headers["openai-organization"] = self._account_id
+        if self._auth_type == "oauth" and self._account_id:
+            headers["ChatGPT-Account-Id"] = self._account_id
         return "/responses", body, headers
 
     async def stream_chat(

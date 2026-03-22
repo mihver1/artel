@@ -33,6 +33,24 @@ provider_requires_api_key = _provider_resolver.provider_requires_api_key
 resolve_provider_runtime_config = _provider_resolver.resolve_provider_runtime_config
 
 
+async def _oauth_runtime_kwargs(config: ArtelConfig, provider_name: str) -> dict[str, Any]:
+    """Load provider-specific OAuth metadata needed at runtime."""
+    if provider_name != "openai":
+        return {}
+    try:
+        from artel_ai.oauth import get_oauth_provider
+
+        oauth = get_oauth_provider(provider_name, config=config)
+        if oauth is None:
+            return {}
+        token = await oauth.get_token()
+    except Exception:
+        return {}
+    if token is None or not token.account_id:
+        return {}
+    return {"account_id": token.account_id}
+
+
 @dataclass
 class RuntimeBootstrap:
     provider_name: str
@@ -103,6 +121,7 @@ async def bootstrap_runtime(
     provider_type, kwargs = resolve_provider_runtime_config(config, provider_name)
     if auth_type == "oauth":
         kwargs["auth_type"] = "oauth"
+        kwargs.update(await _oauth_runtime_kwargs(config, provider_name))
     provider = registry.create(provider_type, api_key=api_key, **kwargs)
     tools = create_builtin_tools(project_dir)
 
@@ -150,6 +169,7 @@ async def bootstrap_runtime(
         sm_type, sm_kwargs = resolve_provider_runtime_config(config, sm_provider_name)
         if sm_auth == "oauth":
             sm_kwargs["auth_type"] = "oauth"
+            sm_kwargs.update(await _oauth_runtime_kwargs(config, sm_provider_name))
         small_provider = registry.create(sm_type, api_key=sm_key, **sm_kwargs)
 
     return RuntimeBootstrap(
